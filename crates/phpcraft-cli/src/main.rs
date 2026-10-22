@@ -43,7 +43,13 @@ fn run(args: &[String]) -> Result<u8, u8> {
             "-r" => {
                 index += 1;
                 match args.get(index) {
-                    Some(code) => inline_code = Some(code.clone()),
+                    Some(code) => {
+                        inline_code = Some(code.clone());
+                        // Everything after the code string belongs to the
+                        // script, not to phpcraft's own options.
+                        index += 1;
+                        break;
+                    }
                     None => {
                         eprintln!("phpcraft: option -r requires an argument");
                         return Err(1);
