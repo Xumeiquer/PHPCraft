@@ -7,8 +7,8 @@
 //! boundary of the implementation is always explicit.
 
 use phpcraft_ast::{
-    ArrayItem, BinOp, CastKind, Expr, FunctionDecl, InterpPart, Param, Program, Stmt, SwitchCase,
-    UnOp,
+    ArrayItem, BinOp, CastKind, Expr, FunctionDecl, InterpPart, MatchArm, Param, Program, Stmt,
+    SwitchCase, UnOp,
 };
 use phpcraft_lexer::{self, DimKey, StrPart, Tok, Token};
 
@@ -634,6 +634,44 @@ impl Parser {
 
     // ----------------------------------------------------------- expressions
 
+    fn parse_match(&mut self) -> Result<Expr, ParseError> {
+        self.expect_keyword("match")?;
+        self.expect(&Tok::LParen)?;
+        let subject = self.parse_expr()?;
+        self.expect(&Tok::RParen)?;
+        self.expect(&Tok::LBrace)?;
+
+        let mut arms = Vec::new();
+        loop {
+            if self.eat(&Tok::RBrace) {
+                break;
+            }
+            let mut conditions = Vec::new();
+            if self.check_keyword("default") && self.peek_at(1) == &Tok::DoubleArrow {
+                self.advance();
+            } else {
+                loop {
+                    conditions.push(self.parse_expr()?);
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Tok::DoubleArrow)?;
+            let body = self.parse_expr()?;
+            arms.push(MatchArm { conditions, body });
+            if self.eat(&Tok::Comma) {
+                continue;
+            }
+            self.expect(&Tok::RBrace)?;
+            break;
+        }
+        Ok(Expr::Match {
+            subject: Box::new(subject),
+            arms,
+        })
+    }
+
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         self.parse_bp(0)
     }
@@ -940,7 +978,7 @@ impl Parser {
                     "list" => Err(self.unsupported("list() destructuring")),
                     "new" | "clone" => Err(self.unsupported("objects")),
                     "function" | "fn" => Err(self.unsupported("closures")),
-                    "match" => Err(self.unsupported("match expressions")),
+                    "match" if self.peek_at(1) == &Tok::LParen => self.parse_match(),
                     "yield" => Err(self.unsupported("generators")),
                     "throw" => Err(self.unsupported("exceptions")),
                     "print" => Err(self.unsupported("the print expression; use echo")),

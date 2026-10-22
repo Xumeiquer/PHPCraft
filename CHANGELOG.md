@@ -8,6 +8,46 @@ The reference behaviour is PHP 8.5.4.
 
 ## [Unreleased]
 
+### Added
+
+- `match` expressions: multiple conditions per arm, strict (`===`)
+  comparison, a `default` arm in any position, trailing commas, nested
+  expressions and `UnhandledMatchError` when no arm matches.
+- Differential coverage for `match` and integer-boundary builtin calls.
+
+### Fixed
+
+- Integer-boundary arithmetic in `explode()`, `substr()`, `array_slice()`,
+  `array_fill()` and `range()` no longer wraps or overflows.
+- `range()` uses exact `i128` arithmetic for integer inputs. Ranges ending at
+  `PHP_INT_MAX` previously added `1.0` to an `f64` that could not change and
+  looped forever.
+- `range()` now rejects steps outside the spanned interval and oversized
+  results instead of allocating until failure.
+- `number_format()` uses `_php_math_round()` semantics (`number_format(1.005,
+  2)` is now `1.01`) and can emit exact fractional expansions beyond Rust's
+  formatter precision.
+- `sprintf()` clamps floating-point precision to PHP's 53-digit maximum, as
+  `formatted_print.c` does.
+
+### Security
+
+- Hardened builtins against panics and allocator aborts caused by extreme
+  integer arguments: `str_repeat()`, `str_pad()`, `explode()`,
+  `array_fill()`, `number_format()` and `sprintf()`.
+- `sprintf()` validates width/precision against PHP's `INT_MAX` limit and all
+  padding goes through fallible allocation.
+- Rust integer overflow and capacity-overflow paths found by a boundary audit
+  now produce PHP fatal errors (status 255) instead of process aborts. A
+  single user-controlled allocation is capped at 64 MiB as a stop-gap until
+  an explicit `memory_limit` implementation exists.
+
+### Tested
+
+- 39 Rust unit/integration tests.
+- 13 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
+  status.
+
 ### Planned
 
 - References and by-reference builtins (`sort`, `array_push`, `unset`,

@@ -8,7 +8,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use phpcraft_ast::{ArrayItem, BinOp, Expr, FunctionDecl, InterpPart, Program, Stmt, UnOp};
+use phpcraft_ast::{
+    ArrayItem, BinOp, Expr, FunctionDecl, InterpPart, MatchArm, Program, Stmt, UnOp,
+};
 use phpcraft_bytecode::{Chunk, CompiledProgram, DimMode, Function, Op, ParamSlot};
 use phpcraft_runtime::{key_from_value, PhpArray, Value};
 
@@ -695,6 +697,7 @@ impl FnCompiler {
                     argc: args.len() as u32,
                 });
             }
+            Expr::Match { subject, arms } => self.compile_match(subject, arms)?,
             Expr::Isset(args) => self.compile_isset(args)?,
             Expr::Empty(expr) => {
                 self.silent_read(expr)?;
@@ -720,6 +723,59 @@ impl FnCompiler {
             });
         }
         self.emit(Op::LoadTmp(tmp));
+        Ok(())
+    }
+
+    fn compile_match(&mut self, subject: &Expr, arms: &[MatchArm]) -> Result<(), CompileError> {
+        let mut default: Option<&Expr> = None;
+        for arm in arms {
+            if arm.conditions.is_empty() {
+                if default.is_some() {
+                    return Err(CompileError::new(
+                        "Match expressions may only contain one default arm",
+                        self.line,
+                    ));
+                }
+                default = Some(&arm.body);
+            }
+        }
+
+        self.expr(subject)?;
+        let subject_tmp = self.temp();
+        self.emit(Op::StoreTmp(subject_tmp));
+
+        let mut end_jumps = Vec::new();
+        for arm in arms.iter().filter(|arm| !arm.conditions.is_empty()) {
+            let mut matched_jumps = Vec::new();
+            for condition in &arm.conditions {
+                self.emit(Op::LoadTmp(subject_tmp));
+                self.expr(condition)?;
+                self.emit(Op::Binary(BinOp::Identical));
+                matched_jumps.push(self.emit(Op::JumpIfTrue(0)));
+            }
+            let miss = self.emit(Op::Jump(0));
+            let matched = self.ops.len();
+            for jump in matched_jumps {
+                self.patch(jump, matched);
+            }
+            self.expr(&arm.body)?;
+            end_jumps.push(self.emit(Op::Jump(0)));
+            let next_arm = self.ops.len();
+            self.patch(miss, next_arm);
+        }
+
+        if let Some(body) = default {
+            self.expr(body)?;
+        } else {
+            self.emit(Op::ThrowUnhandledMatch {
+                subject: subject_tmp,
+            });
+        }
+
+        let end = self.ops.len();
+        for jump in end_jumps {
+            self.patch(jump, end);
+        }
         Ok(())
     }
 

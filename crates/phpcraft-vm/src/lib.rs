@@ -11,8 +11,8 @@ use std::rc::Rc;
 use phpcraft_ast::{BinOp, CastKind, UnOp};
 use phpcraft_bytecode::{Chunk, CompiledProgram, DimMode, Function, Op};
 use phpcraft_runtime::{
-    compare, key_from_value, loose_eq, strict_eq, Key, Numeric, PhpArray, PhpError, PhpResult,
-    RuntimeHooks, ToNumber, Value,
+    compare, key_from_value, loose_eq, strict_eq, ErrorKind, Key, Numeric, PhpArray, PhpError,
+    PhpResult, RuntimeHooks, ToNumber, Value,
 };
 
 /// Maximum userland call depth, mirroring the usual `xdebug.max_nesting_level`
@@ -450,6 +450,13 @@ impl Vm {
                     };
                     let result = self.call_named(&name, args)?;
                     stack.push(result);
+                }
+                Op::ThrowUnhandledMatch { subject } => {
+                    let value = frame.get(*subject);
+                    return Err(PhpError::new(
+                        ErrorKind::UnhandledMatch,
+                        format!("Unhandled match case of type {}", value.type_name()),
+                    ));
                 }
                 Op::IterInit { iter } => {
                     let subject = stack.pop().unwrap_or(Value::Null);

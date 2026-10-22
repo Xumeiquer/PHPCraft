@@ -86,6 +86,21 @@ impl PhpArray {
         }
     }
 
+    /// Fallible version of [`PhpArray::with_capacity`] for sizes derived from
+    /// userland input. Returns `None` instead of aborting on capacity
+    /// overflow or allocation failure.
+    pub fn try_with_capacity(cap: usize) -> Option<Self> {
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(cap).ok()?;
+        let mut index = HashMap::new();
+        index.try_reserve(cap).ok()?;
+        Some(Self {
+            entries,
+            index,
+            next_index: i64::MIN,
+        })
+    }
+
     pub fn from_pairs(pairs: Vec<(Key, Value)>) -> Self {
         let mut arr = Self::with_capacity(pairs.len());
         for (k, v) in pairs {

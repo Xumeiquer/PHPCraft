@@ -12,7 +12,7 @@ use std::rc::Rc;
 use phpcraft_runtime::value::parse_numeric;
 use phpcraft_runtime::{
     compare, float_to_fixed, float_to_general, float_to_repr, key_from_value, loose_eq, strict_eq,
-    Key, PhpArray, PhpError, PhpResult, RuntimeHooks, Value,
+    Key, Numeric, PhpArray, PhpError, PhpResult, RuntimeHooks, ToNumber, Value,
 };
 
 pub type NativeFn = fn(&mut dyn RuntimeHooks, Vec<Value>) -> PhpResult<Value>;
@@ -207,6 +207,80 @@ fn string_value(bytes: Vec<u8>) -> Value {
     Value::str(bytes)
 }
 
+/// Maximum bytes a single user-controlled allocation may request.
+///
+/// PHP relies on `memory_limit` to turn absurd lengths into a fatal error.
+/// PHPCraft has no allocator limiter yet, so without this cap a call such as
+/// `str_repeat("a", PHP_INT_MAX)` would abort the Rust process instead of
+/// producing a catchable fatal error. A single allocation is capped rather
+/// than total memory; scripts can still allocate many bounded values.
+const MAX_USER_ALLOCATION: usize = 64 * 1024 * 1024;
+
+/// Mirrors Zend's `HT_MAX_SIZE` on 64-bit platforms. `range()` and
+/// `array_fill()` reject results at or above this size in php-src.
+const HT_MAX_SIZE: u128 = 0x4000_0000;
+
+/// Rust's dynamic formatting precision is limited to this value. Every f64
+/// has a finite decimal expansion of at most 1074 fractional digits, so larger
+/// precisions can be produced exactly by appending zeroes.
+const MAX_RUST_FORMAT_PRECISION: usize = 65_535;
+const EXACT_DECIMAL_FRACTION_DIGITS: usize = 1_074;
+/// `MAX_FLOAT_PRECISION` in `ext/standard/formatted_print.c`.
+const PHP_MAX_FLOAT_PRECISION: usize = 53;
+
+fn allocation_error() -> PhpError {
+    PhpError::fatal("Allowed memory size exhausted")
+}
+
+fn ensure_allocation(len: usize) -> PhpResult<()> {
+    if len > MAX_USER_ALLOCATION || len > isize::MAX as usize {
+        return Err(allocation_error());
+    }
+    Ok(())
+}
+
+fn reserve_exact<T>(values: &mut Vec<T>, additional: usize) -> PhpResult<()> {
+    ensure_allocation(additional)?;
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| allocation_error())
+}
+
+fn fixed_decimal(value: f64, decimals: usize) -> PhpResult<String> {
+    if !value.is_finite() || decimals <= MAX_RUST_FORMAT_PRECISION {
+        return Ok(float_to_fixed(value, decimals));
+    }
+    ensure_allocation(decimals)?;
+    let mut text = float_to_fixed(value, EXACT_DECIMAL_FRACTION_DIGITS);
+    let extra = decimals - EXACT_DECIMAL_FRACTION_DIGITS;
+    text.try_reserve(extra).map_err(|_| allocation_error())?;
+    text.extend(std::iter::repeat_n('0', extra));
+    Ok(text)
+}
+
+fn integer_operand(value: &Value) -> Option<i64> {
+    match value.to_number() {
+        ToNumber::Num(Numeric::Int(value)) | ToNumber::Leading(Numeric::Int(value)) => Some(value),
+        _ => None,
+    }
+}
+
+fn range_boundary_error() -> PhpError {
+    PhpError::value_error(
+        "range(): Argument #3 ($step) must be less than the range spanned by argument #1 ($start) and argument #2 ($end)",
+    )
+}
+
+fn range_negative_step_error() -> PhpError {
+    PhpError::value_error(
+        "range(): Argument #3 ($step) must be greater than 0 for increasing ranges",
+    )
+}
+
+fn range_too_large_error() -> PhpError {
+    PhpError::value_error("The supplied range exceeds the maximum array size")
+}
+
 fn key_to_value(key: &Key) -> Value {
     match key {
         Key::Int(i) => Value::Int(*i),
@@ -232,7 +306,21 @@ fn str_repeat(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Valu
             "str_repeat(): Argument #2 ($times) must be greater than or equal to 0",
         ));
     }
-    Ok(string_value(string.repeat(times as usize)))
+    if string.is_empty() || times == 0 {
+        return Ok(string_value(Vec::new()));
+    }
+    let times = usize::try_from(times).map_err(|_| allocation_error())?;
+    let total = string
+        .len()
+        .checked_mul(times)
+        .ok_or_else(allocation_error)?;
+    ensure_allocation(total)?;
+    let mut out = Vec::new();
+    reserve_exact(&mut out, total)?;
+    for _ in 0..times {
+        out.extend_from_slice(&string);
+    }
+    Ok(string_value(out))
 }
 
 fn strtoupper(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
@@ -322,9 +410,9 @@ fn substr(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     let mut end = len;
     if let Some(length) = length {
         if length < 0 {
-            end = (len + length).max(start);
+            end = len.saturating_add(length).max(start);
         } else {
-            end = (start + length).min(len);
+            end = start.saturating_add(length).min(len);
         }
     }
     if end <= start {
@@ -540,7 +628,9 @@ fn explode(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
                 parts.push(rest);
             }
         } else if limit < 0 {
-            let drop = (-limit) as usize;
+            // `-i64::MIN` overflows in debug builds; `unsigned_abs()` also
+            // handles the "drop everything" case correctly.
+            let drop = usize::try_from(limit.unsigned_abs()).unwrap_or(usize::MAX);
             if drop < parts.len() {
                 parts.truncate(parts.len() - drop);
             } else {
@@ -617,12 +707,25 @@ fn format_args(format: &[u8], args: &[Value], fname: &str) -> PhpResult<Vec<u8>>
             spec.width = spec.width.saturating_mul(10) + (digit - b'0') as usize;
             i += 1;
         }
+        // php_sprintf_getnumber() rejects values outside [0, INT_MAX].
+        if spec.width > i32::MAX as usize {
+            return Err(PhpError::value_error(format!(
+                "{fname}(): Width must be between 0 and {}",
+                i32::MAX
+            )));
+        }
         if format.get(i) == Some(&b'.') {
             i += 1;
             let mut precision = 0usize;
             while let Some(digit) = format.get(i).filter(|c| c.is_ascii_digit()) {
                 precision = precision.saturating_mul(10) + (digit - b'0') as usize;
                 i += 1;
+            }
+            if precision > i32::MAX as usize {
+                return Err(PhpError::value_error(format!(
+                    "{fname}(): Precision must be between 0 and {}",
+                    i32::MAX
+                )));
             }
             spec.precision = Some(precision);
         }
@@ -636,35 +739,47 @@ fn format_args(format: &[u8], args: &[Value], fname: &str) -> PhpResult<Vec<u8>>
         })?;
         arg_index += 1;
 
+        // php_sprintf() truncates floating-point precision to 53 digits.
+        if matches!(conversion, b'f' | b'F' | b'e' | b'E' | b'g' | b'G') {
+            if let Some(precision) = spec.precision.as_mut() {
+                *precision = (*precision).min(PHP_MAX_FLOAT_PRECISION);
+            }
+        }
+
         match conversion {
             b's' => {
                 let mut bytes = value.to_bytes();
                 if let Some(precision) = spec.precision {
                     bytes.truncate(precision);
                 }
-                out.extend(pad(&[], &bytes, spec.width, spec.left, false));
+                out.extend(pad(&[], &bytes, spec.width, spec.left, false)?);
             }
             b'd' | b'i' => {
                 let number = value.to_int_cast();
                 let negative = number < 0;
                 let mut digits = number.unsigned_abs().to_string().into_bytes();
                 if let Some(precision) = spec.precision {
-                    while digits.len() < precision {
-                        digits.insert(0, b'0');
+                    if digits.len() < precision {
+                        ensure_allocation(precision)?;
+                        let mut padded = Vec::new();
+                        reserve_exact(&mut padded, precision)?;
+                        padded.resize(precision - digits.len(), b'0');
+                        padded.extend_from_slice(&digits);
+                        digits = padded;
                     }
                 }
                 let sign = sign_prefix(negative, spec.plus, spec.space);
-                out.extend(pad(&sign, &digits, spec.width, spec.left, spec.zero));
+                out.extend(pad(&sign, &digits, spec.width, spec.left, spec.zero)?);
             }
             b'u' => {
                 let number = value.to_int_cast() as u64;
                 let digits = number.to_string().into_bytes();
-                out.extend(pad(&[], &digits, spec.width, spec.left, spec.zero));
+                out.extend(pad(&[], &digits, spec.width, spec.left, spec.zero)?);
             }
             b'f' | b'F' => {
                 let number = value.to_float_cast();
                 let decimals = spec.precision.unwrap_or(6);
-                let text = float_to_fixed(number.abs(), decimals);
+                let text = fixed_decimal(number.abs(), decimals)?;
                 let sign = sign_prefix(number < 0.0, spec.plus, spec.space);
                 out.extend(pad(
                     &sign,
@@ -672,11 +787,12 @@ fn format_args(format: &[u8], args: &[Value], fname: &str) -> PhpResult<Vec<u8>>
                     spec.width,
                     spec.left,
                     spec.zero,
-                ));
+                )?);
             }
             b'e' | b'E' => {
                 let number = value.to_float_cast();
                 let decimals = spec.precision.unwrap_or(6);
+                ensure_allocation(decimals)?;
                 let text = format!("{:.*e}", decimals, number.abs());
                 let (mantissa, exponent) = text.split_once('e').expect("exponential");
                 let exponent: i32 = exponent.parse().expect("exponent");
@@ -685,11 +801,12 @@ fn format_args(format: &[u8], args: &[Value], fname: &str) -> PhpResult<Vec<u8>>
                 body.push(if exponent < 0 { b'-' } else { b'+' });
                 body.extend_from_slice(exponent.unsigned_abs().to_string().as_bytes());
                 let sign = sign_prefix(number < 0.0, spec.plus, spec.space);
-                out.extend(pad(&sign, &body, spec.width, spec.left, spec.zero));
+                out.extend(pad(&sign, &body, spec.width, spec.left, spec.zero)?);
             }
             b'g' | b'G' => {
                 let number = value.to_float_cast();
                 let precision = spec.precision.unwrap_or(6).max(1);
+                ensure_allocation(precision)?;
                 let mut text = float_to_general(number.abs(), precision);
                 if conversion == b'G' {
                     text = text.to_uppercase();
@@ -703,7 +820,7 @@ fn format_args(format: &[u8], args: &[Value], fname: &str) -> PhpResult<Vec<u8>>
                     spec.width,
                     spec.left,
                     spec.zero,
-                ));
+                )?);
             }
             b'x' | b'X' | b'o' | b'b' => {
                 let number = value.to_int_cast() as u64;
@@ -716,7 +833,7 @@ fn format_args(format: &[u8], args: &[Value], fname: &str) -> PhpResult<Vec<u8>>
                 if conversion == b'X' {
                     digits.make_ascii_uppercase();
                 }
-                out.extend(pad(&[], &digits, spec.width, spec.left, spec.zero));
+                out.extend(pad(&[], &digits, spec.width, spec.left, spec.zero)?);
             }
             b'c' => {
                 let code = value.to_int_cast() as u32;
@@ -728,7 +845,7 @@ fn format_args(format: &[u8], args: &[Value], fname: &str) -> PhpResult<Vec<u8>>
                     spec.width,
                     spec.left,
                     false,
-                ));
+                )?);
             }
             other => {
                 return Err(PhpError::value_error(format!(
@@ -753,15 +870,17 @@ fn sign_prefix(negative: bool, plus: bool, space: bool) -> Vec<u8> {
     }
 }
 
-fn pad(sign: &[u8], body: &[u8], width: usize, left: bool, zero: bool) -> Vec<u8> {
+fn pad(sign: &[u8], body: &[u8], width: usize, left: bool, zero: bool) -> PhpResult<Vec<u8>> {
     let total = sign.len() + body.len();
     if total >= width {
         let mut out = sign.to_vec();
         out.extend_from_slice(body);
-        return out;
+        return Ok(out);
     }
     let fill = width - total;
-    let mut out = Vec::with_capacity(width);
+    ensure_allocation(width)?;
+    let mut out = Vec::new();
+    reserve_exact(&mut out, width)?;
     if left {
         out.extend_from_slice(sign);
         out.extend_from_slice(body);
@@ -775,7 +894,7 @@ fn pad(sign: &[u8], body: &[u8], width: usize, left: bool, zero: bool) -> Vec<u8
         out.extend_from_slice(sign);
         out.extend_from_slice(body);
     }
-    out
+    Ok(out)
 }
 
 fn number_format(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
@@ -786,6 +905,9 @@ fn number_format(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<V
     } else {
         0
     };
+    // Rust's formatting machinery panics when the precision cannot be
+    // represented by the runtime; reject absurd values before that point.
+    ensure_allocation(decimals)?;
     let decimal_point = if args.len() > 2 {
         as_string(&args, 2, "number_format", "decimal_separator")?
     } else {
@@ -797,9 +919,8 @@ fn number_format(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<V
         b",".to_vec()
     };
 
-    let factor = 10f64.powi(decimals as i32);
-    let rounded = (number.abs() * factor).round() / factor;
-    let text = format!("{rounded:.decimals$}");
+    let rounded = php_math_round(number.abs(), decimals as i64);
+    let text = fixed_decimal(rounded, decimals)?;
     let (integer, fraction) = match text.split_once('.') {
         Some((integer, fraction)) => (integer.to_string(), fraction.to_string()),
         None => (text, String::new()),
@@ -846,26 +967,36 @@ fn str_pad(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
             "str_pad(): Argument #3 ($pad_string) must be a non-empty string",
         ));
     }
-    let needed = length as usize - input.len();
-    let mut padding = Vec::with_capacity(needed);
+    let total = usize::try_from(length).map_err(|_| allocation_error())?;
+    ensure_allocation(total)?;
+    let needed = total - input.len();
+    let mut padding = Vec::new();
+    reserve_exact(&mut padding, needed)?;
     while padding.len() < needed {
         padding.push(pad_string[padding.len() % pad_string.len()]);
     }
     match pad_type {
         0 => {
-            let mut out = padding[..needed].to_vec();
+            let mut out = Vec::new();
+            reserve_exact(&mut out, total)?;
+            out.extend_from_slice(&padding[..needed]);
             out.extend_from_slice(&input);
             input = out;
         }
         2 => {
             let left = needed / 2;
             let right = needed - left;
-            let mut out = padding[..left].to_vec();
+            let mut out = Vec::new();
+            reserve_exact(&mut out, total)?;
+            out.extend_from_slice(&padding[..left]);
             out.extend_from_slice(&input);
             out.extend_from_slice(&padding[..right]);
             input = out;
         }
-        _ => input.extend_from_slice(&padding[..needed]),
+        _ => {
+            input.try_reserve(needed).map_err(|_| allocation_error())?;
+            input.extend_from_slice(&padding[..needed]);
+        }
     }
     Ok(string_value(input))
 }
@@ -1097,9 +1228,9 @@ fn array_slice(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Val
     let mut end = total;
     if let Some(length) = length {
         if length < 0 {
-            end = (total + length).max(start);
+            end = total.saturating_add(length).max(start);
         } else {
-            end = (start + length).min(total);
+            end = start.saturating_add(length).min(total);
         }
     }
 
@@ -1158,7 +1289,21 @@ fn array_fill(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Valu
             "array_fill(): Argument #2 ($count) must be greater than or equal to 0",
         ));
     }
-    let mut out = PhpArray::with_capacity(count as usize);
+    if count > 0 {
+        // php-src rejects counts that do not fit in a 32-bit array size and
+        // detects an overflowing next index before allocating.
+        if count > i32::MAX as i64 {
+            return Err(PhpError::value_error(
+                "array_fill(): Argument #2 ($count) is too large",
+            ));
+        }
+        if start > i64::MAX - count + 1 {
+            return Err(PhpError::fatal(
+                "Cannot add element to the array as the next element is already occupied",
+            ));
+        }
+    }
+    let mut out = PhpArray::try_with_capacity(count as usize).ok_or_else(allocation_error)?;
     for i in 0..count {
         out.insert_int(start + i, args[2].clone());
     }
@@ -1237,7 +1382,6 @@ fn array_map(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value>
 
 fn range(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("range", &args, 2, Some(3))?;
-    let mut out = PhpArray::new();
 
     let is_char = |value: &Value| -> Option<u8> {
         match value {
@@ -1246,75 +1390,155 @@ fn range(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
         }
     };
 
-    if let (Some(start), Some(end)) = (is_char(&args[0]), is_char(&args[1])) {
-        let step = if args.len() > 2 {
-            as_int(&args, 2, "range", "step")?
-        } else {
-            1
-        };
-        if step == 0 {
-            return Err(PhpError::value_error(
-                "range(): Argument #3 ($step) cannot be 0",
-            ));
-        }
-        let step = step.unsigned_abs() as usize;
-        if start <= end {
-            let mut current = start;
-            loop {
-                out.push(string_value(vec![current]));
-                if current as usize + step > end as usize {
-                    break;
-                }
-                current = (current as usize + step) as u8;
-            }
-        } else {
-            let mut current = start as i32;
-            loop {
-                out.push(string_value(vec![current as u8]));
-                if (current - step as i32) < (end as i32) {
-                    break;
-                }
-                current -= step as i32;
-            }
-        }
-        return Ok(Value::array(out));
+    let step_arg = args.get(2);
+    let step_int = step_arg.map(Value::to_int_cast).unwrap_or(1);
+    let step_is_float = step_arg.is_some_and(|value| {
+        matches!(
+            value.to_number(),
+            ToNumber::Num(Numeric::Float(_)) | ToNumber::Leading(Numeric::Float(_))
+        )
+    });
+    let step_negative = step_arg.is_some_and(|value| match value.to_number() {
+        ToNumber::Num(Numeric::Int(step)) | ToNumber::Leading(Numeric::Int(step)) => step < 0,
+        ToNumber::Num(Numeric::Float(step)) | ToNumber::Leading(Numeric::Float(step)) => step < 0.0,
+        ToNumber::Invalid => false,
+    });
+    let step_float = step_arg.map(Value::to_float_cast).unwrap_or(1.0);
+    if !step_float.is_finite() {
+        return Err(PhpError::value_error(
+            "range(): Argument #3 ($step) must be a finite number",
+        ));
     }
-
-    let start = args[0].to_float_cast();
-    let end = args[1].to_float_cast();
-    let step = if args.len() > 2 {
-        as_float(&args, 2, "range", "step")?
-    } else {
-        1.0
-    };
-    if step == 0.0 {
+    if step_float == 0.0 {
         return Err(PhpError::value_error(
             "range(): Argument #3 ($step) cannot be 0",
         ));
     }
-    let step = step.abs();
-    let integer_range =
-        args[0].to_number().is_int() && args[1].to_number().is_int() && step.fract() == 0.0;
-    if start <= end {
-        let mut current = start;
-        while current <= end + f64::EPSILON {
-            out.push(if integer_range {
-                Value::Int(current as i64)
-            } else {
-                Value::Float(current)
-            });
-            current += step;
+
+    // Single-byte string ranges use byte arithmetic, independently of the
+    // numeric branch. Keep the step positive and compute by index so that a
+    // huge step cannot wrap or loop forever.
+    if let (Some(start), Some(end)) = (is_char(&args[0]), is_char(&args[1])) {
+        if step_int == i64::MIN {
+            return Err(PhpError::value_error(
+                "range(): Argument #3 ($step) must be greater than the minimum integer",
+            ));
         }
+        let step = (step_int as i128).abs();
+        let (low, high) = (start as i128, end as i128);
+        let (first, last, direction) = if low > high {
+            (low, high, -1i128)
+        } else if high > low {
+            if step_negative {
+                return Err(range_negative_step_error());
+            }
+            (low, high, 1i128)
+        } else {
+            return Ok(Value::array(PhpArray::from_pairs(vec![(
+                Key::Int(0),
+                string_value(vec![start]),
+            )])));
+        };
+        let distance = (last - first).unsigned_abs();
+        if distance < step as u128 {
+            return Err(range_boundary_error());
+        }
+        let count = distance / step as u128 + 1;
+        if count >= HT_MAX_SIZE {
+            return Err(range_too_large_error());
+        }
+        let mut out = PhpArray::try_with_capacity(count as usize).ok_or_else(allocation_error)?;
+        for i in 0..count {
+            let current = first + direction * (i as i128 * step);
+            out.push(string_value(vec![current as u8]));
+        }
+        return Ok(Value::array(out));
+    }
+
+    let start_int = integer_operand(&args[0]);
+    let end_int = integer_operand(&args[1]);
+    if let (Some(start), Some(end)) = (start_int, end_int) {
+        if !step_is_float {
+            // Zend's integer range path never converts through f64. Doing so
+            // loses the final increment at PHP_INT_MAX and can loop forever.
+            if step_int == i64::MIN {
+                return Err(PhpError::value_error(
+                    "range(): Argument #3 ($step) must be greater than the minimum integer",
+                ));
+            }
+            let step = (step_int as i128).abs();
+            if start == end {
+                let mut out = PhpArray::new();
+                out.push(Value::Int(start));
+                return Ok(Value::array(out));
+            }
+            let (first, last, direction) = if start > end {
+                if (start as i128 - end as i128) < step {
+                    return Err(range_boundary_error());
+                }
+                (start as i128, end as i128, -1i128)
+            } else {
+                if step_negative {
+                    return Err(range_negative_step_error());
+                }
+                if (end as i128 - start as i128) < step {
+                    return Err(range_boundary_error());
+                }
+                (start as i128, end as i128, 1i128)
+            };
+            let distance = (last - first).unsigned_abs();
+            let count = distance / step as u128 + 1;
+            if count >= HT_MAX_SIZE {
+                return Err(range_too_large_error());
+            }
+            let mut out =
+                PhpArray::try_with_capacity(count as usize).ok_or_else(allocation_error)?;
+            for i in 0..count {
+                out.push(Value::Int((first + direction * (i as i128 * step)) as i64));
+            }
+            return Ok(Value::array(out));
+        }
+    }
+
+    // Float (or mixed numeric/string) ranges. Compute an upper bound instead
+    // of repeatedly adding `step` to a float that may no longer change.
+    let start = args[0].to_float_cast();
+    let end = args[1].to_float_cast();
+    let step = step_float.abs();
+    if start == end {
+        let mut out = PhpArray::new();
+        out.push(Value::Float(start));
+        return Ok(Value::array(out));
+    }
+    let (first, last, direction) = if start > end {
+        (start, end, -1.0)
     } else {
-        let mut current = start;
-        while current >= end - f64::EPSILON {
-            out.push(if integer_range {
-                Value::Int(current as i64)
-            } else {
-                Value::Float(current)
-            });
-            current -= step;
+        if step_negative {
+            return Err(range_negative_step_error());
         }
+        (start, end, 1.0)
+    };
+    let distance = (last - first).abs();
+    if distance < step {
+        return Err(range_boundary_error());
+    }
+    let upper = (distance / step).floor();
+    if !upper.is_finite() || upper >= (HT_MAX_SIZE - 2) as f64 {
+        return Err(range_too_large_error());
+    }
+    let upper = upper as u128 + 2;
+    let mut out = PhpArray::try_with_capacity(upper as usize).ok_or_else(allocation_error)?;
+    let epsilon = f64::EPSILON * distance.abs().max(1.0);
+    for i in 0..upper {
+        let element = first + direction * (i as f64 * step);
+        if direction > 0.0 {
+            if element > last + epsilon {
+                break;
+            }
+        } else if element < last - epsilon {
+            break;
+        }
+        out.push(Value::Float(element));
     }
     Ok(Value::array(out))
 }
@@ -1805,6 +2029,141 @@ mod tests {
             String::from_utf8(out.to_bytes()).unwrap(),
             "Array\n(\n    [a] => Array\n        (\n            [0] => 1\n            [1] => 2\n        )\n\n    [b] => 2\n)\n"
         );
+    }
+
+    #[test]
+    fn number_format_rounding_and_precision_limits() {
+        let mut hooks = NullHooks { output: vec![] };
+        let formatted =
+            number_format(&mut hooks, vec![Value::Float(1.005), Value::Int(2)]).unwrap();
+        assert_eq!(formatted.to_bytes(), b"1.01");
+
+        let formatted = number_format(&mut hooks, vec![Value::Float(1.5), Value::Int(30)]).unwrap();
+        assert_eq!(formatted.to_bytes(), b"1.500000000000000000000000000000");
+
+        assert!(
+            number_format(&mut hooks, vec![Value::Float(1.5), Value::Int(200_000_000)]).is_err()
+        );
+        let formatted = sprintf(
+            &mut hooks,
+            vec![Value::str(b"%.100000f".to_vec()), Value::Float(1.5)],
+        )
+        .unwrap();
+        // php_sprintf() truncates floating-point precision to 53 digits.
+        assert_eq!(formatted.to_bytes().len(), 55);
+        let formatted = sprintf(
+            &mut hooks,
+            vec![Value::str(b"%.100000e".to_vec()), Value::Float(1.5)],
+        )
+        .unwrap();
+        // PHP truncates floating-point precision to 53 digits.
+        assert_eq!(formatted.to_bytes().len(), 58);
+
+        // number_format() does not truncate; it emits the exact expansion.
+        let formatted =
+            number_format(&mut hooks, vec![Value::Float(1.5), Value::Int(100_000)]).unwrap();
+        assert_eq!(formatted.to_bytes().len(), 100_002);
+    }
+
+    #[test]
+    fn extreme_integer_arguments_fail_cleanly() {
+        let mut hooks = NullHooks { output: vec![] };
+
+        // These used to panic or abort the Rust process.
+        assert!(str_repeat(
+            &mut hooks,
+            vec![Value::str(b"a".to_vec()), Value::Int(i64::MAX)]
+        )
+        .is_err());
+        assert!(str_pad(
+            &mut hooks,
+            vec![Value::str(b"a".to_vec()), Value::Int(i64::MAX)]
+        )
+        .is_err());
+        assert!(array_fill(
+            &mut hooks,
+            vec![Value::Int(0), Value::Int(i64::MAX), Value::Int(1)]
+        )
+        .is_err());
+        assert!(array_fill(
+            &mut hooks,
+            vec![Value::Int(i64::MAX), Value::Int(2), Value::Int(1)]
+        )
+        .is_err());
+        assert!(number_format(&mut hooks, vec![Value::Float(1.5), Value::Int(i64::MAX)]).is_err());
+        assert!(sprintf(
+            &mut hooks,
+            vec![
+                Value::str(b"%999999999999999999s".to_vec()),
+                Value::str(b"x".to_vec())
+            ]
+        )
+        .is_err());
+
+        // Negative limits and large positive lengths must saturate, not wrap.
+        let parts = explode(
+            &mut hooks,
+            vec![
+                Value::str(b",".to_vec()),
+                Value::str(b"a,b".to_vec()),
+                Value::Int(i64::MIN),
+            ],
+        )
+        .unwrap();
+        match parts {
+            Value::Array(parts) => assert!(parts.is_empty()),
+            other => panic!("expected array, got {other:?}"),
+        }
+        assert_eq!(
+            substr(
+                &mut hooks,
+                vec![
+                    Value::str(b"abc".to_vec()),
+                    Value::Int(1),
+                    Value::Int(i64::MAX)
+                ]
+            )
+            .unwrap()
+            .to_bytes(),
+            b"bc"
+        );
+        let slice = array_slice(
+            &mut hooks,
+            vec![
+                Value::array(PhpArray::from_pairs(vec![
+                    (Key::Int(0), Value::Int(1)),
+                    (Key::Int(1), Value::Int(2)),
+                    (Key::Int(2), Value::Int(3)),
+                ])),
+                Value::Int(1),
+                Value::Int(i64::MAX),
+            ],
+        )
+        .unwrap();
+        match slice {
+            Value::Array(slice) => assert_eq!(slice.len(), 2),
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn range_handles_integer_boundaries() {
+        let mut hooks = NullHooks { output: vec![] };
+        let ranged = range(
+            &mut hooks,
+            vec![Value::Int(i64::MAX - 2), Value::Int(i64::MAX)],
+        )
+        .unwrap();
+        match ranged {
+            Value::Array(array) => {
+                assert_eq!(array.len(), 3);
+                assert!(matches!(array.get_int(0), Some(Value::Int(v)) if *v == i64::MAX - 2));
+                assert!(matches!(array.get_int(1), Some(Value::Int(v)) if *v == i64::MAX - 1));
+                assert!(matches!(array.get_int(2), Some(Value::Int(v)) if *v == i64::MAX));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+        assert!(range(&mut hooks, vec![Value::Int(0), Value::Int(i64::MAX)]).is_err());
     }
 
     #[test]

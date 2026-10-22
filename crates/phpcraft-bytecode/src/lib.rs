@@ -93,6 +93,11 @@ pub enum Op {
         argc: u32,
     },
 
+    /// Abort with `UnhandledMatchError` after no match arm was selected.
+    ThrowUnhandledMatch {
+        subject: u32,
+    },
+
     /// Pop the subject into a foreach iterator slot.
     IterInit {
         iter: u32,

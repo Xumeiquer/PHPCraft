@@ -86,12 +86,12 @@ Release highlights live in [`CHANGELOG.md`](CHANGELOG.md).
 
 Implemented: scalar types, binary-safe strings and interpolation, heredoc and
 nowdoc, ordered arrays with PHP key coercion and copy-on-write, arithmetic and
-comparison semantics, `if`/`while`/`do`/`for`/`foreach`/`switch`, functions,
-`global`, `isset`/`empty`, casts, string/array/math/type builtins, and CLI
-behaviour matching `php` (stdout/stderr separation, exit status 255 on fatal
-errors).
+comparison semantics, `if`/`while`/`do`/`for`/`foreach`/`switch`, `match`
+expressions, functions, `global`, `isset`/`empty`, casts,
+string/array/math/type builtins, and CLI behaviour matching `php`
+(stdout/stderr separation, exit status 255 on fatal errors).
 
 Not yet implemented: classes, objects, closures, namespaces, exceptions,
-references, `include`/`require`, `match`, dynamic calls, named arguments and
-alternative control syntax. Unsupported constructs produce explicit parse or
+references, `include`/`require`, dynamic calls, named arguments and alternative
+control syntax. Unsupported constructs produce explicit parse or
 compile errors rather than silently misbehaving.

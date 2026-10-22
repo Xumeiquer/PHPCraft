@@ -85,6 +85,13 @@ pub struct ArrayItem {
 }
 
 #[derive(Clone, Debug)]
+pub struct MatchArm {
+    /// Empty for `default`.
+    pub conditions: Vec<Expr>,
+    pub body: Expr,
+}
+
+#[derive(Clone, Debug)]
 pub enum InterpPart {
     Lit(Vec<u8>),
     Expr(Expr),
@@ -152,6 +159,11 @@ pub enum Expr {
     Call {
         name: String,
         args: Vec<Expr>,
+    },
+    /// `match ($value) { 1, 2 => ..., default => ... }`.
+    Match {
+        subject: Box<Expr>,
+        arms: Vec<MatchArm>,
     },
     Isset(Vec<Expr>),
     Empty(Box<Expr>),

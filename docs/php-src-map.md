@@ -66,6 +66,7 @@ fetch/assign instructions.
 | `IndexSafe` | `ZEND_FETCH_DIM_IS` |
 | `AssignDim` | `ZEND_ASSIGN_DIM`, `ZEND_ASSIGN_DIM_OP` |
 | `Call` | `ZEND_INIT_FCALL`, `ZEND_SEND_VAL`, `ZEND_DO_FCALL` |
+| `ThrowUnhandledMatch` | `ZEND_MATCH_ERROR` |
 | `IterInit` | `ZEND_FE_RESET_R` |
 | `IterNext` | `ZEND_FE_FETCH_R`, `ZEND_FE_FREE` |
 | `Return`, `ReturnNull` | `ZEND_RETURN`, `ZEND_RETURN` with `null` |

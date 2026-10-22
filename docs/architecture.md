@@ -119,8 +119,8 @@ writing), and `vendor/php-src` tracks branch `PHP-8.5`.
 
 Deliberately unimplemented (they produce explicit errors): classes, objects,
 closures/arrow functions, namespaces, attributes, exceptions, references,
-`include`/`require`, `match`, `new`, property/method access, static access,
-dynamic calls, named arguments and alternative control syntax. By-reference
+`include`/`require`, `new`, property/method access, static access, dynamic
+calls, named arguments and alternative control syntax. By-reference
 builtins such as `sort()` and `array_push()` are also absent until references
 exist. Opcodes carry no source line information yet, so runtime diagnostics
 omit the line number.

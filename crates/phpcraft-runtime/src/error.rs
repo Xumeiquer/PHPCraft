@@ -15,6 +15,7 @@ pub enum ErrorKind {
     ArgumentCountError,
     ArithmeticError,
     ParseError,
+    UnhandledMatch,
 }
 
 impl ErrorKind {
@@ -26,6 +27,7 @@ impl ErrorKind {
             ErrorKind::ArgumentCountError => "ArgumentCountError",
             ErrorKind::ArithmeticError => "ArithmeticError",
             ErrorKind::ParseError => "Parse error",
+            ErrorKind::UnhandledMatch => "UnhandledMatchError",
         }
     }
 }
