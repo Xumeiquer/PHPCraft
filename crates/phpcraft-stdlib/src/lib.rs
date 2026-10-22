@@ -13,7 +13,7 @@ use std::rc::Rc;
 use phpcraft_runtime::value::parse_numeric;
 use phpcraft_runtime::{
     compare, float_to_fixed, float_to_general, float_to_repr, key_from_value, loose_eq, strict_eq,
-    Key, Numeric, PhpArray, PhpError, PhpResult, RuntimeHooks, ToNumber, Value,
+    Key, Numeric, PhpArray, PhpClosure, PhpError, PhpResult, RuntimeHooks, ToNumber, Value,
 };
 
 pub type NativeFn = fn(&mut dyn RuntimeHooks, Vec<Value>) -> PhpResult<Value>;
@@ -117,6 +117,7 @@ static REGISTRY: &[(&str, NativeFn)] = &[
     // types
     ("gettype", gettype),
     ("get_debug_type", get_debug_type),
+    ("get_class", get_class),
     ("intval", intval),
     ("floatval", floatval),
     ("doubleval", floatval),
@@ -131,10 +132,13 @@ static REGISTRY: &[(&str, NativeFn)] = &[
     ("is_string", is_string),
     ("is_bool", is_bool),
     ("is_array", is_array),
+    ("is_object", is_object),
     ("is_numeric", is_numeric),
     ("is_scalar", is_scalar),
     ("is_callable", is_callable),
     ("function_exists", function_exists),
+    ("call_user_func", call_user_func),
+    ("call_user_func_array", call_user_func_array),
     // output
     ("var_dump", var_dump),
     ("print_r", print_r),
@@ -1858,7 +1862,7 @@ fn array_map(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value>
     let array = as_array(&args, 1, "array_map", "array")?;
     let callback = match &args[0] {
         Value::Null => None,
-        Value::Str(name) => Some(String::from_utf8_lossy(name.as_bytes()).into_owned()),
+        Value::Str(_) | Value::Closure(_) => Some(args[0].clone()),
         other => {
             return Err(type_error_arg(
                 "array_map",
@@ -1873,7 +1877,7 @@ fn array_map(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value>
     for (key, value) in array.iter() {
         let mapped = match &callback {
             None => value.clone(),
-            Some(name) => hooks.call(name, vec![value.clone()])?,
+            Some(callable) => hooks.call_value(callable, vec![value.clone()])?,
         };
         match key {
             Key::Str(_) => {
@@ -2355,12 +2359,24 @@ fn gettype(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
         Value::Float(_) => "double",
         Value::Str(_) => "string",
         Value::Array(_) => "array",
+        Value::Closure(_) => "object",
     }))
 }
 
 fn get_debug_type(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("get_debug_type", &args, 1, Some(1))?;
     Ok(Value::from_str_lit(args[0].debug_type_name()))
+}
+
+fn get_class(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("get_class", &args, 1, Some(1))?;
+    match &args[0] {
+        Value::Closure(_) => Ok(Value::from_str_lit("Closure")),
+        other => Err(PhpError::type_error(format!(
+            "get_class(): Argument #1 ($object) must be of type object, {} given",
+            other.debug_type_name()
+        ))),
+    }
 }
 
 fn intval(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
@@ -2393,6 +2409,11 @@ fn floatval(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value>
 
 fn strval(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("strval", &args, 1, Some(1))?;
+    if matches!(args[0], Value::Closure(_)) {
+        return Err(PhpError::fatal(
+            "Object of class Closure could not be converted to string",
+        ));
+    }
     Ok(string_value(args[0].to_bytes()))
 }
 
@@ -2416,6 +2437,7 @@ type_predicate!(is_float, "is_float", Value::Float(_));
 type_predicate!(is_string, "is_string", Value::Str(_));
 type_predicate!(is_bool, "is_bool", Value::Bool(_));
 type_predicate!(is_array, "is_array", Value::Array(_));
+type_predicate!(is_object, "is_object", Value::Closure(_));
 
 fn is_numeric(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("is_numeric", &args, 1, Some(1))?;
@@ -2436,9 +2458,23 @@ fn is_callable(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Valu
     arity("is_callable", &args, 1, Some(3))?;
     let result = match &args[0] {
         Value::Str(name) => hooks.function_exists(&String::from_utf8_lossy(name.as_bytes())),
+        Value::Closure(_) => true,
         _ => false,
     };
     Ok(Value::Bool(result))
+}
+
+fn call_user_func(hooks: &mut dyn RuntimeHooks, mut args: Vec<Value>) -> PhpResult<Value> {
+    arity("call_user_func", &args, 1, None)?;
+    let callable = args.remove(0);
+    hooks.call_value(&callable, args)
+}
+
+fn call_user_func_array(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("call_user_func_array", &args, 2, Some(2))?;
+    let array = as_array(&args, 1, "call_user_func_array", "args")?;
+    let values = array.iter().map(|(_, value)| value.clone()).collect();
+    hooks.call_value(&args[0], values)
 }
 
 fn function_exists(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
@@ -2485,6 +2521,51 @@ fn dump_value(value: &Value, depth: usize, out: &mut Vec<u8>) {
             out.extend(std::iter::repeat_n(b' ', depth * 2));
             out.extend_from_slice(b"}\n");
         }
+        Value::Closure(closure) => {
+            let properties = 3
+                + usize::from(!closure.captures.is_empty())
+                + usize::from(!closure.parameters.is_empty());
+            out.extend_from_slice(
+                format!("object(Closure)#{} ({properties}) {{\n", closure.id).as_bytes(),
+            );
+            let property_indent = (depth + 1) * 2;
+            out.extend(std::iter::repeat_n(b' ', property_indent));
+            out.extend_from_slice(b"[\"name\"]=>\n");
+            dump_value(&Value::from_str_lit(&closure.name), depth + 1, out);
+            out.extend(std::iter::repeat_n(b' ', property_indent));
+            out.extend_from_slice(b"[\"file\"]=>\n");
+            dump_value(&Value::from_str_lit(&closure.file), depth + 1, out);
+            out.extend(std::iter::repeat_n(b' ', property_indent));
+            out.extend_from_slice(b"[\"line\"]=>\n");
+            dump_value(&Value::Int(i64::from(closure.line)), depth + 1, out);
+            if !closure.captures.is_empty() {
+                out.extend(std::iter::repeat_n(b' ', property_indent));
+                out.extend_from_slice(b"[\"static\"]=>\n");
+                let mut captured = PhpArray::new();
+                for (name, value) in closure.capture_names.iter().zip(closure.captures.iter()) {
+                    captured.insert(Key::from_str(name), value.clone());
+                }
+                dump_value(&Value::array(captured), depth + 1, out);
+            }
+            if !closure.parameters.is_empty() {
+                out.extend(std::iter::repeat_n(b' ', property_indent));
+                out.extend_from_slice(b"[\"parameter\"]=>\n");
+                let mut parameters = PhpArray::new();
+                for (name, optional) in &closure.parameters {
+                    parameters.insert(
+                        Key::from_str(&format!("${name}")),
+                        Value::from_str_lit(if *optional {
+                            "<optional>"
+                        } else {
+                            "<required>"
+                        }),
+                    );
+                }
+                dump_value(&Value::array(parameters), depth + 1, out);
+            }
+            out.extend(std::iter::repeat_n(b' ', depth * 2));
+            out.extend_from_slice(b"}\n");
+        }
     }
 }
 
@@ -2497,8 +2578,7 @@ fn var_dump(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
     Ok(Value::Null)
 }
 
-fn print_array(array: &PhpArray, level: usize, out: &mut Vec<u8>) {
-    out.extend_from_slice(b"Array\n");
+fn print_array_body(array: &PhpArray, level: usize, out: &mut Vec<u8>) {
     out.extend(std::iter::repeat_n(b' ', level * 4));
     out.extend_from_slice(b"(\n");
     for (key, value) in array.iter() {
@@ -2511,6 +2591,10 @@ fn print_array(array: &PhpArray, level: usize, out: &mut Vec<u8>) {
                 print_array(child, level + 2, out);
                 // Nested arrays already end with a newline; PHP leaves a blank
                 // line before the next element.
+                out.push(b'\n');
+            }
+            Value::Closure(child) => {
+                print_closure(child, level + 2, out);
                 out.push(b'\n');
             }
             Value::Null => out.push(b'\n'),
@@ -2529,11 +2613,47 @@ fn print_array(array: &PhpArray, level: usize, out: &mut Vec<u8>) {
     out.extend_from_slice(b")\n");
 }
 
+fn print_array(array: &PhpArray, level: usize, out: &mut Vec<u8>) {
+    out.extend_from_slice(b"Array\n");
+    print_array_body(array, level, out);
+}
+
+fn print_closure(closure: &PhpClosure, level: usize, out: &mut Vec<u8>) {
+    out.extend_from_slice(b"Closure Object\n");
+    let mut properties = PhpArray::new();
+    properties.insert_str("name", Value::from_str_lit(&closure.name));
+    properties.insert_str("file", Value::from_str_lit(&closure.file));
+    properties.insert_str("line", Value::Int(i64::from(closure.line)));
+    if !closure.captures.is_empty() {
+        let mut captures = PhpArray::new();
+        for (name, value) in closure.capture_names.iter().zip(closure.captures.iter()) {
+            captures.insert(Key::from_str(name), value.clone());
+        }
+        properties.insert_str("static", Value::array(captures));
+    }
+    if !closure.parameters.is_empty() {
+        let mut parameters = PhpArray::new();
+        for (name, optional) in &closure.parameters {
+            parameters.insert(
+                Key::from_str(&format!("${name}")),
+                Value::from_str_lit(if *optional {
+                    "<optional>"
+                } else {
+                    "<required>"
+                }),
+            );
+        }
+        properties.insert_str("parameter", Value::array(parameters));
+    }
+    print_array_body(&properties, level, out);
+}
+
 fn print_r(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("print_r", &args, 1, Some(2))?;
     let mut out = Vec::new();
     match &args[0] {
         Value::Array(array) => print_array(array, 0, &mut out),
+        Value::Closure(closure) => print_closure(closure, 0, &mut out),
         Value::Null => {}
         Value::Bool(true) => out.push(b'1'),
         Value::Bool(false) => {}

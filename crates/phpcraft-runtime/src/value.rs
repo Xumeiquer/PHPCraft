@@ -39,6 +39,35 @@ impl fmt::Debug for PhpStr {
     }
 }
 
+/// A userland closure value. The VM resolves `function` to the compiled body;
+/// `captures` holds the by-value `use (...)` or arrow-function imports.
+#[derive(Clone)]
+pub struct PhpClosure {
+    /// Synthetic function name used to resolve the compiled body.
+    pub function: String,
+    /// Closure display name (`{closure:<file>:<line>}`).
+    pub name: String,
+    pub file: String,
+    pub line: u32,
+    /// Object handle shown by `var_dump`.
+    pub id: u64,
+    pub capture_names: Vec<String>,
+    /// `(name, optional)` for the closure's declared parameters.
+    pub parameters: Vec<(String, bool)>,
+    pub captures: Vec<Value>,
+}
+
+impl fmt::Debug for PhpClosure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "closure({}, {} captures)",
+            self.function,
+            self.captures.len()
+        )
+    }
+}
+
 /// A numeric value produced by PHP's numeric conversion.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Numeric {
@@ -86,6 +115,7 @@ pub enum Value {
     Float(f64),
     Str(Rc<PhpStr>),
     Array(Rc<PhpArray>),
+    Closure(Rc<PhpClosure>),
 }
 
 impl Value {
@@ -101,6 +131,28 @@ impl Value {
         Value::Array(Rc::new(items))
     }
 
+    pub fn closure(
+        function: String,
+        file: String,
+        line: u32,
+        id: u64,
+        capture_names: Vec<String>,
+        parameters: Vec<(String, bool)>,
+        captures: Vec<Value>,
+    ) -> Self {
+        let name = format!("{{closure:{file}:{line}}}");
+        Value::Closure(Rc::new(PhpClosure {
+            function,
+            name,
+            file,
+            line,
+            id,
+            capture_names,
+            parameters,
+            captures,
+        }))
+    }
+
     /// PHP's `gettype()` name.
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -110,6 +162,7 @@ impl Value {
             Value::Float(_) => "float",
             Value::Str(_) => "string",
             Value::Array(_) => "array",
+            Value::Closure(_) => "object",
         }
     }
 
@@ -122,6 +175,7 @@ impl Value {
             Value::Float(_) => "float",
             Value::Str(_) => "string",
             Value::Array(_) => "array",
+            Value::Closure(_) => "Closure",
         }
     }
 
@@ -145,6 +199,7 @@ impl Value {
             Value::Float(f) => *f != 0.0,
             Value::Str(s) => !(s.0.is_empty() || s.0 == b"0"),
             Value::Array(a) => !a.is_empty(),
+            Value::Closure(_) => true,
         }
     }
 
@@ -158,6 +213,7 @@ impl Value {
             Value::Float(f) => float_to_string(*f).into_bytes(),
             Value::Str(s) => s.0.clone(),
             Value::Array(_) => b"Array".to_vec(),
+            Value::Closure(_) => b"Closure".to_vec(),
         }
     }
 
@@ -180,6 +236,7 @@ impl Value {
                 None => 0,
             },
             Value::Array(a) => i64::from(!a.is_empty()),
+            Value::Closure(_) => 1,
         }
     }
 
@@ -195,6 +252,7 @@ impl Value {
                 None => 0.0,
             },
             Value::Array(a) => f64::from(u8::from(!a.is_empty())),
+            Value::Closure(_) => 1.0,
         }
     }
 
@@ -210,7 +268,7 @@ impl Value {
                 Some((n, false)) => ToNumber::Leading(n),
                 None => ToNumber::Invalid,
             },
-            Value::Array(_) => ToNumber::Invalid,
+            Value::Array(_) | Value::Closure(_) => ToNumber::Invalid,
         }
     }
 
@@ -220,6 +278,9 @@ impl Value {
             Value::Str(s) => Ok(s.clone()),
             Value::Array(_) => Err(PhpError::type_error(
                 "Array to string conversion is not supported",
+            )),
+            Value::Closure(_) => Err(PhpError::type_error(
+                "Object of class Closure could not be converted to string",
             )),
             other => Ok(Rc::new(PhpStr::new(other.to_bytes()))),
         }
@@ -235,6 +296,7 @@ impl fmt::Debug for Value {
             Value::Float(v) => write!(f, "float({})", float_to_repr(*v)),
             Value::Str(s) => write!(f, "string({:?})", s.to_string_lossy()),
             Value::Array(a) => write!(f, "array({})", a.len()),
+            Value::Closure(c) => write!(f, "closure({})", c.function),
         }
     }
 }
@@ -498,6 +560,7 @@ pub fn strict_eq(a: &Value, b: &Value) -> bool {
                 .zip(y.iter())
                 .all(|((ka, va), (kb, vb))| ka == kb && strict_eq(va, vb))
         }
+        (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),
         _ => false,
     }
 }
@@ -546,6 +609,13 @@ pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
         (Array(x), Array(y)) => compare_arrays(x, y),
         (Array(_), _) => Some(Ordering::Greater),
         (_, Array(_)) => Some(Ordering::Less),
+        (Closure(x), Closure(y)) => Some(if Rc::ptr_eq(x, y) {
+            Ordering::Equal
+        } else {
+            Ordering::Greater
+        }),
+        (Closure(_), _) => Some(Ordering::Greater),
+        (_, Closure(_)) => Some(Ordering::Less),
         (Null, _) | (_, Null) | (Bool(_), _) | (_, Bool(_)) => Some(a.to_bool().cmp(&b.to_bool())),
     }
 }
@@ -591,7 +661,7 @@ pub fn key_from_value(value: &Value) -> PhpResult<Key> {
         Value::Bool(b) => Key::Int(i64::from(*b)),
         Value::Float(f) => Key::Int(float_to_int(*f)),
         Value::Null => Key::Str(Rc::new(PhpStr::from_str(""))),
-        Value::Array(_) => {
+        Value::Array(_) | Value::Closure(_) => {
             return Err(PhpError::type_error(
                 "Illegal offset type: array keys must be int or string",
             ))

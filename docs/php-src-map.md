@@ -16,6 +16,7 @@ gitignored.
 | `Zend/zend_opcode.c`, `Zend/zend_vm_opcodes.h` | `crates/phpcraft-bytecode/src/lib.rs` | `Op`, `Chunk`, `Function`, `CompiledProgram`. Stack machine instead of Zend's register slots. |
 | `Zend/zend_vm_def.h`, `Zend/zend_vm_execute.h` | `crates/phpcraft-vm/src/lib.rs` | Dispatch loop, frames, variable fetch/store, iterators. |
 | `Zend/zend_execute.c` | `crates/phpcraft-vm/src/lib.rs` | Function calls, `global` binding, return values, nesting guard. |
+| `Zend/zend_closures.c` | `crates/phpcraft-runtime/src/value.rs`, `crates/phpcraft-vm/src/lib.rs` | `PhpClosure`, capture binding and invocation. |
 | `Zend/zend_types.h` | `crates/phpcraft-runtime/src/value.rs` | `Value` corresponds to `zval`; `PhpStr` to `zend_string`. |
 | `Zend/zend_string.c`, `Zend/zend_string.h` | `crates/phpcraft-runtime/src/value.rs` | Byte strings and PHP string conversions. |
 | `Zend/zend_hash.c`, `Zend/zend_hash.h` | `crates/phpcraft-runtime/src/array.rs` | Ordered hash table with `Key::Int`/`Key::Str`, next-index tracking and COW. |
@@ -66,6 +67,8 @@ fetch/assign instructions.
 | `IndexSafe` | `ZEND_FETCH_DIM_IS` |
 | `AssignDim` | `ZEND_ASSIGN_DIM`, `ZEND_ASSIGN_DIM_OP` |
 | `Call` | `ZEND_INIT_FCALL`, `ZEND_SEND_VAL`, `ZEND_DO_FCALL` |
+| `CallValue` | `ZEND_INIT_DYNAMIC_CALL`, `ZEND_DO_FCALL` |
+| `MakeClosure` | `ZEND_DECLARE_LAMBDA_FUNCTION`, `ZEND_BIND_LEXICAL` |
 | `ThrowUnhandledMatch` | `ZEND_MATCH_ERROR` |
 | `IterInit` | `ZEND_FE_RESET_R` |
 | `IterNext` | `ZEND_FE_FETCH_R`, `ZEND_FE_FREE` |
@@ -86,8 +89,9 @@ fetch/assign instructions.
 | `IS_DOUBLE` | `Value::Float(f64)` |
 | `IS_STRING` (`zend_string`) | `Value::Str(Rc<PhpStr>)` |
 | `IS_ARRAY` (`HashTable`) | `Value::Array(Rc<PhpArray>)` |
+| `IS_OBJECT` (`Closure`) | `Value::Closure(Rc<PhpClosure>)` |
 | `ZVAL_DEREF`, reference zvals | not implemented |
-| `IS_OBJECT`, `IS_RESOURCE` | not implemented |
+| other `IS_OBJECT`, `IS_RESOURCE` | not implemented |
 
 | Behaviour | php-src location | PHPCraft |
 | --- | --- | --- |
@@ -115,9 +119,10 @@ fetch/assign instructions.
 | `array_combine`, `array_flip`, `array_map`, `range` | same |
 | `abs`, `ceil`, `floor`, `round`, `sqrt`, `pow`, `intdiv`, `fmod` | same |
 | `max`, `min`, `pi` | same |
-| `gettype`, `get_debug_type`, `intval`, `floatval`, `strval`, `boolval` | same |
-| `is_null`, `is_int`, `is_float`, `is_string`, `is_bool`, `is_array` | same |
+| `gettype`, `get_debug_type`, `get_class`, `intval`, `floatval`, `strval`, `boolval` | same |
+| `is_null`, `is_int`, `is_float`, `is_string`, `is_bool`, `is_array`, `is_object` | same |
 | `is_numeric`, `is_scalar`, `is_callable`, `function_exists` | same |
+| `call_user_func`, `call_user_func_array` | same, via `RuntimeHooks::call_value` |
 | `var_dump`, `print_r` | same |
 | `define`, `defined`, `constant` | same, backed by `Vm::define_constant` |
 
@@ -135,6 +140,7 @@ fetch/assign instructions.
 | `ext/standard/tests/math/*.phpt` | `tests/php/07_stdlib.php`, `tests/php/08_floats.php`, `tests/php/14_stdlib_batch.php` |
 | `tests/lang/control_structures/*.phpt` | `tests/php/04_control.php` |
 | `tests/lang/functions/*.phpt` | `tests/php/05_functions.php` |
+| `Zend/tests/closures/*.phpt` | `tests/php/15_closures.php` |
 
 `scripts/phpt-subset.sh` extracts `--FILE--` sections from a php-src checkout
 and skips tests that need extensions, INI settings, request data or special

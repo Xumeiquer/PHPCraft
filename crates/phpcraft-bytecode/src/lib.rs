@@ -92,6 +92,16 @@ pub enum Op {
         name: u32,
         argc: u32,
     },
+    /// Call a callable value (closure or callable string) with `argc` args.
+    CallValue {
+        argc: u32,
+    },
+    /// Pop `argc` captured values and push a closure for the function named
+    /// by `consts[name]`.
+    MakeClosure {
+        name: u32,
+        argc: u32,
+    },
 
     /// Abort with `UnhandledMatchError` after no match arm was selected.
     ThrowUnhandledMatch {
@@ -143,7 +153,15 @@ pub struct ParamSlot {
 #[derive(Clone, Debug)]
 pub struct Function {
     pub name: String,
+    /// PHP-visible name for diagnostics, when it differs from the internal
+    /// lookup key (closures use a unique synthetic name).
+    pub display_name: Option<String>,
     pub params: Vec<ParamSlot>,
+    /// Slots that receive values captured by a closure, in creation order.
+    /// Empty for named functions.
+    pub capture_slots: Vec<u32>,
+    /// Names corresponding to `capture_slots`, used by `var_dump`.
+    pub capture_names: Vec<String>,
     pub chunk: Chunk,
     pub max_slots: u32,
     /// Variable name per slot (temps have `None`); used in diagnostics.
@@ -155,6 +173,8 @@ impl Function {
     pub fn display_name(&self) -> String {
         if self.name == "{main}" {
             "main".to_string()
+        } else if let Some(display_name) = &self.display_name {
+            display_name.clone()
         } else {
             self.name.clone()
         }

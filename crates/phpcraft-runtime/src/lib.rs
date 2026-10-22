@@ -13,7 +13,7 @@ pub use array::{Key, PhpArray};
 pub use error::{ErrorKind, PhpError, PhpResult};
 pub use value::{
     compare, float_to_fixed, float_to_general, float_to_repr, float_to_string, key_from_value,
-    loose_eq, strict_eq, Numeric, PhpStr, ToNumber, Value,
+    loose_eq, strict_eq, Numeric, PhpClosure, PhpStr, ToNumber, Value,
 };
 
 /// Services the standard library needs from the engine while a script runs.
@@ -29,6 +29,18 @@ pub trait RuntimeHooks {
 
     /// Call a userland function by name (for the few callbacks we support).
     fn call(&mut self, name: &str, args: Vec<Value>) -> PhpResult<Value>;
+
+    /// Call a callable value. The default only supports callable strings so
+    /// lightweight test hooks do not need to understand closures.
+    fn call_value(&mut self, callable: &Value, args: Vec<Value>) -> PhpResult<Value> {
+        match callable {
+            Value::Str(name) => self.call(&String::from_utf8_lossy(name.as_bytes()), args),
+            other => Err(PhpError::type_error(format!(
+                "Value of type {} is not callable",
+                other.debug_type_name()
+            ))),
+        }
+    }
 
     /// Whether a function (builtin or userland) exists.
     fn function_exists(&mut self, name: &str) -> bool;

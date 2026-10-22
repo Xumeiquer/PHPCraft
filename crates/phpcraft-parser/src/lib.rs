@@ -7,8 +7,8 @@
 //! boundary of the implementation is always explicit.
 
 use phpcraft_ast::{
-    ArrayItem, BinOp, CastKind, Expr, FunctionDecl, InterpPart, MatchArm, Param, Program, Stmt,
-    SwitchCase, UnOp,
+    ArrayItem, BinOp, Capture, CastKind, ClosureBody, ClosureDecl, Expr, FunctionDecl, InterpPart,
+    MatchArm, Param, Program, Stmt, SwitchCase, UnOp,
 };
 use phpcraft_lexer::{self, DimKey, StrPart, Tok, Token};
 
@@ -251,7 +251,9 @@ impl Parser {
         if self.check_keyword("switch") {
             return self.parse_switch();
         }
-        if self.check_keyword("function") {
+        // A statement starting with `function` is a declaration only when a
+        // name follows; otherwise it is a closure expression.
+        if self.check_keyword("function") && matches!(self.peek_at(1), Tok::Ident(_)) {
             return Ok(Stmt::Function(self.parse_function()?));
         }
         if self.check_keyword("return") {
@@ -592,6 +594,69 @@ impl Parser {
         })
     }
 
+    fn parse_closure_expr(&mut self, arrow: bool) -> Result<Expr, ParseError> {
+        let line = self.line();
+        if arrow {
+            self.expect_keyword("fn")?;
+        } else {
+            self.expect_keyword("function")?;
+        }
+        if matches!(self.peek(), Tok::BitAnd) {
+            return Err(self.unsupported("by-reference closure returns"));
+        }
+        self.expect(&Tok::LParen)?;
+        let params = self.parse_params()?;
+
+        let mut captures = Vec::new();
+        if !arrow && self.eat_keyword("use") {
+            self.expect(&Tok::LParen)?;
+            if self.eat(&Tok::RParen) {
+                return Err(
+                    self.error("syntax error, unexpected \")\", expecting variable in use (...)")
+                );
+            }
+            loop {
+                let by_ref = self.eat(&Tok::BitAnd);
+                let name = self.expect_variable()?;
+                captures.push(Capture { name, by_ref });
+                if self.eat(&Tok::Comma) {
+                    if self.eat(&Tok::RParen) {
+                        break;
+                    }
+                    continue;
+                }
+                self.expect(&Tok::RParen)?;
+                break;
+            }
+        } else if arrow && self.check_keyword("use") {
+            return Err(self.unsupported("use (...) on arrow functions"));
+        }
+
+        if self.eat(&Tok::Colon) {
+            while !matches!(
+                self.peek(),
+                Tok::LBrace | Tok::DoubleArrow | Tok::Semi | Tok::Eof
+            ) {
+                self.advance();
+            }
+        }
+
+        let body = if arrow {
+            self.expect(&Tok::DoubleArrow)?;
+            ClosureBody::Expr(self.parse_expr()?)
+        } else {
+            self.expect(&Tok::LBrace)?;
+            ClosureBody::Block(self.parse_block_body()?)
+        };
+
+        Ok(Expr::Closure(Box::new(ClosureDecl {
+            params,
+            captures,
+            body,
+            line,
+        })))
+    }
+
     fn parse_params(&mut self) -> Result<Vec<Param>, ParseError> {
         let mut params = Vec::new();
         if self.eat(&Tok::RParen) {
@@ -717,8 +782,13 @@ impl Parser {
                 };
                 continue;
             }
-            if matches!(self.peek(), Tok::LParen) {
-                return Err(self.unsupported("dynamic function calls ($fn())"));
+            if self.eat(&Tok::LParen) {
+                let args = self.parse_call_args()?;
+                lhs = Expr::DynamicCall {
+                    callee: Box::new(lhs),
+                    args,
+                };
+                continue;
             }
             if matches!(self.peek(), Tok::Arrow) {
                 return Err(self.unsupported("object property access (->)"));
@@ -977,7 +1047,23 @@ impl Parser {
                     }
                     "list" => Err(self.unsupported("list() destructuring")),
                     "new" | "clone" => Err(self.unsupported("objects")),
-                    "function" | "fn" => Err(self.unsupported("closures")),
+                    "static"
+                        if matches!(
+                            self.peek_at(1),
+                            Tok::Ident(next)
+                                if next.eq_ignore_ascii_case("function")
+                                    || next.eq_ignore_ascii_case("fn")
+                        ) =>
+                    {
+                        self.advance();
+                        let arrow = matches!(
+                            self.peek(),
+                            Tok::Ident(next) if next.eq_ignore_ascii_case("fn")
+                        );
+                        self.parse_closure_expr(arrow)
+                    }
+                    "function" => self.parse_closure_expr(false),
+                    "fn" => self.parse_closure_expr(true),
                     "match" if self.peek_at(1) == &Tok::LParen => self.parse_match(),
                     "yield" => Err(self.unsupported("generators")),
                     "throw" => Err(self.unsupported("exceptions")),
@@ -1241,10 +1327,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_closures_arrow_functions_and_dynamic_calls() {
+        let program = parse_file(
+            br#"<?php
+                $f = function ($x) use ($y) { return $x + $y; };
+                $g = fn($z) => $z * 2;
+                $f(1);
+            "#,
+        )
+        .unwrap();
+        match &program.stmts[0] {
+            Stmt::Expr(Expr::Assign { value, .. }) => {
+                assert!(matches!(value.as_ref(), Expr::Closure(_)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &program.stmts[1] {
+            Stmt::Expr(Expr::Assign { value, .. }) => {
+                assert!(matches!(value.as_ref(), Expr::Closure(_)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            &program.stmts[2],
+            Stmt::Expr(Expr::DynamicCall { .. })
+        ));
+    }
+
+    #[test]
     fn reports_unsupported_constructs() {
         let err = parse_file(b"<?php class Foo {}").unwrap_err();
         assert!(err.message.contains("class"));
-        let err = parse_file(b"<?php $x = fn() => 1;").unwrap_err();
-        assert!(err.message.contains("closures"));
     }
 }

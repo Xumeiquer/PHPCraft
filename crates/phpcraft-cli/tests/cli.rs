@@ -68,6 +68,31 @@ fn match_expression_and_unhandled_case() {
 }
 
 #[test]
+fn closures_run_and_by_reference_captures_are_rejected() {
+    let output = phpcraft()
+        .args([
+            "-r",
+            r#"$n = 2; $f = fn($x) => $x + $n; echo $f(3), "|", (function ($x) { return $x * 2; })(4);"#,
+        ])
+        .output()
+        .expect("run phpcraft");
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "5|8");
+
+    let output = phpcraft()
+        .args([
+            "-r",
+            r#"$x = 1; $f = function () use (&$x) { return $x; };"#,
+        ])
+        .output()
+        .expect("run phpcraft");
+    assert_eq!(output.status.code(), Some(255));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("by-reference closure captures are not supported"));
+}
+
+#[test]
 fn extreme_integers_do_not_panic_the_interpreter() {
     for code in [
         "str_repeat('a', PHP_INT_MAX);",

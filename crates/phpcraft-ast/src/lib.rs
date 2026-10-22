@@ -78,6 +78,37 @@ pub struct Param {
     pub variadic: bool,
 }
 
+/// A variable imported by `use (...)` on a closure.
+#[derive(Clone, Debug)]
+pub struct Capture {
+    pub name: String,
+    pub by_ref: bool,
+}
+
+/// The body of an anonymous function: a block for `function`, or a single
+/// expression for `fn`.
+#[derive(Clone, Debug)]
+pub enum ClosureBody {
+    Block(Vec<Stmt>),
+    Expr(Expr),
+}
+
+#[derive(Clone, Debug)]
+pub struct ClosureDecl {
+    pub params: Vec<Param>,
+    /// Explicit `use (...)` captures. Arrow functions leave this empty and
+    /// capture free variables implicitly.
+    pub captures: Vec<Capture>,
+    pub body: ClosureBody,
+    pub line: u32,
+}
+
+impl ClosureDecl {
+    pub fn is_arrow(&self) -> bool {
+        matches!(self.body, ClosureBody::Expr(_))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ArrayItem {
     pub key: Option<Expr>,
@@ -160,6 +191,13 @@ pub enum Expr {
         name: String,
         args: Vec<Expr>,
     },
+    /// `$fn(...)`, `(function () { ... })(...)`, or a callable expression.
+    DynamicCall {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+    },
+    /// `function (...) use (...) { ... }` or `fn (...) => ...`.
+    Closure(Box<ClosureDecl>),
     /// `match ($value) { 1, 2 => ..., default => ... }`.
     Match {
         subject: Box<Expr>,

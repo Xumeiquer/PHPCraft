@@ -79,6 +79,12 @@ function calls create a frame with fixed slots; `slot_names` in `Function`
 supports diagnostics. Temporary slots are used by the compiler for arrays,
 `foreach` iterators and short-circuit evaluation.
 
+Anonymous functions compile to ordinary `Function` bodies with synthetic
+names. `MakeClosure` captures values into a `PhpClosure`; the body's
+`capture_slots` bind those values when the closure is invoked. Arrow functions
+collect free variables at compile time and use the same runtime path. Dynamic
+calls use `CallValue`, which dispatches closures and callable strings.
+
 ## Control flow
 
 The compiler lowers structured control flow to jumps:
@@ -118,9 +124,9 @@ writing), and `vendor/php-src` tracks branch `PHP-8.5`.
 ## Current limits
 
 Deliberately unimplemented (they produce explicit errors): classes, objects,
-closures/arrow functions, namespaces, attributes, exceptions, references,
-`include`/`require`, `new`, property/method access, static access, dynamic
-calls, named arguments and alternative control syntax. By-reference
-builtins such as `sort()` and `array_push()` are also absent until references
-exist. Opcodes carry no source line information yet, so runtime diagnostics
-omit the line number.
+namespaces, attributes, exceptions, references, by-reference closure captures,
+first-class callable syntax, `include`/`require`, `new`, property/method
+access, static access, named arguments and alternative control syntax.
+By-reference builtins such as `sort()` and `array_push()` are also absent until
+references exist. Opcodes carry no source line information yet, so runtime
+diagnostics omit the line number.

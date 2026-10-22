@@ -10,6 +10,14 @@ The reference behaviour is PHP 8.5.4.
 
 ### Added
 
+- Closures and arrow functions: `function (...) use (...)` captures, implicit
+  arrow-function captures, default/variadic parameters, nested closures and
+  by-value capture semantics.
+- Dynamic calls (`$fn(...)`, `(fn() => ...)()`) and callable strings, including
+  closure callbacks for `array_map()`, `call_user_func()` and
+  `call_user_func_array()`.
+- `is_object()` and `get_class()` recognize closures, and `var_dump()`/`print_r()`
+  expose their source location, captures and parameter metadata.
 - `match` expressions: multiple conditions per arm, strict (`===`)
   comparison, a `default` arm in any position, trailing commas, nested
   expressions and `UnhandledMatchError` when no arm matches.
@@ -25,6 +33,8 @@ The reference behaviour is PHP 8.5.4.
     `is_finite`, `is_infinite`
   - URL: `urlencode`, `urldecode`, `rawurlencode`, `rawurldecode`
 - Differential coverage for the new stdlib batch.
+- Differential coverage for closures, arrow functions, dynamic calls and
+  closure callbacks.
 
 ### Fixed
 
@@ -55,15 +65,15 @@ The reference behaviour is PHP 8.5.4.
 
 ### Tested
 
-- 40 Rust unit/integration tests.
-- 14 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
+- 43 Rust unit/integration tests.
+- 15 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
   status.
 
 ### Planned
 
 - References and by-reference builtins (`sort`, `array_push`, `unset`,
-  `foreach &$value`).
-- Closures, arrow functions and first-class callables.
+  `foreach &$value`), including by-reference closure captures.
+- First-class callable syntax (`strlen(...)`) and callable arrays.
 - Classes, objects, property access and exceptions.
 - `include`/`require` and namespaces.
 

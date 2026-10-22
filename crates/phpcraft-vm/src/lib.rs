@@ -59,6 +59,8 @@ pub struct Vm {
     output: Vec<u8>,
     warnings: Vec<String>,
     depth: u32,
+    file: String,
+    next_object_id: u64,
 }
 
 impl Default for Vm {
@@ -107,11 +109,14 @@ impl Vm {
             output: Vec::new(),
             warnings: Vec::new(),
             depth: 0,
+            file: String::new(),
+            next_object_id: 1,
         }
     }
 
     /// Register every compiled userland function.
     pub fn load(&mut self, program: &CompiledProgram) {
+        self.file = program.file.clone();
         for function in &program.functions {
             self.functions.insert(
                 function.name.to_ascii_lowercase(),
@@ -172,7 +177,25 @@ impl Vm {
         self.warnings.push(message);
     }
 
+    fn output_bytes(&mut self, value: &Value) -> PhpResult<Vec<u8>> {
+        if matches!(value, Value::Closure(_)) {
+            return Err(PhpError::fatal(
+                "Object of class Closure could not be converted to string",
+            ));
+        }
+        Ok(value.to_bytes())
+    }
+
     fn call_function(&mut self, function: Rc<Function>, args: Vec<Value>) -> PhpResult<Value> {
+        self.call_function_with_captures(function, &[], args)
+    }
+
+    fn call_function_with_captures(
+        &mut self,
+        function: Rc<Function>,
+        captures: &[Value],
+        args: Vec<Value>,
+    ) -> PhpResult<Value> {
         if self.depth >= MAX_CALL_DEPTH {
             return Err(PhpError::fatal(
                 "Maximum function nesting level reached (infinite recursion?)",
@@ -180,6 +203,9 @@ impl Vm {
         }
 
         let mut frame = Frame::new(function.max_slots as usize);
+        for (slot, value) in function.capture_slots.iter().zip(captures.iter()) {
+            frame.set(*slot, value.clone());
+        }
         let mut arg_index = 0usize;
         for param in &function.params {
             if param.variadic {
@@ -206,6 +232,27 @@ impl Vm {
         let result = self.run_chunk(&function.chunk, &function.slot_names, &mut frame);
         self.depth -= 1;
         result
+    }
+
+    /// Invoke a callable value: a closure or a function name.
+    pub fn invoke(&mut self, callable: Value, args: Vec<Value>) -> PhpResult<Value> {
+        match callable {
+            Value::Closure(closure) => {
+                let lower = closure.function.to_ascii_lowercase();
+                let function = self.functions.get(&lower).cloned().ok_or_else(|| {
+                    PhpError::fatal(format!("Closure function {} not found", closure.function))
+                })?;
+                self.call_function_with_captures(function, &closure.captures, args)
+            }
+            Value::Str(name) => {
+                let name = String::from_utf8_lossy(name.as_bytes()).into_owned();
+                self.call_named(&name, args)
+            }
+            other => Err(PhpError::fatal(format!(
+                "Value of type {} is not callable",
+                other.debug_type_name()
+            ))),
+        }
     }
 
     fn run_chunk(
@@ -371,7 +418,7 @@ impl Vm {
                 }
                 Op::Echo => {
                     let value = stack.pop().unwrap_or(Value::Null);
-                    let bytes = value.to_bytes();
+                    let bytes = self.output_bytes(&value)?;
                     self.output.extend_from_slice(&bytes);
                 }
                 Op::ArrayNew => stack.push(Value::array(PhpArray::new())),
@@ -450,6 +497,57 @@ impl Vm {
                     };
                     let result = self.call_named(&name, args)?;
                     stack.push(result);
+                }
+                Op::CallValue { argc } => {
+                    let argc = *argc as usize;
+                    let args = if argc == 0 {
+                        Vec::new()
+                    } else {
+                        stack.split_off(stack.len() - argc)
+                    };
+                    let callee = stack.pop().unwrap_or(Value::Null);
+                    let result = self.invoke(callee, args)?;
+                    stack.push(result);
+                }
+                Op::MakeClosure { name, argc } => {
+                    let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                    let argc = *argc as usize;
+                    let captures = if argc == 0 {
+                        Vec::new()
+                    } else {
+                        stack.split_off(stack.len() - argc)
+                    };
+                    let (line, capture_names, parameters) = self
+                        .functions
+                        .get(&name.to_ascii_lowercase())
+                        .map(|function| {
+                            (
+                                function.line,
+                                function.capture_names.clone(),
+                                function
+                                    .params
+                                    .iter()
+                                    .map(|param| {
+                                        (
+                                            param.name.clone(),
+                                            param.default.is_some() || param.variadic,
+                                        )
+                                    })
+                                    .collect(),
+                            )
+                        })
+                        .unwrap_or((0, Vec::new(), Vec::new()));
+                    let id = self.next_object_id;
+                    self.next_object_id += 1;
+                    stack.push(Value::closure(
+                        name,
+                        self.file.clone(),
+                        line,
+                        id,
+                        capture_names,
+                        parameters,
+                        captures,
+                    ));
                 }
                 Op::ThrowUnhandledMatch { subject } => {
                     let value = frame.get(*subject);
@@ -619,8 +717,8 @@ impl Vm {
                 self.arithmetic(op, lhs, rhs)
             }
             BinOp::Concat => {
-                let mut out = lhs.to_bytes();
-                out.extend_from_slice(&rhs.to_bytes());
+                let mut out = self.output_bytes(&lhs)?;
+                out.extend_from_slice(&self.output_bytes(&rhs)?);
                 Ok(Value::str(out))
             }
             BinOp::Shl | BinOp::Shr | BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
@@ -858,6 +956,10 @@ impl RuntimeHooks for Vm {
 
     fn call(&mut self, name: &str, args: Vec<Value>) -> PhpResult<Value> {
         self.call_named(name, args)
+    }
+
+    fn call_value(&mut self, callable: &Value, args: Vec<Value>) -> PhpResult<Value> {
+        self.invoke(callable.clone(), args)
     }
 
     fn function_exists(&mut self, name: &str) -> bool {
@@ -1104,6 +1206,24 @@ mod tests {
             $s = "abc"; $s--; echo $s;
         "#);
         assert_eq!(out, "b|Ba|aa|b0|10|1|NULL\nabc");
+    }
+
+    #[test]
+    fn closures_capture_by_value_and_arrow_functions() {
+        let (out, _) = run(r#"<?php
+            $n = 2;
+            $closure = function ($x) use ($n) { return $x + $n; };
+            $arrow = fn($x) => $x * $n;
+            $n = 10;
+            echo $closure(3), "|", $arrow(3), "|";
+            $make = fn($a) => fn($b) => $a + $b;
+            echo $make(4)(5), "|";
+            echo array_map(fn($v) => $v + 1, [1, 2, 3])[2], "|";
+            $name = "strlen";
+            echo $name("abcd"), "|";
+            echo $closure === $closure ? "same" : "different";
+        "#);
+        assert_eq!(out, "5|6|9|4|4|same");
     }
 
     #[test]

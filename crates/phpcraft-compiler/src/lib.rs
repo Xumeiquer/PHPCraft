@@ -7,9 +7,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use phpcraft_ast::{
-    ArrayItem, BinOp, Expr, FunctionDecl, InterpPart, MatchArm, Program, Stmt, UnOp,
+    ArrayItem, BinOp, ClosureBody, ClosureDecl, Expr, FunctionDecl, InterpPart, MatchArm, Param,
+    Program, Stmt, UnOp,
 };
 use phpcraft_bytecode::{Chunk, CompiledProgram, DimMode, Function, Op, ParamSlot};
 use phpcraft_runtime::{key_from_value, PhpArray, Value};
@@ -40,6 +42,26 @@ impl fmt::Display for CompileError {
 }
 
 impl std::error::Error for CompileError {}
+
+static CLOSURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_closure_name(line: u32) -> String {
+    let id = CLOSURE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    format!("{{closure:{line}:{id}}}")
+}
+
+fn check_param_names(params: &[Param], line: u32) -> Result<(), CompileError> {
+    let mut seen = HashSet::new();
+    for param in params {
+        if !seen.insert(param.name.as_str()) {
+            return Err(CompileError::new(
+                format!("Redefinition of parameter ${}", param.name),
+                line,
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Compile a parsed program. `file` is only used for diagnostics.
 pub fn compile(program: &Program, file: &str) -> Result<CompiledProgram, CompileError> {
@@ -73,6 +95,7 @@ struct LoopCtx {
 
 struct FnCompiler {
     name: String,
+    display_name: Option<String>,
     line: u32,
     is_main: bool,
     locals: HashMap<String, u32>,
@@ -83,6 +106,8 @@ struct FnCompiler {
     const_str_cache: HashMap<Vec<u8>, u32>,
     loops: Vec<LoopCtx>,
     params: Vec<ParamSlot>,
+    capture_slots: Vec<u32>,
+    capture_names: Vec<String>,
     functions: Vec<Function>,
     file: String,
 }
@@ -91,6 +116,7 @@ impl FnCompiler {
     fn new_main(file: &str) -> Self {
         Self {
             name: "{main}".to_string(),
+            display_name: None,
             line: 0,
             is_main: true,
             locals: HashMap::new(),
@@ -101,6 +127,8 @@ impl FnCompiler {
             const_str_cache: HashMap::new(),
             loops: Vec::new(),
             params: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_names: Vec::new(),
             functions: Vec::new(),
             file: file.to_string(),
         }
@@ -109,6 +137,7 @@ impl FnCompiler {
     fn new_function(decl: &FunctionDecl, file: &str) -> Self {
         Self {
             name: decl.name.clone(),
+            display_name: None,
             line: decl.line,
             is_main: false,
             locals: HashMap::new(),
@@ -119,6 +148,29 @@ impl FnCompiler {
             const_str_cache: HashMap::new(),
             loops: Vec::new(),
             params: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_names: Vec::new(),
+            functions: Vec::new(),
+            file: file.to_string(),
+        }
+    }
+
+    fn new_closure(name: &str, line: u32, file: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            display_name: Some(format!("{{closure:{file}:{line}}}")),
+            line,
+            is_main: false,
+            locals: HashMap::new(),
+            globals: HashSet::new(),
+            next_slot: 0,
+            ops: Vec::new(),
+            consts: Vec::new(),
+            const_str_cache: HashMap::new(),
+            loops: Vec::new(),
+            params: Vec::new(),
+            capture_slots: Vec::new(),
+            capture_names: Vec::new(),
             functions: Vec::new(),
             file: file.to_string(),
         }
@@ -132,7 +184,10 @@ impl FnCompiler {
         }
         let function = Function {
             name: self.name,
+            display_name: self.display_name,
             params: self.params,
+            capture_slots: self.capture_slots,
+            capture_names: self.capture_names,
             chunk: Chunk {
                 ops: self.ops,
                 consts: self.consts,
@@ -568,6 +623,7 @@ impl FnCompiler {
     }
 
     fn compile_function_decl(&mut self, decl: &FunctionDecl) -> Result<(), CompileError> {
+        check_param_names(&decl.params, decl.line)?;
         let mut nested = FnCompiler::new_function(decl, &self.file);
         for param in &decl.params {
             let slot = nested.slot(&param.name);
@@ -586,6 +642,101 @@ impl FnCompiler {
         let (function, inner) = nested.finish();
         self.functions.push(function);
         self.functions.extend(inner);
+        Ok(())
+    }
+
+    fn compile_closure(&mut self, decl: &ClosureDecl) -> Result<(), CompileError> {
+        let captures = if decl.is_arrow() {
+            let params: HashSet<String> = decl.params.iter().map(|p| p.name.clone()).collect();
+            let mut captures = Vec::new();
+            let mut seen = HashSet::new();
+            match &decl.body {
+                ClosureBody::Expr(body) => {
+                    collect_free_vars(body, &params, &mut captures, &mut seen);
+                }
+                ClosureBody::Block(_) => {}
+            }
+            captures
+        } else {
+            if let Some(capture) = decl.captures.iter().find(|capture| capture.by_ref) {
+                return Err(CompileError::new(
+                    format!(
+                        "by-reference closure captures are not supported (${})",
+                        capture.name
+                    ),
+                    decl.line,
+                ));
+            }
+            let captures: Vec<String> = decl
+                .captures
+                .iter()
+                .map(|capture| capture.name.clone())
+                .collect();
+            let mut seen: HashSet<&str> = HashSet::new();
+            if let Some(capture) = captures.iter().find(|name| !seen.insert(name.as_str())) {
+                return Err(CompileError::new(
+                    format!("Cannot use variable ${capture} twice"),
+                    decl.line,
+                ));
+            }
+            if let Some(capture) = captures
+                .iter()
+                .find(|name| decl.params.iter().any(|param| &param.name == *name))
+            {
+                return Err(CompileError::new(
+                    format!("Cannot use lexical variable ${capture} as a parameter name"),
+                    decl.line,
+                ));
+            }
+            captures
+        };
+        check_param_names(&decl.params, decl.line)?;
+        if captures.iter().any(|name| name == "this") {
+            return Err(CompileError::new(
+                "Cannot use $this as lexical variable",
+                decl.line,
+            ));
+        }
+
+        let name = next_closure_name(decl.line);
+        let mut nested = FnCompiler::new_closure(&name, decl.line, &self.file);
+        for capture in &captures {
+            let slot = nested.slot(capture);
+            nested.capture_slots.push(slot);
+            nested.capture_names.push(capture.clone());
+        }
+        for param in &decl.params {
+            let slot = nested.slot(&param.name);
+            let default = match &param.default {
+                Some(expr) => Some(const_expr(expr, decl.line)?),
+                None => None,
+            };
+            nested.params.push(ParamSlot {
+                name: param.name.clone(),
+                slot,
+                default,
+                variadic: param.variadic,
+            });
+        }
+        match &decl.body {
+            ClosureBody::Block(body) => nested.compile_stmts(body)?,
+            ClosureBody::Expr(body) => {
+                nested.expr(body)?;
+                nested.emit(Op::Return);
+            }
+        }
+        let (function, inner) = nested.finish();
+        self.functions.push(function);
+        self.functions.extend(inner);
+
+        for capture in &captures {
+            self.load_var(capture);
+        }
+        let index = self.const_str(name.as_bytes());
+        self.emit(Op::MakeClosure {
+            name: index,
+            argc: captures.len() as u32,
+        });
         Ok(())
     }
 
@@ -697,6 +848,16 @@ impl FnCompiler {
                     argc: args.len() as u32,
                 });
             }
+            Expr::DynamicCall { callee, args } => {
+                self.expr(callee)?;
+                for arg in args {
+                    self.expr(arg)?;
+                }
+                self.emit(Op::CallValue {
+                    argc: args.len() as u32,
+                });
+            }
+            Expr::Closure(decl) => self.compile_closure(decl)?,
             Expr::Match { subject, arms } => self.compile_match(subject, arms)?,
             Expr::Isset(args) => self.compile_isset(args)?,
             Expr::Empty(expr) => {
@@ -935,6 +1096,115 @@ impl FnCompiler {
 }
 
 /// Evaluate a compile-time constant expression (parameter defaults only).
+fn note_free_var(
+    name: &str,
+    params: &HashSet<String>,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    if params.contains(name) || !seen.insert(name.to_string()) {
+        return;
+    }
+    out.push(name.to_string());
+}
+
+fn collect_free_vars(
+    expr: &Expr,
+    params: &HashSet<String>,
+    out: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+) {
+    match expr {
+        Expr::Var(name) => note_free_var(name, params, out, seen),
+        Expr::Cast { expr, .. } | Expr::Unary { expr, .. } | Expr::Empty(expr) => {
+            collect_free_vars(expr, params, out, seen);
+        }
+        Expr::Interp(parts) => {
+            for part in parts {
+                if let InterpPart::Expr(expr) = part {
+                    collect_free_vars(expr, params, out, seen);
+                }
+            }
+        }
+        Expr::Array(items) => {
+            for item in items {
+                if let Some(key) = &item.key {
+                    collect_free_vars(key, params, out, seen);
+                }
+                collect_free_vars(&item.value, params, out, seen);
+            }
+        }
+        Expr::Assign { target, value, .. } => {
+            collect_free_vars(target, params, out, seen);
+            collect_free_vars(value, params, out, seen);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_free_vars(lhs, params, out, seen);
+            collect_free_vars(rhs, params, out, seen);
+        }
+        Expr::IncDec { target, .. } => collect_free_vars(target, params, out, seen),
+        Expr::Ternary { cond, then_, else_ } => {
+            collect_free_vars(cond, params, out, seen);
+            if let Some(then_) = then_ {
+                collect_free_vars(then_, params, out, seen);
+            }
+            collect_free_vars(else_, params, out, seen);
+        }
+        Expr::Index { base, index } => {
+            collect_free_vars(base, params, out, seen);
+            if let Some(index) = index {
+                collect_free_vars(index, params, out, seen);
+            }
+        }
+        Expr::Call { args, .. } => {
+            for arg in args {
+                collect_free_vars(arg, params, out, seen);
+            }
+        }
+        Expr::DynamicCall { callee, args } => {
+            collect_free_vars(callee, params, out, seen);
+            for arg in args {
+                collect_free_vars(arg, params, out, seen);
+            }
+        }
+        Expr::Closure(decl) => {
+            if decl.is_arrow() {
+                let mut nested_params = params.clone();
+                nested_params.extend(decl.params.iter().map(|param| param.name.clone()));
+                if let ClosureBody::Expr(body) = &decl.body {
+                    collect_free_vars(body, &nested_params, out, seen);
+                }
+            } else {
+                for capture in &decl.captures {
+                    if !capture.by_ref {
+                        note_free_var(&capture.name, params, out, seen);
+                    }
+                }
+            }
+        }
+        Expr::Match { subject, arms } => {
+            collect_free_vars(subject, params, out, seen);
+            for arm in arms {
+                for condition in &arm.conditions {
+                    collect_free_vars(condition, params, out, seen);
+                }
+                collect_free_vars(&arm.body, params, out, seen);
+            }
+        }
+        Expr::Isset(args) => {
+            for arg in args {
+                collect_free_vars(arg, params, out, seen);
+            }
+        }
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Name(_) => {}
+    }
+}
+
 fn const_expr(expr: &Expr, line: u32) -> Result<Value, CompileError> {
     match expr {
         Expr::Null => Ok(Value::Null),
