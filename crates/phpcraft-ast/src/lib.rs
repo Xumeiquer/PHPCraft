@@ -1,0 +1,238 @@
+//! PHP abstract syntax tree.
+//!
+//! Mirrors the shape of `zend_ast.h` (`ZEND_AST_*` nodes) but in idiomatic
+//! Rust. Only the constructs the engine currently executes are represented;
+//! classes, namespaces, attributes and exceptions are still missing.
+
+/// A parsed PHP file.
+#[derive(Clone, Debug)]
+pub struct Program {
+    pub stmts: Vec<Stmt>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Stmt {
+    /// Text outside PHP tags, echoed verbatim.
+    InlineHtml(Vec<u8>),
+    /// `echo a, b;`
+    Echo(Vec<Expr>),
+    Expr(Expr),
+    Block(Vec<Stmt>),
+    If {
+        /// `if` plus any `elseif` branches, in order.
+        branches: Vec<(Expr, Vec<Stmt>)>,
+        else_: Option<Vec<Stmt>>,
+    },
+    While {
+        cond: Expr,
+        body: Vec<Stmt>,
+    },
+    DoWhile {
+        body: Vec<Stmt>,
+        cond: Expr,
+    },
+    For {
+        init: Vec<Expr>,
+        cond: Vec<Expr>,
+        step: Vec<Expr>,
+        body: Vec<Stmt>,
+    },
+    Foreach {
+        subject: Expr,
+        key: Option<Expr>,
+        value: Expr,
+        body: Vec<Stmt>,
+    },
+    Switch {
+        subject: Expr,
+        cases: Vec<SwitchCase>,
+    },
+    Function(FunctionDecl),
+    /// `global $a, $b;`
+    Global(Vec<String>),
+    Return(Option<Expr>),
+    Break(Option<u32>),
+    Continue(Option<u32>),
+    Nop,
+}
+
+#[derive(Clone, Debug)]
+pub struct SwitchCase {
+    /// `None` for `default:`.
+    pub test: Option<Expr>,
+    pub body: Vec<Stmt>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FunctionDecl {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub body: Vec<Stmt>,
+    pub line: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct Param {
+    pub name: String,
+    pub default: Option<Expr>,
+    pub variadic: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArrayItem {
+    pub key: Option<Expr>,
+    pub value: Expr,
+}
+
+#[derive(Clone, Debug)]
+pub enum InterpPart {
+    Lit(Vec<u8>),
+    Expr(Expr),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CastKind {
+    Int,
+    Float,
+    String,
+    Bool,
+    Array,
+}
+
+#[derive(Clone, Debug)]
+pub enum Expr {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(Vec<u8>),
+    /// `(int) $x`, `(string) $x`, ...
+    Cast {
+        kind: CastKind,
+        expr: Box<Expr>,
+    },
+    /// Double-quoted/heredoc string with `$vars` and `{$expr}`.
+    Interp(Vec<InterpPart>),
+    Var(String),
+    /// A bare name used as a constant (`PHP_EOL`, `true` is parsed separately).
+    Name(String),
+    Array(Vec<ArrayItem>),
+    Assign {
+        target: Box<Expr>,
+        /// `None` for `=`, otherwise the compound operator (`+=`).
+        op: Option<BinOp>,
+        value: Box<Expr>,
+    },
+    Binary {
+        op: BinOp,
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+    },
+    Unary {
+        op: UnOp,
+        expr: Box<Expr>,
+    },
+    /// `$a++`, `--$a`.
+    IncDec {
+        target: Box<Expr>,
+        increment: bool,
+        prefix: bool,
+    },
+    Ternary {
+        cond: Box<Expr>,
+        /// `None` for the short form `$a ?: $b`.
+        then_: Option<Box<Expr>>,
+        else_: Box<Expr>,
+    },
+    Index {
+        base: Box<Expr>,
+        /// `None` means append (`$a[] = ...`), only legal as an assignment target.
+        index: Option<Box<Expr>>,
+    },
+    Call {
+        name: String,
+        args: Vec<Expr>,
+    },
+    Isset(Vec<Expr>),
+    Empty(Box<Expr>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    Concat,
+    Shl,
+    Shr,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Eq,
+    NotEq,
+    Identical,
+    NotIdentical,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Spaceship,
+    LogicalAnd,
+    LogicalOr,
+    LogicalXor,
+    Coalesce,
+}
+
+impl BinOp {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            BinOp::Add => "+",
+            BinOp::Sub => "-",
+            BinOp::Mul => "*",
+            BinOp::Div => "/",
+            BinOp::Mod => "%",
+            BinOp::Pow => "**",
+            BinOp::Concat => ".",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Eq => "==",
+            BinOp::NotEq => "!=",
+            BinOp::Identical => "===",
+            BinOp::NotIdentical => "!==",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            BinOp::Spaceship => "<=>",
+            BinOp::LogicalAnd => "&&",
+            BinOp::LogicalOr => "||",
+            BinOp::LogicalXor => "xor",
+            BinOp::Coalesce => "??",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnOp {
+    Neg,
+    Pos,
+    Not,
+    BitNot,
+}
+
+impl UnOp {
+    pub fn symbol(self) -> &'static str {
+        match self {
+            UnOp::Neg => "-",
+            UnOp::Pos => "+",
+            UnOp::Not => "!",
+            UnOp::BitNot => "~",
+        }
+    }
+}

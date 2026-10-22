@@ -1,0 +1,17 @@
+[package]
+name = "phpcraft-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "phpcraft: a PHP-compatible interpreter written in Rust"
+
+[[bin]]
+name = "phpcraft"
+path = "src/main.rs"
+
+[dependencies]
+phpcraft-compiler.workspace = true
+phpcraft-parser.workspace = true
+phpcraft-runtime.workspace = true
+phpcraft-vm.workspace = true

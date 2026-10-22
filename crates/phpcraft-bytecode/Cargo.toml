@@ -1,0 +1,11 @@
+[package]
+name = "phpcraft-bytecode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PHPCraft bytecode: chunks, opcodes, compiled functions"
+
+[dependencies]
+phpcraft-ast.workspace = true
+phpcraft-runtime.workspace = true

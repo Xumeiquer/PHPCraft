@@ -1,0 +1,11 @@
+[package]
+name = "phpcraft-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Recursive-descent / Pratt parser for PHP 8"
+
+[dependencies]
+phpcraft-ast.workspace = true
+phpcraft-lexer.workspace = true

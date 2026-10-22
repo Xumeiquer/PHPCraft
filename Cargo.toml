@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[profile.release]
+opt-level = 2
+
+[workspace.dependencies]
+phpcraft-runtime = { path = "crates/phpcraft-runtime" }
+phpcraft-lexer = { path = "crates/phpcraft-lexer" }
+phpcraft-ast = { path = "crates/phpcraft-ast" }
+phpcraft-bytecode = { path = "crates/phpcraft-bytecode" }
+phpcraft-parser = { path = "crates/phpcraft-parser" }
+phpcraft-compiler = { path = "crates/phpcraft-compiler" }
+phpcraft-vm = { path = "crates/phpcraft-vm" }
+phpcraft-stdlib = { path = "crates/phpcraft-stdlib" }

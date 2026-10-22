@@ -1,0 +1,17 @@
+[package]
+name = "phpcraft-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PHPCraft bytecode virtual machine"
+
+[dependencies]
+phpcraft-ast.workspace = true
+phpcraft-bytecode.workspace = true
+phpcraft-runtime.workspace = true
+phpcraft-stdlib.workspace = true
+
+[dev-dependencies]
+phpcraft-parser.workspace = true
+phpcraft-compiler.workspace = true

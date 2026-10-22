@@ -1,0 +1,9 @@
+[package]
+name = "phpcraft-lexer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "PHP tokenizer: PHP tags, inline HTML, string interpolation, heredocs"
+
+[dependencies]

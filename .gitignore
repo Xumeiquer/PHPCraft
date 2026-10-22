@@ -1,0 +1,4 @@
+/target
+/vendor
+/tests/phpt
+**/*.rs.bk
