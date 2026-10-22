@@ -7,11 +7,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use phpcraft_ast::{
     ArrayItem, BinOp, CatchClause, ClassDecl, ClosureBody, ClosureDecl, Expr, FunctionDecl,
-    InterpPart, MatchArm, Param, Program, Stmt, UnOp,
+    InterpPart, MatchArm, Param, Program, Stmt, UnOp, UseKind,
 };
 use phpcraft_bytecode::{
     Chunk, ClassDef, ClassMethod, ClassProperty, CompiledProgram, DimMode, Function, Op, ParamSlot,
@@ -123,6 +124,10 @@ struct FnCompiler {
     capture_names: Vec<String>,
     functions: Vec<Function>,
     classes: Vec<ClassDef>,
+    namespace: String,
+    class_uses: HashMap<String, String>,
+    function_uses: HashMap<String, String>,
+    const_uses: HashMap<String, String>,
     file: String,
 }
 
@@ -145,6 +150,10 @@ impl FnCompiler {
             capture_names: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
+            namespace: String::new(),
+            class_uses: HashMap::new(),
+            function_uses: HashMap::new(),
+            const_uses: HashMap::new(),
             file: file.to_string(),
         }
     }
@@ -167,6 +176,10 @@ impl FnCompiler {
             capture_names: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
+            namespace: String::new(),
+            class_uses: HashMap::new(),
+            function_uses: HashMap::new(),
+            const_uses: HashMap::new(),
             file: file.to_string(),
         }
     }
@@ -189,6 +202,10 @@ impl FnCompiler {
             capture_names: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
+            namespace: String::new(),
+            class_uses: HashMap::new(),
+            function_uses: HashMap::new(),
+            const_uses: HashMap::new(),
             file: file.to_string(),
         }
     }
@@ -254,6 +271,149 @@ impl FnCompiler {
         self.consts.push(Value::str(bytes.to_vec()));
         self.const_str_cache.insert(bytes.to_vec(), index);
         index
+    }
+
+    fn qualify_with_uses(&self, name: &str, uses: &HashMap<String, String>) -> String {
+        let raw = name.trim_start_matches('\\');
+        if name.starts_with('\\') {
+            return raw.to_string();
+        }
+        if raw.eq_ignore_ascii_case("self")
+            || raw.eq_ignore_ascii_case("parent")
+            || raw.eq_ignore_ascii_case("static")
+        {
+            return raw.to_string();
+        }
+        if raw.eq_ignore_ascii_case("namespace") {
+            return self.namespace.clone();
+        }
+        if raw.len() > "namespace\\".len()
+            && raw[.."namespace\\".len()].eq_ignore_ascii_case("namespace\\")
+        {
+            let rest = &raw["namespace\\".len()..];
+            return if self.namespace.is_empty() {
+                rest.to_string()
+            } else {
+                format!("{}\\{}", self.namespace, rest)
+            };
+        }
+        let (first, rest) = match raw.split_once('\\') {
+            Some((first, rest)) => (first, Some(rest)),
+            None => (raw, None),
+        };
+        if let Some(target) = uses.get(&first.to_ascii_lowercase()) {
+            return match rest {
+                Some(rest) => format!("{target}\\{rest}"),
+                None => target.clone(),
+            };
+        }
+        if self.namespace.is_empty() {
+            raw.to_string()
+        } else {
+            format!("{}\\{}", self.namespace, raw)
+        }
+    }
+
+    fn qualify_class(&self, name: &str) -> String {
+        self.qualify_with_uses(name, &self.class_uses)
+    }
+
+    fn resolve_function_call(&self, name: &str) -> (String, bool) {
+        let raw = name.trim_start_matches('\\');
+        if name.starts_with('\\') {
+            return (raw.to_string(), false);
+        }
+        if raw.eq_ignore_ascii_case("namespace") {
+            return (self.namespace.clone(), false);
+        }
+        if raw.len() > "namespace\\".len()
+            && raw[.."namespace\\".len()].eq_ignore_ascii_case("namespace\\")
+        {
+            let rest = &raw["namespace\\".len()..];
+            return (
+                if self.namespace.is_empty() {
+                    rest.to_string()
+                } else {
+                    format!("{}\\{}", self.namespace, rest)
+                },
+                false,
+            );
+        }
+        let (first, rest) = match raw.split_once('\\') {
+            Some((first, rest)) => (first, Some(rest)),
+            None => (raw, None),
+        };
+        if let Some(target) = self.function_uses.get(&first.to_ascii_lowercase()) {
+            return (
+                match rest {
+                    Some(rest) => format!("{target}\\{rest}"),
+                    None => target.clone(),
+                },
+                false,
+            );
+        }
+        if rest.is_some() {
+            return (
+                if self.namespace.is_empty() {
+                    raw.to_string()
+                } else {
+                    format!("{}\\{}", self.namespace, raw)
+                },
+                false,
+            );
+        }
+        if self.namespace.is_empty() {
+            (raw.to_string(), false)
+        } else {
+            (format!("{}\\{}", self.namespace, raw), true)
+        }
+    }
+
+    fn qualify_constant(&self, name: &str) -> String {
+        self.qualify_with_uses(name, &self.const_uses)
+    }
+
+    fn qualify_decl_name(&self, name: &str, _function: bool) -> String {
+        let raw = name.trim_start_matches('\\');
+        if name.starts_with('\\') || self.namespace.is_empty() {
+            raw.to_string()
+        } else {
+            format!("{}\\{}", self.namespace, raw)
+        }
+    }
+
+    fn magic_file(&self) -> String {
+        if matches!(
+            self.file.as_str(),
+            "Command line code" | "Standard input code"
+        ) {
+            return self.file.clone();
+        }
+        std::fs::canonicalize(&self.file)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| self.file.clone())
+    }
+
+    fn magic_dir(&self) -> String {
+        if matches!(
+            self.file.as_str(),
+            "Command line code" | "Standard input code"
+        ) {
+            return std::env::current_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+        }
+        let file = self.magic_file();
+        Path::new(&file)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.display().to_string())
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|path| path.display().to_string())
+            })
+            .unwrap_or_default()
     }
 
     fn slot(&mut self, name: &str) -> u32 {
@@ -473,6 +633,37 @@ impl FnCompiler {
             Stmt::Switch { subject, cases } => self.compile_switch(subject, cases),
             Stmt::Function(decl) => self.compile_function_decl(decl),
             Stmt::Class(decl) => self.compile_class(decl),
+            Stmt::NamespaceMark(name) => {
+                self.namespace = name.clone().unwrap_or_default();
+                self.class_uses.clear();
+                self.function_uses.clear();
+                self.const_uses.clear();
+                Ok(())
+            }
+            Stmt::NamespaceBlock { name, body } => {
+                let saved_namespace =
+                    std::mem::replace(&mut self.namespace, name.clone().unwrap_or_default());
+                let saved_class_uses = std::mem::take(&mut self.class_uses);
+                let saved_function_uses = std::mem::take(&mut self.function_uses);
+                let saved_const_uses = std::mem::take(&mut self.const_uses);
+                let result = self.compile_stmts(body);
+                self.namespace = saved_namespace;
+                self.class_uses = saved_class_uses;
+                self.function_uses = saved_function_uses;
+                self.const_uses = saved_const_uses;
+                result
+            }
+            Stmt::Use(imports) => {
+                for import in imports {
+                    let map = match import.kind {
+                        UseKind::Class => &mut self.class_uses,
+                        UseKind::Function => &mut self.function_uses,
+                        UseKind::Constant => &mut self.const_uses,
+                    };
+                    map.insert(import.alias.to_ascii_lowercase(), import.target.clone());
+                }
+                Ok(())
+            }
             Stmt::Try {
                 body,
                 catches,
@@ -702,6 +893,11 @@ impl FnCompiler {
                 decl.line,
             ));
         }
+        let class_name = self.qualify_decl_name(&decl.name, false);
+        let parent = decl
+            .parent
+            .as_ref()
+            .map(|parent| self.qualify_class(parent));
         let mut properties = Vec::new();
         for property in &decl.properties {
             properties.push(ClassProperty {
@@ -725,8 +921,12 @@ impl FnCompiler {
 
         let mut methods = Vec::new();
         for method in &decl.methods {
-            let function_name = format!("{}::{}", decl.name, method.name);
+            let function_name = format!("{}::{}", class_name, method.name);
             let mut nested = FnCompiler::new_method(&function_name, method.line, &self.file);
+            nested.namespace = self.namespace.clone();
+            nested.class_uses = self.class_uses.clone();
+            nested.function_uses = self.function_uses.clone();
+            nested.const_uses = self.const_uses.clone();
             for param in &method.params {
                 let slot = nested.slot(&param.name);
                 let default = match &param.default {
@@ -755,8 +955,8 @@ impl FnCompiler {
         }
 
         self.classes.push(ClassDef {
-            name: decl.name.clone(),
-            parent: decl.parent.clone(),
+            name: class_name,
+            parent,
             properties,
             constants,
             methods,
@@ -789,6 +989,7 @@ impl FnCompiler {
             let mut hit_jumps = Vec::new();
             for class in &catch.classes {
                 self.emit(Op::LoadTmp(catch_slot));
+                let class = self.qualify_class(class);
                 let index = self.const_str(class.as_bytes());
                 self.emit(Op::InstanceOf { class: index });
                 hit_jumps.push(self.emit(Op::JumpIfTrue(0)));
@@ -833,6 +1034,11 @@ impl FnCompiler {
     fn compile_function_decl(&mut self, decl: &FunctionDecl) -> Result<(), CompileError> {
         check_param_names(&decl.params, decl.line)?;
         let mut nested = FnCompiler::new_function(decl, &self.file);
+        nested.name = self.qualify_decl_name(&decl.name, true);
+        nested.namespace = self.namespace.clone();
+        nested.class_uses = self.class_uses.clone();
+        nested.function_uses = self.function_uses.clone();
+        nested.const_uses = self.const_uses.clone();
         for param in &decl.params {
             let slot = nested.slot(&param.name);
             let default = match &param.default {
@@ -908,6 +1114,10 @@ impl FnCompiler {
 
         let name = next_closure_name(decl.line);
         let mut nested = FnCompiler::new_closure(&name, decl.line, &self.file);
+        nested.namespace = self.namespace.clone();
+        nested.class_uses = self.class_uses.clone();
+        nested.function_uses = self.function_uses.clone();
+        nested.const_uses = self.const_uses.clone();
         for capture in &captures {
             let slot = nested.slot(capture);
             nested.capture_slots.push(slot);
@@ -1014,8 +1224,35 @@ impl FnCompiler {
             }
             Expr::Var(name) => self.load_var(name),
             Expr::Name(name) => {
-                let index = self.const_str(name.as_bytes());
-                self.emit(Op::ConstName(index));
+                let lowered = name.to_ascii_lowercase();
+                let magic = match lowered.as_str() {
+                    "__file__" => Some(self.magic_file()),
+                    "__dir__" => Some(self.magic_dir()),
+                    "__namespace__" => Some(self.namespace.clone()),
+                    "__class__" => Some(match self.name.split_once("::") {
+                        Some((class, _)) => class.to_string(),
+                        None => String::new(),
+                    }),
+                    "__method__" => Some(match self.name.as_str() {
+                        "{main}" => String::new(),
+                        name => name.to_string(),
+                    }),
+                    "__function__" => Some(match self.name.rsplit_once("::") {
+                        Some((_, function)) => function.to_string(),
+                        None if self.name == "{main}" => String::new(),
+                        None => self.name.clone(),
+                    }),
+                    "__line__" => Some("1".to_string()),
+                    _ => None,
+                };
+                if let Some(value) = magic {
+                    let index = self.const_str(value.as_bytes());
+                    self.emit(Op::StrConst(index));
+                } else {
+                    let name = self.qualify_constant(name);
+                    let index = self.const_str(name.as_bytes());
+                    self.emit(Op::ConstName(index));
+                }
             }
             Expr::Array(items) => self.compile_array(items)?,
             Expr::Assign { target, op, value } => self.compile_assign(target, op, value)?,
@@ -1050,10 +1287,12 @@ impl FnCompiler {
                 for arg in args {
                     self.expr(arg)?;
                 }
+                let (name, fallback) = self.resolve_function_call(name);
                 let index = self.const_str(name.as_bytes());
                 self.emit(Op::Call {
                     name: index,
                     argc: args.len() as u32,
+                    fallback,
                 });
             }
             Expr::DynamicCall { callee, args } => {
@@ -1069,6 +1308,7 @@ impl FnCompiler {
                 for arg in args {
                     self.expr(arg)?;
                 }
+                let class = self.qualify_class(class);
                 let index = self.const_str(class.as_bytes());
                 self.emit(Op::NewObject {
                     class: index,
@@ -1106,6 +1346,7 @@ impl FnCompiler {
                 for arg in args {
                     self.expr(arg)?;
                 }
+                let class = self.qualify_class(class);
                 let class = self.const_str(class.as_bytes());
                 let method = self.const_str(method.as_bytes());
                 self.emit(Op::CallStaticMethod {
@@ -1115,6 +1356,7 @@ impl FnCompiler {
                 });
             }
             Expr::StaticProperty { class, name } => {
+                let class = self.qualify_class(class);
                 let class = self.const_str(class.as_bytes());
                 let name = self.const_str(name.as_bytes());
                 self.emit(Op::LoadStaticProperty {
@@ -1124,12 +1366,14 @@ impl FnCompiler {
                 });
             }
             Expr::ClassConst { class, name } => {
+                let class = self.qualify_class(class);
                 let class = self.const_str(class.as_bytes());
                 let name = self.const_str(name.as_bytes());
                 self.emit(Op::ClassConstant { class, name });
             }
             Expr::InstanceOf { expr, class } => {
                 self.expr(expr)?;
+                let class = self.qualify_class(class);
                 let index = self.const_str(class.as_bytes());
                 self.emit(Op::InstanceOf { class: index });
             }
@@ -1140,6 +1384,17 @@ impl FnCompiler {
             Expr::Throw(expr) => {
                 self.expr(expr)?;
                 self.emit(Op::Throw);
+            }
+            Expr::Include {
+                path,
+                once,
+                require,
+            } => {
+                self.expr(path)?;
+                self.emit(Op::Include {
+                    once: *once,
+                    require: *require,
+                });
             }
             Expr::Closure(decl) => self.compile_closure(decl)?,
             Expr::Match { subject, arms } => self.compile_match(subject, arms)?,
@@ -1465,6 +1720,7 @@ fn collect_free_vars(
         }
         Expr::InstanceOf { expr, .. } => collect_free_vars(expr, params, out, seen),
         Expr::Clone(expr) | Expr::Throw(expr) => collect_free_vars(expr, params, out, seen),
+        Expr::Include { path, .. } => collect_free_vars(path, params, out, seen),
         Expr::Closure(decl) => {
             if decl.is_arrow() {
                 let mut nested_params = params.clone();

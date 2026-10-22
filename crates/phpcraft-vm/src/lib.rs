@@ -5,7 +5,8 @@
 //! a call frame with slots, and a value stack. Function calls recurse in Rust
 //! (Zend also uses the C stack), with an explicit nesting guard.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use phpcraft_ast::{BinOp, CastKind, UnOp};
@@ -83,6 +84,7 @@ pub struct Vm {
     depth: u32,
     file: String,
     next_object_id: u64,
+    included_files: HashSet<String>,
 }
 
 impl Default for Vm {
@@ -135,6 +137,7 @@ impl Vm {
             depth: 0,
             file: String::new(),
             next_object_id: 1,
+            included_files: HashSet::new(),
         }
     }
 
@@ -203,6 +206,75 @@ impl Vm {
         Err(PhpError::fatal(format!(
             "Call to undefined function {name}()"
         )))
+    }
+
+    fn include_file(&mut self, raw: &str, once: bool, require: bool) -> PhpResult<Value> {
+        let path = self.resolve_include_path(raw);
+        let key = std::fs::canonicalize(&path)
+            .unwrap_or_else(|_| path.clone())
+            .display()
+            .to_string();
+        if once && self.included_files.contains(&key) {
+            return Ok(Value::Int(1));
+        }
+        let source = match std::fs::read(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                let message = format!(
+                    "{}: Failed to open stream: {}",
+                    if require { "require" } else { "include" },
+                    error
+                );
+                if require {
+                    return Err(PhpError::fatal(message));
+                }
+                self.warn(message);
+                return Ok(Value::Bool(false));
+            }
+        };
+        let program = phpcraft_parser::parse_file(&source).map_err(|error| {
+            PhpError::fatal(format!(
+                "Parse error: {} in {} on line {}",
+                error.message, key, error.line
+            ))
+        })?;
+        let compiled = phpcraft_compiler::compile(&program, &key).map_err(|error| {
+            PhpError::fatal(format!(
+                "{} in {} on line {}",
+                error.message, key, error.line
+            ))
+        })?;
+        self.included_files.insert(key.clone());
+        let previous_file = std::mem::replace(&mut self.file, key.clone());
+        self.load(&compiled);
+        let main = Rc::new(compiled.main.clone());
+        let result = self.call_function(main, Vec::new());
+        self.file = previous_file;
+        let value = result?;
+        Ok(if matches!(value, Value::Null) {
+            Value::Int(1)
+        } else {
+            value
+        })
+    }
+
+    fn resolve_include_path(&self, raw: &str) -> PathBuf {
+        let path = PathBuf::from(raw);
+        if path.is_absolute()
+            || matches!(
+                self.file.as_str(),
+                "Command line code" | "Standard input code"
+            )
+        {
+            return path;
+        }
+        if let Some(parent) = Path::new(&self.file).parent() {
+            let candidate = parent.join(&path);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+        path
     }
 
     fn warn(&mut self, message: impl Into<String>) {
@@ -861,8 +933,12 @@ impl Vm {
                     Op::StrConst(index) => stack.push(chunk.consts[*index as usize].clone()),
                     Op::ConstName(index) => {
                         let name = String::from_utf8_lossy(chunk.const_str(*index)).into_owned();
-                        match self.constants.get(&name) {
-                            Some(value) => stack.push(value.clone()),
+                        let value = self.constants.get(&name).cloned().or_else(|| {
+                            name.rsplit_once('\\')
+                                .and_then(|(_, short)| self.constants.get(short).cloned())
+                        });
+                        match value {
+                            Some(value) => stack.push(value),
                             None => {
                                 return Err(PhpError::fatal(format!(
                                     "Undefined constant \"{name}\""
@@ -1073,14 +1149,26 @@ impl Vm {
                         self.insert_path(&mut array, &keys, value)?;
                         stack.push(Value::array(array));
                     }
-                    Op::Call { name, argc } => {
-                        let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                    Op::Call {
+                        name,
+                        argc,
+                        fallback,
+                    } => {
+                        let mut name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         let argc = *argc as usize;
                         let args = if argc == 0 {
                             Vec::new()
                         } else {
                             stack.split_off(stack.len() - argc)
                         };
+                        let lower = name.to_ascii_lowercase();
+                        let exists = self.functions.contains_key(&lower)
+                            || phpcraft_stdlib::find(&lower).is_some();
+                        if !exists && *fallback {
+                            if let Some((_, short)) = name.rsplit_once('\\') {
+                                name = short.to_string();
+                            }
+                        }
                         let result = self.call_named(&name, args)?;
                         stack.push(result);
                     }
@@ -1093,6 +1181,18 @@ impl Vm {
                         };
                         let callee = stack.pop().unwrap_or(Value::Null);
                         let result = self.invoke(callee, args)?;
+                        stack.push(result);
+                    }
+                    Op::Include { once, require } => {
+                        let path = stack.pop().unwrap_or(Value::Null);
+                        let Value::Str(path) = path else {
+                            return Err(PhpError::type_error(format!(
+                                "include(): Argument #1 ($path) must be of type string, {} given",
+                                path.debug_type_name()
+                            )));
+                        };
+                        let path = String::from_utf8_lossy(path.as_bytes()).into_owned();
+                        let result = self.include_file(&path, *once, *require)?;
                         stack.push(result);
                     }
                     Op::MakeClosure { name, argc } => {
@@ -1980,6 +2080,27 @@ mod tests {
             echo $child->value, "|", $clone->value;
         "#);
         assert_eq!(out, "Child[Base(7)]|yes|base|1|9|same|9|11");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn namespaces_resolve_declarations_and_imports() {
+        let (out, warnings) = run(r#"<?php
+            namespace Demo\Util;
+            function name() { return __NAMESPACE__; }
+            class Box {
+                public $value;
+                function __construct($value) { $this->value = $value; }
+                function get() { return $this->value; }
+            }
+            echo name(), "|", strlen("abc"), "|";
+            namespace App;
+            use Demo\Util\Box as Crate;
+            use function Demo\Util\name as util_name;
+            $box = new Crate(7);
+            echo util_name(), "|", $box->get(), "|", Crate::class;
+        "#);
+        assert_eq!(out, "Demo\\Util|3|Demo\\Util|7|Demo\\Util\\Box");
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 

@@ -12,10 +12,10 @@ gitignored.
 | `Zend/zend_language_scanner.h` | `crates/phpcraft-lexer/src/token.rs` | Token kinds and interpolation parts. |
 | `Zend/zend_language_parser.y` | `crates/phpcraft-parser/src/lib.rs` | Statements are recursive descent; expressions use Pratt parsing with the PHP 8 precedence table. |
 | `Zend/zend_ast.h`, `Zend/zend_ast.c` | `crates/phpcraft-ast/src/lib.rs` | Simplified AST; nodes only exist for implemented constructs. |
-| `Zend/zend_compile.c`, `Zend/zend_compile.h` | `crates/phpcraft-compiler/src/lib.rs` | AST lowering, jump patching, function hoisting, constant folding for parameter defaults. |
+| `Zend/zend_compile.c`, `Zend/zend_compile.h` | `crates/phpcraft-compiler/src/lib.rs` | AST lowering, jump patching, function hoisting, namespace/import resolution, magic constants, constant folding for parameter defaults. |
 | `Zend/zend_opcode.c`, `Zend/zend_vm_opcodes.h` | `crates/phpcraft-bytecode/src/lib.rs` | `Op`, `Chunk`, `Function`, `CompiledProgram`. Stack machine instead of Zend's register slots. |
 | `Zend/zend_vm_def.h`, `Zend/zend_vm_execute.h` | `crates/phpcraft-vm/src/lib.rs` | Dispatch loop, frames, variable fetch/store, iterators. |
-| `Zend/zend_execute.c` | `crates/phpcraft-vm/src/lib.rs` | Function calls, `global` binding, return values, nesting guard. |
+| `Zend/zend_execute.c` | `crates/phpcraft-vm/src/lib.rs` | Function calls, `global` binding, return values, nesting guard, runtime includes. |
 | `Zend/zend_closures.c` | `crates/phpcraft-runtime/src/value.rs`, `crates/phpcraft-vm/src/lib.rs` | `PhpClosure`, capture binding and invocation. |
 | `Zend/zend_objects.c`, `Zend/zend_object_handlers.c` | `crates/phpcraft-runtime/src/value.rs`, `crates/phpcraft-vm/src/lib.rs` | `PhpObject`, class registry, property storage, method dispatch and inheritance. |
 | `Zend/zend_exceptions.c` | `crates/phpcraft-runtime/src/error.rs`, `crates/phpcraft-vm/src/lib.rs` | `ExceptionData`, built-in exception hierarchy, `throw` and catch matching. |
@@ -70,6 +70,7 @@ fetch/assign instructions.
 | `AssignDim` | `ZEND_ASSIGN_DIM`, `ZEND_ASSIGN_DIM_OP` |
 | `Call` | `ZEND_INIT_FCALL`, `ZEND_SEND_VAL`, `ZEND_DO_FCALL` |
 | `CallValue` | `ZEND_INIT_DYNAMIC_CALL`, `ZEND_DO_FCALL` |
+| `Include` | `ZEND_INCLUDE_OR_EVAL` |
 | `MakeClosure` | `ZEND_DECLARE_LAMBDA_FUNCTION`, `ZEND_BIND_LEXICAL` |
 | `NewObject` | `ZEND_NEW`, `ZEND_DO_FCALL` (constructor) |
 | `LoadProperty`, `AssignProperty` | `ZEND_FETCH_OBJ_R`, `ZEND_ASSIGN_OBJ` |
@@ -154,6 +155,7 @@ fetch/assign instructions.
 | `tests/lang/functions/*.phpt` | `tests/php/05_functions.php` |
 | `Zend/tests/closures/*.phpt` | `tests/php/15_closures.php` |
 | `Zend/tests/classes/*.phpt`, `Zend/tests/exceptions/*.phpt` | `tests/php/16_objects.php` |
+| `Zend/tests/ns/*.phpt`, `Zend/tests/use/*.phpt` | `tests/php/17_namespaces_includes.php`, `tests/php/18_namespace_blocks.php` |
 
 `scripts/phpt-subset.sh` extracts `--FILE--` sections from a php-src checkout
 and skips tests that need extensions, INI settings, request data or special

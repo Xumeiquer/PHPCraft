@@ -91,10 +91,18 @@ pub enum Op {
     Call {
         name: u32,
         argc: u32,
+        /// Allow an unqualified namespaced call to fall back to the global
+        /// function of the same short name.
+        fallback: bool,
     },
     /// Call a callable value (closure or callable string) with `argc` args.
     CallValue {
         argc: u32,
+    },
+    /// Pop a path expression and include/require it.
+    Include {
+        once: bool,
+        require: bool,
     },
     /// Pop `argc` captured values and push a closure for the function named
     /// by `consts[name]`.

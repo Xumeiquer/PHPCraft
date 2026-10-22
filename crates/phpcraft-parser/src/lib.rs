@@ -9,7 +9,7 @@
 use phpcraft_ast::{
     ArrayItem, BinOp, Capture, CastKind, CatchClause, ClassConstDecl, ClassDecl, ClosureBody,
     ClosureDecl, Expr, FunctionDecl, InterpPart, MatchArm, MethodDecl, Param, Program,
-    PropertyDecl, Stmt, SwitchCase, UnOp, Visibility,
+    PropertyDecl, Stmt, SwitchCase, UnOp, UseDecl, UseKind, Visibility,
 };
 use phpcraft_lexer::{self, DimKey, StrPart, Tok, Token};
 
@@ -273,6 +273,12 @@ impl Parser {
         {
             return Ok(Stmt::Class(self.parse_class()?));
         }
+        if self.check_keyword("namespace") {
+            return self.parse_namespace();
+        }
+        if self.check_keyword("use") {
+            return self.parse_use();
+        }
         if self.check_keyword("try") {
             return self.parse_try();
         }
@@ -315,8 +321,6 @@ impl Parser {
             "interface",
             "trait",
             "enum",
-            "namespace",
-            "use",
             "const",
             "static",
             "unset",
@@ -609,6 +613,67 @@ impl Parser {
             body,
             line,
         })
+    }
+
+    fn parse_namespace(&mut self) -> Result<Stmt, ParseError> {
+        self.expect_keyword("namespace")?;
+        if self.eat(&Tok::LBrace) {
+            let body = self.parse_block_body()?;
+            return Ok(Stmt::NamespaceBlock { name: None, body });
+        }
+        let name = self.parse_qualified_name()?;
+        if self.eat(&Tok::LBrace) {
+            let body = self.parse_block_body()?;
+            return Ok(Stmt::NamespaceBlock {
+                name: Some(name),
+                body,
+            });
+        }
+        self.end_statement()?;
+        Ok(Stmt::NamespaceMark(Some(name)))
+    }
+
+    fn parse_use(&mut self) -> Result<Stmt, ParseError> {
+        self.expect_keyword("use")?;
+        let kind = if self.eat_keyword("function") {
+            UseKind::Function
+        } else if self.eat_keyword("const") {
+            UseKind::Constant
+        } else {
+            UseKind::Class
+        };
+        let mut imports = Vec::new();
+        loop {
+            let mut target = self.parse_qualified_name()?;
+            if target.starts_with('\\') {
+                target.remove(0);
+            }
+            if self.check_keyword("as") {
+                self.advance();
+                let alias = self.expect_ident()?;
+                imports.push(UseDecl {
+                    target,
+                    alias,
+                    kind,
+                });
+            } else {
+                let alias = target
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(target.as_str())
+                    .to_string();
+                imports.push(UseDecl {
+                    target,
+                    alias,
+                    kind,
+                });
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.end_statement()?;
+        Ok(Stmt::Use(imports))
     }
 
     fn parse_class(&mut self) -> Result<ClassDecl, ParseError> {
@@ -1330,6 +1395,19 @@ impl Parser {
                         Ok(Expr::Empty(Box::new(expr)))
                     }
                     "list" => Err(self.unsupported("list() destructuring")),
+                    "include" | "include_once" | "require" | "require_once" => {
+                        let keyword = match self.peek().clone() {
+                            Tok::Ident(name) => name.to_ascii_lowercase(),
+                            _ => unreachable!(),
+                        };
+                        self.advance();
+                        let path = self.parse_bp(0)?;
+                        Ok(Expr::Include {
+                            path: Box::new(path),
+                            once: keyword.ends_with("_once"),
+                            require: keyword.starts_with("require"),
+                        })
+                    }
                     "new" => {
                         self.advance();
                         if self.check_keyword("class") {
@@ -1376,12 +1454,14 @@ impl Parser {
                     "yield" => Err(self.unsupported("generators")),
                     "print" => Err(self.unsupported("the print expression; use echo")),
                     "exit" | "die" => Err(self.unsupported("exit/die")),
-                    "include" | "include_once" | "require" | "require_once" => {
-                        Err(self.unsupported("include/require"))
-                    }
                     "instanceof" => Err(self.unsupported("instanceof")),
-                    _ => {
+                    "namespace" if self.peek_at(1) == &Tok::Backslash => {
                         self.advance();
+                        let mut name = String::from("namespace");
+                        while self.eat(&Tok::Backslash) {
+                            name.push('\\');
+                            name.push_str(&self.expect_ident()?);
+                        }
                         if self.eat(&Tok::LParen) {
                             let args = self.parse_call_args()?;
                             Ok(Expr::Call { name, args })
@@ -1389,6 +1469,29 @@ impl Parser {
                             Ok(Expr::Name(name))
                         }
                     }
+                    _ => {
+                        self.advance();
+                        let mut name = name;
+                        while self.eat(&Tok::Backslash) {
+                            name.push('\\');
+                            name.push_str(&self.expect_ident()?);
+                        }
+                        if self.eat(&Tok::LParen) {
+                            let args = self.parse_call_args()?;
+                            Ok(Expr::Call { name, args })
+                        } else {
+                            Ok(Expr::Name(name))
+                        }
+                    }
+                }
+            }
+            Tok::Backslash => {
+                let name = self.parse_qualified_name()?;
+                if self.eat(&Tok::LParen) {
+                    let args = self.parse_call_args()?;
+                    Ok(Expr::Call { name, args })
+                } else {
+                    Ok(Expr::Name(name))
                 }
             }
             other => Err(self.error(format!("syntax error, unexpected {}", other.describe()))),
@@ -1659,6 +1762,55 @@ mod tests {
         assert!(matches!(
             &program.stmts[2],
             Stmt::Expr(Expr::DynamicCall { .. })
+        ));
+    }
+
+    #[test]
+    fn parses_namespaces_imports_and_includes() {
+        let program = parse_file(
+            br#"<?php
+                namespace App\Util;
+                use Foo\Bar as Baz;
+                use function Foo\helper;
+                use const Foo\VERSION;
+                include __DIR__ . "/lib.php";
+                require_once "other.php";
+                namespace Other {
+                    use App\Util\Baz;
+                    echo Baz::class;
+                }
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &program.stmts[0],
+            Stmt::NamespaceMark(Some(name)) if name == "App\\Util"
+        ));
+        match &program.stmts[1] {
+            Stmt::Use(imports) => {
+                assert_eq!(imports.len(), 1);
+                assert_eq!(imports[0].alias, "Baz");
+                assert_eq!(imports[0].target, "Foo\\Bar");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &program.stmts[4] {
+            Stmt::Expr(Expr::Include { once, require, .. }) => {
+                assert!(!once);
+                assert!(!require);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &program.stmts[5] {
+            Stmt::Expr(Expr::Include { once, require, .. }) => {
+                assert!(once);
+                assert!(require);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            &program.stmts[6],
+            Stmt::NamespaceBlock { name: Some(name), .. } if name == "Other"
         ));
     }
 

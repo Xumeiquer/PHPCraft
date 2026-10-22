@@ -9,9 +9,7 @@ description = "PHPCraft bytecode virtual machine"
 [dependencies]
 phpcraft-ast.workspace = true
 phpcraft-bytecode.workspace = true
+phpcraft-compiler.workspace = true
+phpcraft-parser.workspace = true
 phpcraft-runtime.workspace = true
 phpcraft-stdlib.workspace = true
-
-[dev-dependencies]
-phpcraft-parser.workspace = true
-phpcraft-compiler.workspace = true

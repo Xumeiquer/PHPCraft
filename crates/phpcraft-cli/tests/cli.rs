@@ -1,5 +1,6 @@
 //! End-to-end CLI behaviour, exercised through the built binary.
 
+use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -113,6 +114,45 @@ fn classes_and_exceptions_run() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Uncaught Exception: uncaught"));
     assert!(stderr.contains("Stack trace:"));
+}
+
+#[test]
+fn includes_register_definitions_and_run_once() {
+    let dir = std::env::temp_dir().join(format!(
+        "phpcraft-cli-include-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    fs::write(
+        dir.join("lib.php"),
+        r#"<?php
+            function inc_fn($a, $b) { return $a + $b; }
+            echo "L|";
+            return "R";
+        "#,
+    )
+    .expect("write lib");
+    fs::write(
+        dir.join("main.php"),
+        r#"<?php
+            $value = include __DIR__ . "/lib.php";
+            echo $value, "|", inc_fn(2, 3), "|";
+            echo include_once __DIR__ . "/lib.php";
+        "#,
+    )
+    .expect("write main");
+
+    let output = phpcraft()
+        .arg(dir.join("main.php"))
+        .output()
+        .expect("run phpcraft");
+    let _ = fs::remove_dir_all(&dir);
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "L|R|5|1");
 }
 
 #[test]

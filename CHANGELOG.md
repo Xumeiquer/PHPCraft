@@ -20,8 +20,17 @@ The reference behaviour is PHP 8.5.4.
   `LogicException`), exception accessors and PHP-like uncaught diagnostics.
 - Runtime errors raised by builtins are catchable as their corresponding
   `Error` subclasses.
+- Namespaces: `namespace Name;`, braced namespace blocks (including the global
+  `namespace { ... }` form), `use` imports for classes, functions and
+  constants, aliases, qualified and fully-qualified names, and the
+  `namespace\Name` relative syntax. Unqualified function and constant lookups
+  fall back to the global namespace as in PHP.
+- Magic constants `__FILE__`, `__DIR__`, `__NAMESPACE__`, `__CLASS__`,
+  `__METHOD__`, `__FUNCTION__` and `__LINE__`.
+- `include`, `include_once`, `require` and `require_once`, including return
+  values, shared globals, included definitions and once-per-file tracking.
 - Differential coverage for classes, inheritance, static members, object
-  identity, cloning and exception handling.
+  identity, cloning, exception handling, namespaces and includes.
 - Closures and arrow functions: `function (...) use (...)` captures, implicit
   arrow-function captures, default/variadic parameters, nested closures and
   by-value capture semantics.
@@ -77,8 +86,8 @@ The reference behaviour is PHP 8.5.4.
 
 ### Tested
 
-- 47 Rust unit/integration tests.
-- 16 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
+- 50 Rust unit/integration tests.
+- 18 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
   status.
 
 ### Planned
@@ -86,7 +95,8 @@ The reference behaviour is PHP 8.5.4.
 - References and by-reference builtins (`sort`, `array_push`, `unset`,
   `foreach &$value`), including by-reference closure captures.
 - First-class callable syntax (`strlen(...)`) and callable arrays.
-- `include`/`require`, namespaces and qualified-name resolution.
+- Group `use` declarations, `include_path`, class autoloading and namespaced
+  constant declarations.
 - Visibility enforcement, `__toString()` in every stdlib coercion path, and
   `finally` on `return`/`throw` paths.
 

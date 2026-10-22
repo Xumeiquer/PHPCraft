@@ -50,6 +50,15 @@ pub enum Stmt {
     Function(FunctionDecl),
     /// `class Name extends Parent { ... }`
     Class(ClassDecl),
+    /// `namespace Name;` — applies to the following statements.
+    NamespaceMark(Option<String>),
+    /// `namespace Name { ... }` or `namespace { ... }`.
+    NamespaceBlock {
+        name: Option<String>,
+        body: Vec<Stmt>,
+    },
+    /// One or more `use` imports.
+    Use(Vec<UseDecl>),
     /// `try { ... } catch (...) { ... } finally { ... }`
     Try {
         body: Vec<Stmt>,
@@ -84,6 +93,22 @@ pub struct Param {
     pub name: String,
     pub default: Option<Expr>,
     pub variadic: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UseKind {
+    Class,
+    Function,
+    Constant,
+}
+
+#[derive(Clone, Debug)]
+pub struct UseDecl {
+    /// Fully-qualified target, without a leading backslash.
+    pub target: String,
+    /// Local alias; defaults to the final segment of `target`.
+    pub alias: String,
+    pub kind: UseKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -307,6 +332,12 @@ pub enum Expr {
     Clone(Box<Expr>),
     /// `throw $value` (an expression in PHP 8).
     Throw(Box<Expr>),
+    /// `include`, `include_once`, `require` or `require_once`.
+    Include {
+        path: Box<Expr>,
+        once: bool,
+        require: bool,
+    },
     /// `function (...) use (...) { ... }` or `fn (...) => ...`.
     Closure(Box<ClosureDecl>),
     /// `match ($value) { 1, 2 => ..., default => ... }`.

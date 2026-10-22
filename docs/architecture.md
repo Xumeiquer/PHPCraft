@@ -80,6 +80,14 @@ objects carrying an `ExceptionData` payload; `throw` transports the object in
 `PhpError::thrown`, and `try` handlers installed as bytecode opcodes unwind the
 current frame to the matching `catch` clause.
 
+Namespace and `use` state is tracked by the compiler. Declarations are stored
+under qualified names, class names are rewritten at compile time, and
+unqualified function calls carry a fallback flag so the VM can try the global
+function when the namespaced one does not exist. `__FILE__` and `__DIR__` are
+folded from the source path; included files are parsed and compiled on demand
+by the VM, executed in the shared global scope and merged into the function and
+class registries. A canonical-path set implements the `*_once` forms.
+
 The runtime also owns observable formatting rules: `echo` uses `precision=14`
 with scientific notation from `1e14`, `var_dump` uses the shortest round-trip
 representation, and `(int)` conversion clamps out-of-range floats.
@@ -139,12 +147,16 @@ writing), and `vendor/php-src` tracks branch `PHP-8.5`.
 
 ## Current limits
 
-Deliberately unimplemented (they produce explicit errors): namespaces,
-attributes, interfaces, traits, enums, references, by-reference closure
-captures, first-class callable syntax, `include`/`require`, named arguments and
-alternative control syntax. By-reference builtins such as `sort()` and
-`array_push()` are also absent until references exist. Visibility is parsed and
-reported by `var_dump()`/`print_r()`, but private/protected access is not
-enforced yet. `return` and `throw` that escape a `catch`/`finally` block can
-still skip the `finally` body. Opcodes carry no source line information yet,
-so exceptions and runtime diagnostics use line 1.
+Deliberately unimplemented (they produce explicit errors): attributes,
+interfaces, traits, enums, references, by-reference closure captures,
+first-class callable syntax, named arguments and alternative control syntax.
+By-reference builtins such as `sort()` and `array_push()` are also absent until
+references exist. Namespace support covers ordinary and braced declarations,
+per-kind `use` imports and aliases; group `use`, namespaced `const`
+declarations and autoloading are not implemented. Includes search the calling
+script's directory and then the current directory; `include_path` is ignored
+and an include written inside a function still executes in the global scope.
+Visibility is parsed and reported by `var_dump()`/`print_r()`, but
+private/protected access is not enforced yet. `return` and `throw` that escape
+a `catch`/`finally` block can still skip the `finally` body. Opcodes carry no
+source line information yet, so exceptions and runtime diagnostics use line 1.
