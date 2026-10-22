@@ -122,6 +122,7 @@ struct FnCompiler {
     params: Vec<ParamSlot>,
     capture_slots: Vec<u32>,
     capture_names: Vec<String>,
+    capture_refs: Vec<bool>,
     functions: Vec<Function>,
     classes: Vec<ClassDef>,
     namespace: String,
@@ -148,6 +149,7 @@ impl FnCompiler {
             params: Vec::new(),
             capture_slots: Vec::new(),
             capture_names: Vec::new(),
+            capture_refs: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
             namespace: String::new(),
@@ -174,6 +176,7 @@ impl FnCompiler {
             params: Vec::new(),
             capture_slots: Vec::new(),
             capture_names: Vec::new(),
+            capture_refs: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
             namespace: String::new(),
@@ -200,6 +203,7 @@ impl FnCompiler {
             params: Vec::new(),
             capture_slots: Vec::new(),
             capture_names: Vec::new(),
+            capture_refs: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
             namespace: String::new(),
@@ -231,6 +235,7 @@ impl FnCompiler {
             params: self.params,
             capture_slots: self.capture_slots,
             capture_names: self.capture_names,
+            capture_refs: self.capture_refs,
             chunk: Chunk {
                 ops: self.ops,
                 consts: self.consts,
@@ -442,6 +447,36 @@ impl FnCompiler {
         }
     }
 
+    fn load_var_ref(&mut self, name: &str) {
+        if self.is_main || self.globals.contains(name) {
+            let index = self.const_str(name.as_bytes());
+            self.emit(Op::LoadGlobalRef(index));
+        } else {
+            let slot = self.slot(name);
+            self.emit(Op::LoadVarRef(slot));
+        }
+    }
+
+    fn store_var_ref(&mut self, name: &str) {
+        if self.is_main || self.globals.contains(name) {
+            let index = self.const_str(name.as_bytes());
+            self.emit(Op::StoreGlobalRef(index));
+        } else {
+            let slot = self.slot(name);
+            self.emit(Op::StoreVarRef(slot));
+        }
+    }
+
+    fn expr_arg(&mut self, expr: &Expr) -> Result<(), CompileError> {
+        if let Expr::Var(name) = expr {
+            if name != "this" {
+                self.load_var_ref(name);
+                return Ok(());
+            }
+        }
+        self.expr(expr)
+    }
+
     fn load_var_safe(&mut self, name: &str) {
         if self.is_main || self.globals.contains(name) {
             let index = self.const_str(name.as_bytes());
@@ -501,6 +536,7 @@ impl FnCompiler {
             Expr::StaticProperty { class, name } => {
                 let value_tmp = self.temp();
                 self.emit(Op::StoreTmp(value_tmp));
+                let class = self.qualify_class(class);
                 let class = self.const_str(class.as_bytes());
                 let name = self.const_str(name.as_bytes());
                 self.emit(Op::LoadTmp(value_tmp));
@@ -571,6 +607,7 @@ impl FnCompiler {
                 Ok(())
             }
             Expr::StaticProperty { class, name } => {
+                let class = self.qualify_class(class);
                 let class = self.const_str(class.as_bytes());
                 let name = self.const_str(name.as_bytes());
                 self.emit(Op::LoadStaticProperty {
@@ -938,6 +975,7 @@ impl FnCompiler {
                     slot,
                     default,
                     variadic: param.variadic,
+                    by_ref: param.by_ref,
                 });
             }
             check_param_names(&method.params, method.line)?;
@@ -1050,6 +1088,7 @@ impl FnCompiler {
                 slot,
                 default,
                 variadic: param.variadic,
+                by_ref: param.by_ref,
             });
         }
         nested.compile_stmts(&decl.body)?;
@@ -1060,42 +1099,36 @@ impl FnCompiler {
     }
 
     fn compile_closure(&mut self, decl: &ClosureDecl) -> Result<(), CompileError> {
-        let captures = if decl.is_arrow() {
+        let captures: Vec<(String, bool)> = if decl.is_arrow() {
             let params: HashSet<String> = decl.params.iter().map(|p| p.name.clone()).collect();
-            let mut captures = Vec::new();
+            let mut names = Vec::new();
             let mut seen = HashSet::new();
             match &decl.body {
                 ClosureBody::Expr(body) => {
-                    collect_free_vars(body, &params, &mut captures, &mut seen);
+                    collect_free_vars(body, &params, &mut names, &mut seen);
                 }
                 ClosureBody::Block(_) => {}
             }
-            captures
+            names.into_iter().map(|name| (name, false)).collect()
         } else {
-            if let Some(capture) = decl.captures.iter().find(|capture| capture.by_ref) {
-                return Err(CompileError::new(
-                    format!(
-                        "by-reference closure captures are not supported (${})",
-                        capture.name
-                    ),
-                    decl.line,
-                ));
-            }
-            let captures: Vec<String> = decl
+            let captures: Vec<(String, bool)> = decl
                 .captures
                 .iter()
-                .map(|capture| capture.name.clone())
+                .map(|capture| (capture.name.clone(), capture.by_ref))
                 .collect();
             let mut seen: HashSet<&str> = HashSet::new();
-            if let Some(capture) = captures.iter().find(|name| !seen.insert(name.as_str())) {
+            if let Some((capture, _)) = captures
+                .iter()
+                .find(|(name, _)| !seen.insert(name.as_str()))
+            {
                 return Err(CompileError::new(
                     format!("Cannot use variable ${capture} twice"),
                     decl.line,
                 ));
             }
-            if let Some(capture) = captures
+            if let Some((capture, _)) = captures
                 .iter()
-                .find(|name| decl.params.iter().any(|param| &param.name == *name))
+                .find(|(name, _)| decl.params.iter().any(|param| param.name == *name))
             {
                 return Err(CompileError::new(
                     format!("Cannot use lexical variable ${capture} as a parameter name"),
@@ -1105,7 +1138,7 @@ impl FnCompiler {
             captures
         };
         check_param_names(&decl.params, decl.line)?;
-        if captures.iter().any(|name| name == "this") {
+        if captures.iter().any(|(name, _)| name == "this") {
             return Err(CompileError::new(
                 "Cannot use $this as lexical variable",
                 decl.line,
@@ -1118,10 +1151,11 @@ impl FnCompiler {
         nested.class_uses = self.class_uses.clone();
         nested.function_uses = self.function_uses.clone();
         nested.const_uses = self.const_uses.clone();
-        for capture in &captures {
+        for (capture, by_ref) in &captures {
             let slot = nested.slot(capture);
             nested.capture_slots.push(slot);
             nested.capture_names.push(capture.clone());
+            nested.capture_refs.push(*by_ref);
         }
         for param in &decl.params {
             let slot = nested.slot(&param.name);
@@ -1134,6 +1168,7 @@ impl FnCompiler {
                 slot,
                 default,
                 variadic: param.variadic,
+                by_ref: param.by_ref,
             });
         }
         match &decl.body {
@@ -1147,8 +1182,12 @@ impl FnCompiler {
         self.functions.push(function);
         self.functions.extend(inner);
 
-        for capture in &captures {
-            self.load_var(capture);
+        for (capture, by_ref) in &captures {
+            if *by_ref {
+                self.load_var_ref(capture);
+            } else {
+                self.load_var(capture);
+            }
         }
         let index = self.const_str(name.as_bytes());
         self.emit(Op::MakeClosure {
@@ -1285,7 +1324,7 @@ impl FnCompiler {
             }
             Expr::Call { name, args } => {
                 for arg in args {
-                    self.expr(arg)?;
+                    self.expr_arg(arg)?;
                 }
                 let (name, fallback) = self.resolve_function_call(name);
                 let index = self.const_str(name.as_bytes());
@@ -1298,7 +1337,7 @@ impl FnCompiler {
             Expr::DynamicCall { callee, args } => {
                 self.expr(callee)?;
                 for arg in args {
-                    self.expr(arg)?;
+                    self.expr_arg(arg)?;
                 }
                 self.emit(Op::CallValue {
                     argc: args.len() as u32,
@@ -1306,7 +1345,7 @@ impl FnCompiler {
             }
             Expr::New { class, args } => {
                 for arg in args {
-                    self.expr(arg)?;
+                    self.expr_arg(arg)?;
                 }
                 let class = self.qualify_class(class);
                 let index = self.const_str(class.as_bytes());
@@ -1330,7 +1369,7 @@ impl FnCompiler {
             } => {
                 self.expr(object)?;
                 for arg in args {
-                    self.expr(arg)?;
+                    self.expr_arg(arg)?;
                 }
                 let index = self.const_str(method.as_bytes());
                 self.emit(Op::CallMethod {
@@ -1344,7 +1383,7 @@ impl FnCompiler {
                 args,
             } => {
                 for arg in args {
-                    self.expr(arg)?;
+                    self.expr_arg(arg)?;
                 }
                 let class = self.qualify_class(class);
                 let class = self.const_str(class.as_bytes());
@@ -1380,6 +1419,12 @@ impl FnCompiler {
             Expr::Clone(expr) => {
                 self.expr(expr)?;
                 self.emit(Op::CloneObject);
+            }
+            Expr::Reference(_) => {
+                return Err(CompileError::new(
+                    "reference expressions are only supported on the right-hand side of `=`",
+                    self.line,
+                ))
             }
             Expr::Throw(expr) => {
                 self.expr(expr)?;
@@ -1487,6 +1532,30 @@ impl FnCompiler {
     ) -> Result<(), CompileError> {
         match op {
             None => {
+                if let Expr::Reference(source) = value {
+                    let Expr::Var(source) = source.as_ref() else {
+                        return Err(CompileError::new(
+                            "references can only be taken of variables",
+                            self.line,
+                        ));
+                    };
+                    if source == "this" {
+                        return Err(CompileError::new("Cannot re-assign $this", self.line));
+                    }
+                    self.load_var_ref(source);
+                    self.emit(Op::Dup);
+                    let Expr::Var(target) = target else {
+                        return Err(CompileError::new(
+                            "reference assignment target must be a variable",
+                            self.line,
+                        ));
+                    };
+                    if target == "this" {
+                        return Err(CompileError::new("Cannot re-assign $this", self.line));
+                    }
+                    self.store_var_ref(target);
+                    return Ok(());
+                }
                 self.expr(value)?;
                 self.store_target(target, true)?;
             }
@@ -1719,7 +1788,9 @@ fn collect_free_vars(
             }
         }
         Expr::InstanceOf { expr, .. } => collect_free_vars(expr, params, out, seen),
-        Expr::Clone(expr) | Expr::Throw(expr) => collect_free_vars(expr, params, out, seen),
+        Expr::Clone(expr) | Expr::Reference(expr) | Expr::Throw(expr) => {
+            collect_free_vars(expr, params, out, seen)
+        }
         Expr::Include { path, .. } => collect_free_vars(path, params, out, seen),
         Expr::Closure(decl) => {
             if decl.is_arrow() {

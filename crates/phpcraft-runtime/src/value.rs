@@ -154,6 +154,9 @@ pub enum Value {
     Array(Rc<PhpArray>),
     Closure(Rc<PhpClosure>),
     Object(Rc<RefCell<PhpObject>>),
+    /// A PHP reference. The cell is shared by every variable, parameter or
+    /// capture bound to the same reference.
+    Ref(Rc<RefCell<Value>>),
 }
 
 impl Value {
@@ -195,11 +198,34 @@ impl Value {
         Value::Object(Rc::new(RefCell::new(object)))
     }
 
+    pub fn reference(value: Value) -> Self {
+        Value::Ref(Rc::new(RefCell::new(value)))
+    }
+
+    /// Follow reference cells and return the underlying value.
+    pub fn deref(&self) -> Value {
+        let mut current = self.clone();
+        loop {
+            match current {
+                Value::Ref(cell) => current = cell.borrow().clone(),
+                value => return value,
+            }
+        }
+    }
+
+    pub fn as_ref_cell(&self) -> Option<&Rc<RefCell<Value>>> {
+        match self {
+            Value::Ref(cell) => Some(cell),
+            _ => None,
+        }
+    }
+
     /// The class name of an object, or `None` for non-objects.
     pub fn object_class(&self) -> Option<String> {
         match self {
             Value::Object(object) => Some(object.borrow().class_name.clone()),
             Value::Closure(_) => Some("Closure".to_string()),
+            Value::Ref(_) => self.deref().object_class(),
             _ => None,
         }
     }
@@ -214,6 +240,7 @@ impl Value {
             Value::Str(_) => "string",
             Value::Array(_) => "array",
             Value::Closure(_) | Value::Object(_) => "object",
+            Value::Ref(cell) => cell.borrow().type_name(),
         }
     }
 
@@ -228,18 +255,25 @@ impl Value {
             Value::Array(_) => "array".to_string(),
             Value::Closure(_) => "Closure".to_string(),
             Value::Object(object) => object.borrow().class_name.clone(),
+            Value::Ref(_) => self.deref().debug_type_name(),
         }
     }
 
     pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
+        match self {
+            Value::Ref(_) => self.deref().is_null(),
+            _ => matches!(self, Value::Null),
+        }
     }
 
     pub fn is_scalar(&self) -> bool {
-        matches!(
-            self,
-            Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
-        )
+        match self {
+            Value::Ref(_) => self.deref().is_scalar(),
+            _ => matches!(
+                self,
+                Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Str(_)
+            ),
+        }
     }
 
     /// PHP truthiness: `false`, `0`, `0.0`, `""`, `"0"`, `[]` and `null` are falsy.
@@ -252,6 +286,7 @@ impl Value {
             Value::Str(s) => !(s.0.is_empty() || s.0 == b"0"),
             Value::Array(a) => !a.is_empty(),
             Value::Closure(_) | Value::Object(_) => true,
+            Value::Ref(_) => self.deref().to_bool(),
         }
     }
 
@@ -267,6 +302,7 @@ impl Value {
             Value::Array(_) => b"Array".to_vec(),
             Value::Closure(_) => b"Closure".to_vec(),
             Value::Object(object) => object.borrow().class_name.as_bytes().to_vec(),
+            Value::Ref(_) => self.deref().to_bytes(),
         }
     }
 
@@ -290,6 +326,7 @@ impl Value {
             },
             Value::Array(a) => i64::from(!a.is_empty()),
             Value::Closure(_) | Value::Object(_) => 1,
+            Value::Ref(_) => self.deref().to_int_cast(),
         }
     }
 
@@ -306,6 +343,7 @@ impl Value {
             },
             Value::Array(a) => f64::from(u8::from(!a.is_empty())),
             Value::Closure(_) | Value::Object(_) => 1.0,
+            Value::Ref(_) => self.deref().to_float_cast(),
         }
     }
 
@@ -322,6 +360,7 @@ impl Value {
                 None => ToNumber::Invalid,
             },
             Value::Array(_) | Value::Closure(_) | Value::Object(_) => ToNumber::Invalid,
+            Value::Ref(_) => self.deref().to_number(),
         }
     }
 
@@ -339,6 +378,7 @@ impl Value {
                 "Object of class {} could not be converted to string",
                 object.borrow().class_name
             ))),
+            Value::Ref(_) => self.deref().coerce_string(),
             other => Ok(Rc::new(PhpStr::new(other.to_bytes()))),
         }
     }
@@ -355,6 +395,7 @@ impl fmt::Debug for Value {
             Value::Array(a) => write!(f, "array({})", a.len()),
             Value::Closure(c) => write!(f, "closure({})", c.function),
             Value::Object(o) => write!(f, "object({}#{})", o.borrow().class_name, o.borrow().id),
+            Value::Ref(cell) => write!(f, "ref({:?})", cell.borrow()),
         }
     }
 }
@@ -604,6 +645,12 @@ pub fn loose_eq(a: &Value, b: &Value) -> bool {
 
 /// PHP `===`.
 pub fn strict_eq(a: &Value, b: &Value) -> bool {
+    if matches!(a, Value::Ref(_)) {
+        return strict_eq(&a.deref(), b);
+    }
+    if matches!(b, Value::Ref(_)) {
+        return strict_eq(a, &b.deref());
+    }
     match (a, b) {
         (Value::Null, Value::Null) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
@@ -630,6 +677,13 @@ pub fn strict_eq(a: &Value, b: &Value) -> bool {
 /// array keys), which callers treat as "not equal".
 pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
     use Value::*;
+
+    if matches!(a, Ref(_)) {
+        return compare(&a.deref(), b);
+    }
+    if matches!(b, Ref(_)) {
+        return compare(a, &b.deref());
+    }
 
     // bool/null comparisons are done as booleans.
     let boolish = |v: &Value| matches!(v, Null | Bool(_));
@@ -682,6 +736,7 @@ pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
         (Closure(_), _) | (Object(_), _) => Some(Ordering::Greater),
         (_, Closure(_)) | (_, Object(_)) => Some(Ordering::Less),
         (Null, _) | (_, Null) | (Bool(_), _) | (_, Bool(_)) => Some(a.to_bool().cmp(&b.to_bool())),
+        (Ref(_), _) | (_, Ref(_)) => None,
     }
 }
 
@@ -731,6 +786,7 @@ pub fn key_from_value(value: &Value) -> PhpResult<Key> {
                 "Illegal offset type: array keys must be int or string",
             ))
         }
+        Value::Ref(_) => return key_from_value(&value.deref()),
     })
 }
 

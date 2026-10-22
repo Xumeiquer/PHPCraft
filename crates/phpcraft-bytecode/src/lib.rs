@@ -35,14 +35,22 @@ pub enum Op {
     LoadVar(u32),
     /// Like `LoadVar`, but yields `null` without a warning when undefined.
     LoadVarSafe(u32),
+    /// Push a reference cell for a local slot, creating one if necessary.
+    LoadVarRef(u32),
     StoreVar(u32),
     /// Store and keep the value on the stack (assignment expressions).
     StoreVarKeep(u32),
+    /// Store a reference cell into a slot, rebinding rather than writing through.
+    StoreVarRef(u32),
 
     LoadGlobal(u32),
     LoadGlobalSafe(u32),
+    /// Push a reference cell for a global variable.
+    LoadGlobalRef(u32),
     StoreGlobal(u32),
     StoreGlobalKeep(u32),
+    /// Store a reference cell into a global variable.
+    StoreGlobalRef(u32),
 
     LoadTmp(u32),
     StoreTmp(u32),
@@ -221,6 +229,7 @@ pub struct ParamSlot {
     /// Constant default value; `None` means the parameter is required.
     pub default: Option<Value>,
     pub variadic: bool,
+    pub by_ref: bool,
 }
 
 /// A compiled function (or the top-level script, named `{main}`).
@@ -236,6 +245,8 @@ pub struct Function {
     pub capture_slots: Vec<u32>,
     /// Names corresponding to `capture_slots`, used by `var_dump`.
     pub capture_names: Vec<String>,
+    /// Whether each capture is bound by reference, parallel to `capture_slots`.
+    pub capture_refs: Vec<bool>,
     pub chunk: Chunk,
     pub max_slots: u32,
     /// Variable name per slot (temps have `None`); used in diagnostics.

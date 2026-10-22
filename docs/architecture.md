@@ -57,6 +57,7 @@ enum Value {
     Array(Rc<PhpArray>),
     Closure(Rc<PhpClosure>),
     Object(Rc<RefCell<PhpObject>>),
+    Ref(Rc<RefCell<Value>>),
 }
 ```
 
@@ -72,6 +73,12 @@ enum Value {
   the same object, matching PHP's handle semantics. Property storage is an
   ordered `PhpArray`; declared visibility is kept beside it for `var_dump()`
   and `print_r()`.
+* References are `Value::Ref(Rc<RefCell<Value>>)`. Reads dereference the cell,
+  ordinary stores write through it, and `$a = &$b` rebinds both variables to
+  the same cell. Function and method calls evaluate simple variable arguments
+  as reference candidates; by-value parameters copy the dereferenced value and
+  by-reference parameters bind the cell itself. Native calls preserve cells
+  only for the argument positions listed in `phpcraft_stdlib::by_ref_params`.
 
 Classes are compiled into `ClassDef` metadata (properties, constants and
 method entry points) next to the function table. The VM resolves inherited
@@ -148,10 +155,12 @@ writing), and `vendor/php-src` tracks branch `PHP-8.5`.
 ## Current limits
 
 Deliberately unimplemented (they produce explicit errors): attributes,
-interfaces, traits, enums, references, by-reference closure captures,
-first-class callable syntax, named arguments and alternative control syntax.
-By-reference builtins such as `sort()` and `array_push()` are also absent until
-references exist. Namespace support covers ordinary and braced declarations,
+interfaces, traits, enums, by-reference `foreach`, references to array
+elements and object properties, by-reference returns, `unset`, first-class
+callable syntax, named arguments and alternative control syntax. The
+implemented by-reference builtins are `sort`, `rsort`, `array_push`,
+`array_pop`, `array_shift` and `array_unshift`; `sort` flags are parsed but
+ignored. Namespace support covers ordinary and braced declarations,
 per-kind `use` imports and aliases; group `use`, namespaced `const`
 declarations and autoloading are not implemented. Includes search the calling
 script's directory and then the current directory; `include_path` is ignored

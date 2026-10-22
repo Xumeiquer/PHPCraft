@@ -7,6 +7,7 @@
 //! Functions receive `&mut dyn RuntimeHooks`, so they can write output, warn,
 //! call back into userland and read constants without depending on the VM.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -85,6 +86,12 @@ static REGISTRY: &[(&str, NativeFn)] = &[
     ("array_combine", array_combine),
     ("array_flip", array_flip),
     ("array_map", array_map),
+    ("sort", sort),
+    ("rsort", rsort),
+    ("array_push", array_push),
+    ("array_pop", array_pop),
+    ("array_shift", array_shift),
+    ("array_unshift", array_unshift),
     ("range", range),
     // math
     ("abs", abs),
@@ -159,6 +166,16 @@ pub fn find(name: &str) -> Option<NativeFn> {
 
 pub fn names() -> impl Iterator<Item = &'static str> {
     REGISTRY.iter().map(|(name, _)| *name)
+}
+
+/// Argument indexes that a builtin declares by reference. The VM preserves
+/// reference cells for these positions and dereferences every other native
+/// argument before the call.
+pub fn by_ref_params(name: &str) -> &'static [usize] {
+    match name.to_ascii_lowercase().as_str() {
+        "sort" | "rsort" | "array_push" | "array_pop" | "array_shift" | "array_unshift" => &[0],
+        _ => &[],
+    }
 }
 
 // ---------------------------------------------------------------- arguments
@@ -1892,6 +1909,122 @@ fn array_map(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value>
     Ok(Value::array(out))
 }
 
+// ------------------------------------------------------- by-ref array builtins
+
+fn ref_array(
+    args: &[Value],
+    index: usize,
+    fname: &str,
+    param: &str,
+) -> PhpResult<(Rc<std::cell::RefCell<Value>>, PhpArray)> {
+    let cell = match args.get(index) {
+        None => {
+            return Err(PhpError::argument_count(format!(
+                "{fname}(): Argument #{} (${param}) not passed",
+                index + 1
+            )))
+        }
+        Some(Value::Ref(cell)) => cell.clone(),
+        Some(_) => {
+            return Err(PhpError::fatal(format!(
+                "{fname}(): Argument #{} (${param}) cannot be passed by reference",
+                index + 1
+            )))
+        }
+    };
+    let inner = cell.borrow().deref();
+    match inner {
+        Value::Array(array) => Ok((cell, array.as_ref().clone())),
+        other => Err(type_error_arg(fname, index, param, "array", &other)),
+    }
+}
+
+fn sort(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("sort", &args, 1, Some(2))?;
+    let (cell, array) = ref_array(&args, 0, "sort", "array")?;
+    let mut values = array.values();
+    values.sort_by(|a, b| compare(a, b).unwrap_or(Ordering::Equal));
+    *cell.borrow_mut() = Value::array(PhpArray::from(values));
+    Ok(Value::Bool(true))
+}
+
+fn rsort(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("rsort", &args, 1, Some(2))?;
+    let (cell, array) = ref_array(&args, 0, "rsort", "array")?;
+    let mut values = array.values();
+    values.sort_by(|a, b| compare(b, a).unwrap_or(Ordering::Equal));
+    *cell.borrow_mut() = Value::array(PhpArray::from(values));
+    Ok(Value::Bool(true))
+}
+
+fn array_push(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_push", &args, 1, None)?;
+    let (cell, mut array) = ref_array(&args, 0, "array_push", "array")?;
+    for value in args.iter().skip(1) {
+        array.push(value.deref());
+    }
+    let len = array.len() as i64;
+    *cell.borrow_mut() = Value::array(array);
+    Ok(Value::Int(len))
+}
+
+fn array_pop(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_pop", &args, 1, Some(1))?;
+    let (cell, mut array) = ref_array(&args, 0, "array_pop", "array")?;
+    let value = array
+        .first_key()
+        .and_then(|_| array.keys().last().cloned())
+        .and_then(|key| array.remove(&key))
+        .unwrap_or(Value::Null);
+    *cell.borrow_mut() = Value::array(array);
+    Ok(value)
+}
+
+fn array_shift(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_shift", &args, 1, Some(1))?;
+    let (cell, mut array) = ref_array(&args, 0, "array_shift", "array")?;
+    let first = array.first_key().cloned();
+    let value = first
+        .as_ref()
+        .and_then(|key| array.remove(key))
+        .unwrap_or(Value::Null);
+    let mut out = PhpArray::with_capacity(array.len());
+    for (key, value) in array.iter() {
+        match key {
+            Key::Int(_) => {
+                out.push(value.deref());
+            }
+            Key::Str(_) => {
+                out.insert(key.clone(), value.deref());
+            }
+        }
+    }
+    *cell.borrow_mut() = Value::array(out);
+    Ok(value)
+}
+
+fn array_unshift(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_unshift", &args, 1, None)?;
+    let (cell, array) = ref_array(&args, 0, "array_unshift", "array")?;
+    let mut out = PhpArray::with_capacity(array.len() + args.len() - 1);
+    for value in args.iter().skip(1) {
+        out.push(value.deref());
+    }
+    for (key, value) in array.iter() {
+        match key {
+            Key::Int(_) => {
+                out.push(value.deref());
+            }
+            Key::Str(_) => {
+                out.insert(key.clone(), value.deref());
+            }
+        }
+    }
+    let len = out.len() as i64;
+    *cell.borrow_mut() = Value::array(out);
+    Ok(Value::Int(len))
+}
+
 fn range(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("range", &args, 2, Some(3))?;
 
@@ -2353,7 +2486,8 @@ fn pi(_hooks: &mut dyn RuntimeHooks, _args: Vec<Value>) -> PhpResult<Value> {
 
 fn gettype(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("gettype", &args, 1, Some(1))?;
-    Ok(Value::from_str_lit(match &args[0] {
+    let value = args[0].deref();
+    Ok(Value::from_str_lit(match &value {
         Value::Null => "NULL",
         Value::Bool(_) => "boolean",
         Value::Int(_) => "integer",
@@ -2361,6 +2495,7 @@ fn gettype(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
         Value::Str(_) => "string",
         Value::Array(_) => "array",
         Value::Closure(_) | Value::Object(_) => "object",
+        Value::Ref(_) => unreachable!("deref removes reference cells"),
     }))
 }
 
@@ -2491,6 +2626,8 @@ fn function_exists(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<
 // ------------------------------------------------------------------- output
 
 fn dump_value(value: &Value, depth: usize, out: &mut Vec<u8>) {
+    let deref = value.deref();
+    let value = &deref;
     out.extend(std::iter::repeat_n(b' ', depth * 2));
     match value {
         Value::Null => out.extend_from_slice(b"NULL\n"),
@@ -2607,6 +2744,7 @@ fn dump_value(value: &Value, depth: usize, out: &mut Vec<u8>) {
             out.extend(std::iter::repeat_n(b' ', depth * 2));
             out.extend_from_slice(b"}\n");
         }
+        Value::Ref(_) => unreachable!("deref removes reference cells"),
     }
 }
 

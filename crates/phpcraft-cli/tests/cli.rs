@@ -69,7 +69,7 @@ fn match_expression_and_unhandled_case() {
 }
 
 #[test]
-fn closures_run_and_by_reference_captures_are_rejected() {
+fn closures_run_and_capture_by_value_or_reference() {
     let output = phpcraft()
         .args([
             "-r",
@@ -83,14 +83,12 @@ fn closures_run_and_by_reference_captures_are_rejected() {
     let output = phpcraft()
         .args([
             "-r",
-            r#"$x = 1; $f = function () use (&$x) { return $x; };"#,
+            r#"$x = 1; $f = function () use (&$x) { $x = 5; return $x; }; echo $f(), "|", $x, "|"; $y = 1; $g = function () use ($y) { $y = 9; return $y; }; echo $g(), "|", $y;"#,
         ])
         .output()
         .expect("run phpcraft");
-    assert_eq!(output.status.code(), Some(255));
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr)
-        .contains("by-reference closure captures are not supported"));
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "5|5|9|1");
 }
 
 #[test]

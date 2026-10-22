@@ -68,6 +68,33 @@ impl Frame {
         }
     }
 
+    /// Assignment to a variable writes through an existing reference cell.
+    fn assign(&mut self, slot: u32, value: Value) {
+        let index = slot as usize;
+        if index >= self.slots.len() {
+            return;
+        }
+        let value = value.deref();
+        if let Value::Ref(cell) = &self.slots[index] {
+            *cell.borrow_mut() = value;
+        } else {
+            self.slots[index] = value;
+        }
+        self.defined[index] = true;
+    }
+
+    fn ref_for(&mut self, slot: u32) -> Value {
+        let index = slot as usize;
+        if let Some(Value::Ref(cell)) = self.slots.get(index) {
+            return Value::Ref(cell.clone());
+        }
+        let value = self.slots[index].clone();
+        let cell = Rc::new(std::cell::RefCell::new(value));
+        self.slots[index] = Value::Ref(cell.clone());
+        self.defined[index] = true;
+        Value::Ref(cell)
+    }
+
     fn get(&self, slot: u32) -> &Value {
         &self.slots[slot as usize]
     }
@@ -201,6 +228,18 @@ impl Vm {
             return self.call_function(function, args);
         }
         if let Some(native) = phpcraft_stdlib::find(&lower) {
+            let by_ref = phpcraft_stdlib::by_ref_params(&lower);
+            let args = args
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    if by_ref.contains(&index) {
+                        value
+                    } else {
+                        value.deref()
+                    }
+                })
+                .collect();
             return native(self, args);
         }
         Err(PhpError::fatal(format!(
@@ -283,6 +322,9 @@ impl Vm {
     }
 
     fn output_bytes(&mut self, value: &Value) -> PhpResult<Vec<u8>> {
+        if let Value::Ref(_) = value {
+            return self.output_bytes(&value.deref());
+        }
         match value {
             Value::Closure(_) => Err(PhpError::fatal(
                 "Object of class Closure could not be converted to string",
@@ -332,18 +374,50 @@ impl Vm {
         if let Some(this) = this {
             frame.set(0, this);
         }
-        for (slot, value) in function.capture_slots.iter().zip(captures.iter()) {
-            frame.set(*slot, value.clone());
+        for (index, (slot, value)) in function
+            .capture_slots
+            .iter()
+            .zip(captures.iter())
+            .enumerate()
+        {
+            if function.capture_refs.get(index).copied().unwrap_or(false) {
+                frame.set(*slot, value.clone());
+            } else {
+                frame.set(*slot, value.deref());
+            }
         }
         let mut arg_index = 0usize;
-        for param in &function.params {
+        for (param_index, param) in function.params.iter().enumerate() {
             if param.variadic {
-                let rest: Vec<Value> = args.iter().skip(arg_index).cloned().collect();
+                let rest: Vec<Value> = args
+                    .iter()
+                    .skip(arg_index)
+                    .map(|value| {
+                        if param.by_ref {
+                            value.clone()
+                        } else {
+                            value.deref()
+                        }
+                    })
+                    .collect();
                 frame.set(param.slot, Value::array(PhpArray::from(rest)));
                 break;
             }
             if arg_index < args.len() {
-                frame.set(param.slot, args[arg_index].clone());
+                let value = &args[arg_index];
+                if param.by_ref {
+                    if value.as_ref_cell().is_none() {
+                        return Err(PhpError::fatal(format!(
+                            "{}(): Argument #{} (${}) could not be passed by reference",
+                            function.display_name(),
+                            param_index + 1,
+                            param.name
+                        )));
+                    }
+                    frame.set(param.slot, value.clone());
+                } else {
+                    frame.set(param.slot, value.deref());
+                }
                 arg_index += 1;
             } else if let Some(default) = &param.default {
                 frame.set(param.slot, default.clone());
@@ -756,7 +830,7 @@ impl Vm {
 
     fn load_property(&mut self, object: Value, name: &str, warn: bool) -> PhpResult<Value> {
         if let Value::Object(object) = object {
-            let value = object.borrow().properties.get_str(name).cloned();
+            let value = object.borrow().properties.get_str(name).map(Value::deref);
             if value.is_none() && warn {
                 let class = object.borrow().class_name.clone();
                 self.warn(format!("Undefined property: {}::${}", class, name));
@@ -776,7 +850,10 @@ impl Vm {
     fn assign_property(&mut self, object: Value, name: &str, value: Value) -> PhpResult<()> {
         match object {
             Value::Object(object) => {
-                object.borrow_mut().properties.insert_str(name, value);
+                object
+                    .borrow_mut()
+                    .properties
+                    .insert_str(name, value.deref());
                 Ok(())
             }
             other => Err(PhpError::type_error(format!(
@@ -799,7 +876,10 @@ impl Vm {
     fn load_static_property(&mut self, class: &str, name: &str, warn: bool) -> PhpResult<Value> {
         if let Some(owner) = self.static_property_owner(class, name) {
             if let Some(properties) = self.static_properties.get(&owner.to_ascii_lowercase()) {
-                return Ok(properties.get_str(name).cloned().unwrap_or(Value::Null));
+                return Ok(properties
+                    .get_str(name)
+                    .map(Value::deref)
+                    .unwrap_or(Value::Null));
             }
         }
         if warn {
@@ -815,7 +895,7 @@ impl Vm {
         self.static_properties
             .entry(owner.to_ascii_lowercase())
             .or_default()
-            .insert_str(name, value);
+            .insert_str(name, value.deref());
         Ok(())
     }
 
@@ -963,30 +1043,45 @@ impl Vm {
                                 .unwrap_or_else(|| "this".to_string());
                             self.warn(format!("Undefined variable ${name}"));
                         }
-                        stack.push(frame.get(*slot).clone());
+                        stack.push(frame.get(*slot).deref());
                     }
                     Op::LoadVarSafe(slot) => {
                         let index = *slot as usize;
                         let value = if frame.defined.get(index).copied().unwrap_or(false) {
-                            frame.get(*slot).clone()
+                            frame.get(*slot).deref()
                         } else {
                             Value::Null
                         };
                         stack.push(value);
                     }
+                    Op::LoadVarRef(slot) => {
+                        let index = *slot as usize;
+                        if !frame.defined.get(index).copied().unwrap_or(false) {
+                            let name = slot_names
+                                .get(index)
+                                .and_then(|name| name.clone())
+                                .unwrap_or_else(|| "this".to_string());
+                            self.warn(format!("Undefined variable ${name}"));
+                        }
+                        stack.push(frame.ref_for(*slot));
+                    }
                     Op::StoreVar(slot) => {
                         let value = stack.pop().unwrap_or(Value::Null);
-                        frame.set(*slot, value);
+                        frame.assign(*slot, value);
                     }
                     Op::StoreVarKeep(slot) => {
                         let value = stack.last().cloned().unwrap_or(Value::Null);
+                        frame.assign(*slot, value);
+                    }
+                    Op::StoreVarRef(slot) => {
+                        let value = stack.pop().unwrap_or(Value::Null);
                         frame.set(*slot, value);
                     }
                     Op::LoadGlobal(index) => {
                         let name = String::from_utf8_lossy(chunk.const_str(*index)).into_owned();
                         let key = Key::from_str(&name);
                         match self.globals.get(&key) {
-                            Some(value) => stack.push(value.clone()),
+                            Some(value) => stack.push(value.deref()),
                             None => {
                                 self.warn(format!("Undefined variable ${name}"));
                                 stack.push(Value::Null);
@@ -996,16 +1091,55 @@ impl Vm {
                     Op::LoadGlobalSafe(index) => {
                         let name = String::from_utf8_lossy(chunk.const_str(*index)).into_owned();
                         let key = Key::from_str(&name);
-                        stack.push(self.globals.get(&key).cloned().unwrap_or(Value::Null));
+                        stack.push(
+                            self.globals
+                                .get(&key)
+                                .map(Value::deref)
+                                .unwrap_or(Value::Null),
+                        );
+                    }
+                    Op::LoadGlobalRef(index) => {
+                        let name = String::from_utf8_lossy(chunk.const_str(*index)).into_owned();
+                        let key = Key::from_str(&name);
+                        let existing = self.globals.get(&key).cloned();
+                        match existing {
+                            Some(Value::Ref(cell)) => stack.push(Value::Ref(cell)),
+                            Some(value) => {
+                                let cell = Rc::new(std::cell::RefCell::new(value));
+                                self.globals.insert(key, Value::Ref(cell.clone()));
+                                stack.push(Value::Ref(cell));
+                            }
+                            None => {
+                                self.warn(format!("Undefined variable ${name}"));
+                                let cell = Rc::new(std::cell::RefCell::new(Value::Null));
+                                self.globals.insert(key, Value::Ref(cell.clone()));
+                                stack.push(Value::Ref(cell));
+                            }
+                        }
                     }
                     Op::StoreGlobal(index) => {
                         let name = String::from_utf8_lossy(chunk.const_str(*index)).into_owned();
-                        let value = stack.pop().unwrap_or(Value::Null);
-                        self.globals.insert(Key::from_str(&name), value);
+                        let key = Key::from_str(&name);
+                        let value = stack.pop().unwrap_or(Value::Null).deref();
+                        if let Some(Value::Ref(cell)) = self.globals.get(&key).cloned() {
+                            *cell.borrow_mut() = value;
+                        } else {
+                            self.globals.insert(key, value);
+                        }
                     }
                     Op::StoreGlobalKeep(index) => {
                         let name = String::from_utf8_lossy(chunk.const_str(*index)).into_owned();
-                        let value = stack.last().cloned().unwrap_or(Value::Null);
+                        let key = Key::from_str(&name);
+                        let value = stack.last().cloned().unwrap_or(Value::Null).deref();
+                        if let Some(Value::Ref(cell)) = self.globals.get(&key).cloned() {
+                            *cell.borrow_mut() = value;
+                        } else {
+                            self.globals.insert(key, value);
+                        }
+                    }
+                    Op::StoreGlobalRef(index) => {
+                        let name = String::from_utf8_lossy(chunk.const_str(*index)).into_owned();
+                        let value = stack.pop().unwrap_or(Value::Null);
                         self.globals.insert(Key::from_str(&name), value);
                     }
                     Op::LoadTmp(slot) => stack.push(frame.get(*slot).clone()),
@@ -1085,9 +1219,9 @@ impl Vm {
                     }
                     Op::ArrayNew => stack.push(Value::array(PhpArray::new())),
                     Op::ArraySet { tmp, has_key } => {
-                        let value = stack.pop().unwrap_or(Value::Null);
+                        let value = stack.pop().unwrap_or(Value::Null).deref();
                         let key = if *has_key {
-                            let key_value = stack.pop().unwrap_or(Value::Null);
+                            let key_value = stack.pop().unwrap_or(Value::Null).deref();
                             Some(key_from_value(&key_value)?)
                         } else {
                             None
@@ -1125,16 +1259,18 @@ impl Vm {
                         stack.push(value);
                     }
                     Op::AssignDim { modes } => {
-                        let value = stack.pop().unwrap_or(Value::Null);
+                        let value = stack.pop().unwrap_or(Value::Null).deref();
                         let mut keys: Vec<Option<Value>> = Vec::with_capacity(modes.len());
                         for mode in modes.iter().rev() {
                             match mode {
-                                DimMode::Key => keys.push(Some(stack.pop().unwrap_or(Value::Null))),
+                                DimMode::Key => {
+                                    keys.push(Some(stack.pop().unwrap_or(Value::Null).deref()))
+                                }
                                 DimMode::Append => keys.push(None),
                             }
                         }
                         keys.reverse();
-                        let base = stack.pop().unwrap_or(Value::Null);
+                        let base = stack.pop().unwrap_or(Value::Null).deref();
                         let mut array = match base {
                             Value::Array(array) => (*array).clone(),
                             Value::Null => PhpArray::new(),
@@ -1146,7 +1282,7 @@ impl Vm {
                                 PhpArray::new()
                             }
                         };
-                        self.insert_path(&mut array, &keys, value)?;
+                        self.insert_path(&mut array, &keys, value.deref())?;
                         stack.push(Value::array(array));
                     }
                     Op::Call {
@@ -1260,8 +1396,8 @@ impl Vm {
                         stack.push(self.load_property(object, &name, !*safe)?);
                     }
                     Op::AssignProperty { name, keep } => {
-                        let value = stack.pop().unwrap_or(Value::Null);
-                        let object = stack.pop().unwrap_or(Value::Null);
+                        let value = stack.pop().unwrap_or(Value::Null).deref();
+                        let object = stack.pop().unwrap_or(Value::Null).deref();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         self.assign_property(object, &name, value.clone())?;
                         if *keep {
@@ -1301,7 +1437,7 @@ impl Vm {
                         stack.push(self.load_static_property(&class, &name, !*safe)?);
                     }
                     Op::AssignStaticProperty { class, name, keep } => {
-                        let value = stack.pop().unwrap_or(Value::Null);
+                        let value = stack.pop().unwrap_or(Value::Null).deref();
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
@@ -2101,6 +2237,27 @@ mod tests {
             echo util_name(), "|", $box->get(), "|", Crate::class;
         "#);
         assert_eq!(out, "Demo\\Util|3|Demo\\Util|7|Demo\\Util\\Box");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn references_alias_writes_and_by_ref_builtins() {
+        let (out, warnings) = run(r#"<?php
+                function bump(&$x) { $x += 1; }
+                $a = 1;
+                $b = &$a;
+                $b = 2;
+                bump($a);
+                $arr = [3, 1, 2];
+                sort($arr);
+                array_push($arr, 4);
+                $popped = array_pop($arr);
+                $x = 1;
+                $f = function () use (&$x) { $x = 5; };
+                $f();
+                echo $a, "|", $b, "|", implode(",", $arr), "|", $popped, "|", $x;
+            "#);
+        assert_eq!(out, "3|3|1,2,3|4|5");
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 

@@ -2,7 +2,7 @@
 //!
 //! Mirrors the shape of `zend_ast.h` (`ZEND_AST_*` nodes) but in idiomatic
 //! Rust. Only the constructs the engine currently executes are represented;
-//! classes, namespaces, attributes and exceptions are still missing.
+//! attributes, interfaces, traits and enums are still missing.
 
 /// A parsed PHP file.
 #[derive(Clone, Debug)]
@@ -93,6 +93,7 @@ pub struct Param {
     pub name: String,
     pub default: Option<Expr>,
     pub variadic: bool,
+    pub by_ref: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -330,6 +331,8 @@ pub enum Expr {
     },
     /// `clone $object`.
     Clone(Box<Expr>),
+    /// `&$value`, only valid as an assignment value.
+    Reference(Box<Expr>),
     /// `throw $value` (an expression in PHP 8).
     Throw(Box<Expr>),
     /// `include`, `include_once`, `require` or `require_once`.

@@ -15,7 +15,7 @@ gitignored.
 | `Zend/zend_compile.c`, `Zend/zend_compile.h` | `crates/phpcraft-compiler/src/lib.rs` | AST lowering, jump patching, function hoisting, namespace/import resolution, magic constants, constant folding for parameter defaults. |
 | `Zend/zend_opcode.c`, `Zend/zend_vm_opcodes.h` | `crates/phpcraft-bytecode/src/lib.rs` | `Op`, `Chunk`, `Function`, `CompiledProgram`. Stack machine instead of Zend's register slots. |
 | `Zend/zend_vm_def.h`, `Zend/zend_vm_execute.h` | `crates/phpcraft-vm/src/lib.rs` | Dispatch loop, frames, variable fetch/store, iterators. |
-| `Zend/zend_execute.c` | `crates/phpcraft-vm/src/lib.rs` | Function calls, `global` binding, return values, nesting guard, runtime includes. |
+| `Zend/zend_execute.c` | `crates/phpcraft-vm/src/lib.rs` | Function calls, `global` binding, reference cells and by-reference parameter binding, return values, nesting guard, runtime includes. |
 | `Zend/zend_closures.c` | `crates/phpcraft-runtime/src/value.rs`, `crates/phpcraft-vm/src/lib.rs` | `PhpClosure`, capture binding and invocation. |
 | `Zend/zend_objects.c`, `Zend/zend_object_handlers.c` | `crates/phpcraft-runtime/src/value.rs`, `crates/phpcraft-vm/src/lib.rs` | `PhpObject`, class registry, property storage, method dispatch and inheritance. |
 | `Zend/zend_exceptions.c` | `crates/phpcraft-runtime/src/error.rs`, `crates/phpcraft-vm/src/lib.rs` | `ExceptionData`, built-in exception hierarchy, `throw` and catch matching. |
@@ -51,7 +51,8 @@ fetch/assign instructions.
 | `LoadVarSafe` | `ZEND_FETCH_IS` / `ZEND_ISSET_ISEMPTY_CV` |
 | `StoreVar` | `ZEND_ASSIGN` |
 | `StoreVarKeep` | `ZEND_ASSIGN` + `ZEND_QM_ASSIGN` (assignment value) |
-| `LoadGlobal`, `StoreGlobal` | `ZEND_BIND_GLOBAL`, then CV access |
+| `LoadVarRef`, `StoreVarRef` | `ZEND_ASSIGN_REF`, `ZEND_FETCH_R`/`ZEND_SEND_VAR_EX` on references |
+| `LoadGlobal`, `StoreGlobal`, `LoadGlobalRef`, `StoreGlobalRef` | `ZEND_BIND_GLOBAL`, then CV access / `ZEND_ASSIGN_REF` |
 | `LoadTmp`, `StoreTmp` | `ZEND_QM_ASSIGN` / temporary slots (`TMP_VAR`) |
 | `Binary` | `ZEND_ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `POW`, `CONCAT`, `SL`, `SR`, `BW_AND`, `BW_OR`, `BW_XOR`, `IS_EQUAL`, `IS_NOT_EQUAL`, `IS_IDENTICAL`, `IS_NOT_IDENTICAL`, `IS_SMALLER`, `IS_SMALLER_OR_EQUAL`, `IS_GREATER`, `IS_GREATER_OR_EQUAL`, `SPACESHIP`, `BOOL_XOR` |
 | `Unary` | `ZEND_BOOL_NOT`, `ZEND_BW_NOT`, negation via `ZEND_MUL`/`ZEND_SUB` |
@@ -156,6 +157,7 @@ fetch/assign instructions.
 | `Zend/tests/closures/*.phpt` | `tests/php/15_closures.php` |
 | `Zend/tests/classes/*.phpt`, `Zend/tests/exceptions/*.phpt` | `tests/php/16_objects.php` |
 | `Zend/tests/ns/*.phpt`, `Zend/tests/use/*.phpt` | `tests/php/17_namespaces_includes.php`, `tests/php/18_namespace_blocks.php` |
+| `Zend/tests/ref/*.phpt`, `ext/standard/tests/array/sort*.phpt` | `tests/php/19_references.php` |
 
 `scripts/phpt-subset.sh` extracts `--FILE--` sections from a php-src checkout
 and skips tests that need extensions, INI settings, request data or special

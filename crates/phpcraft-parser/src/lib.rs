@@ -963,9 +963,10 @@ impl Parser {
             ) {
                 self.advance();
             }
+            let by_ref = self.eat(&Tok::BitAnd);
             let variadic = self.eat(&Tok::Ellipsis);
-            if matches!(self.peek(), Tok::BitAnd) {
-                return Err(self.unsupported("by-reference parameters (&$param)"));
+            if by_ref && variadic {
+                return Err(self.unsupported("by-reference variadic parameters (&...$param)"));
             }
             let name = self.expect_variable()?;
             let default = if self.eat(&Tok::Assign) {
@@ -977,6 +978,7 @@ impl Parser {
                 name,
                 default,
                 variadic,
+                by_ref,
             });
             if self.eat(&Tok::Comma) {
                 continue;
@@ -1494,6 +1496,10 @@ impl Parser {
                     Ok(Expr::Name(name))
                 }
             }
+            Tok::BitAnd => {
+                self.advance();
+                Ok(Expr::Reference(Box::new(self.parse_bp(18)?)))
+            }
             other => Err(self.error(format!("syntax error, unexpected {}", other.describe()))),
         }
     }
@@ -1815,9 +1821,50 @@ mod tests {
     }
 
     #[test]
+    fn parses_references_and_by_reference_parameters() {
+        let program = parse_file(
+            br#"<?php
+                function f(&$x, $y) {
+                    $x = &$y;
+                }
+                $fn = function () use (&$x) {
+                    return $x;
+                };
+            "#,
+        )
+        .unwrap();
+        match &program.stmts[0] {
+            Stmt::Function(decl) => {
+                assert!(decl.params[0].by_ref);
+                assert!(!decl.params[1].by_ref);
+                match &decl.body[0] {
+                    Stmt::Expr(Expr::Assign { value, .. }) => {
+                        assert!(matches!(value.as_ref(), Expr::Reference(_)));
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &program.stmts[1] {
+            Stmt::Expr(Expr::Assign { value, .. }) => match value.as_ref() {
+                Expr::Closure(decl) => {
+                    assert!(decl.captures[0].by_ref);
+                    assert_eq!(decl.captures[0].name, "x");
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
     fn reports_unsupported_constructs() {
         let err = parse_file(b"<?php interface Foo {}").unwrap_err();
         assert!(err.message.contains("interface"));
+
+        let err = parse_file(b"<?php function f(&...$values) {}").unwrap_err();
+        assert!(err.message.contains("by-reference variadic"));
     }
 
     #[test]
