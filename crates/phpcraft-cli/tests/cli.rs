@@ -93,6 +93,29 @@ fn closures_run_and_by_reference_captures_are_rejected() {
 }
 
 #[test]
+fn classes_and_exceptions_run() {
+    let output = phpcraft()
+        .args([
+            "-r",
+            r#"class A { public $x = 1; function __construct($x) { $this->x = $x; } function get() { return $this->x; } } $o = new A(4); try { throw new RuntimeException("boom"); } catch (Exception $e) { echo $o->get(), "|", $e->getMessage(); }"#,
+        ])
+        .output()
+        .expect("run phpcraft");
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "4|boom");
+
+    let output = phpcraft()
+        .args(["-r", r#"throw new Exception("uncaught");"#])
+        .output()
+        .expect("run phpcraft");
+    assert_eq!(output.status.code(), Some(255));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Uncaught Exception: uncaught"));
+    assert!(stderr.contains("Stack trace:"));
+}
+
+#[test]
 fn extreme_integers_do_not_panic_the_interpreter() {
     for code in [
         "str_repeat('a', PHP_INT_MAX);",

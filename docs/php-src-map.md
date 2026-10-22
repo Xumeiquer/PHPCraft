@@ -17,6 +17,8 @@ gitignored.
 | `Zend/zend_vm_def.h`, `Zend/zend_vm_execute.h` | `crates/phpcraft-vm/src/lib.rs` | Dispatch loop, frames, variable fetch/store, iterators. |
 | `Zend/zend_execute.c` | `crates/phpcraft-vm/src/lib.rs` | Function calls, `global` binding, return values, nesting guard. |
 | `Zend/zend_closures.c` | `crates/phpcraft-runtime/src/value.rs`, `crates/phpcraft-vm/src/lib.rs` | `PhpClosure`, capture binding and invocation. |
+| `Zend/zend_objects.c`, `Zend/zend_object_handlers.c` | `crates/phpcraft-runtime/src/value.rs`, `crates/phpcraft-vm/src/lib.rs` | `PhpObject`, class registry, property storage, method dispatch and inheritance. |
+| `Zend/zend_exceptions.c` | `crates/phpcraft-runtime/src/error.rs`, `crates/phpcraft-vm/src/lib.rs` | `ExceptionData`, built-in exception hierarchy, `throw` and catch matching. |
 | `Zend/zend_types.h` | `crates/phpcraft-runtime/src/value.rs` | `Value` corresponds to `zval`; `PhpStr` to `zend_string`. |
 | `Zend/zend_string.c`, `Zend/zend_string.h` | `crates/phpcraft-runtime/src/value.rs` | Byte strings and PHP string conversions. |
 | `Zend/zend_hash.c`, `Zend/zend_hash.h` | `crates/phpcraft-runtime/src/array.rs` | Ordered hash table with `Key::Int`/`Key::Str`, next-index tracking and COW. |
@@ -69,6 +71,15 @@ fetch/assign instructions.
 | `Call` | `ZEND_INIT_FCALL`, `ZEND_SEND_VAL`, `ZEND_DO_FCALL` |
 | `CallValue` | `ZEND_INIT_DYNAMIC_CALL`, `ZEND_DO_FCALL` |
 | `MakeClosure` | `ZEND_DECLARE_LAMBDA_FUNCTION`, `ZEND_BIND_LEXICAL` |
+| `NewObject` | `ZEND_NEW`, `ZEND_DO_FCALL` (constructor) |
+| `LoadProperty`, `AssignProperty` | `ZEND_FETCH_OBJ_R`, `ZEND_ASSIGN_OBJ` |
+| `CallMethod`, `CallStaticMethod` | `ZEND_INIT_METHOD_CALL`, `ZEND_INIT_STATIC_METHOD_CALL`, `ZEND_DO_FCALL` |
+| `LoadStaticProperty`, `AssignStaticProperty` | `ZEND_FETCH_STATIC_PROP_*`, `ZEND_ASSIGN_STATIC_PROP_*` |
+| `ClassConstant` | `ZEND_FETCH_CLASS_CONSTANT` |
+| `InstanceOf` | `ZEND_INSTANCEOF` |
+| `CloneObject` | `ZEND_CLONE` |
+| `Throw` | `ZEND_THROW` |
+| `TryStart`, `TryEnd`, `Rethrow`, `RethrowIfNotNull` | `ZEND_CATCH`, `ZEND_FAST_CALL`, `ZEND_FAST_RET` and handler-table unwinding |
 | `ThrowUnhandledMatch` | `ZEND_MATCH_ERROR` |
 | `IterInit` | `ZEND_FE_RESET_R` |
 | `IterNext` | `ZEND_FE_FETCH_R`, `ZEND_FE_FREE` |
@@ -90,8 +101,9 @@ fetch/assign instructions.
 | `IS_STRING` (`zend_string`) | `Value::Str(Rc<PhpStr>)` |
 | `IS_ARRAY` (`HashTable`) | `Value::Array(Rc<PhpArray>)` |
 | `IS_OBJECT` (`Closure`) | `Value::Closure(Rc<PhpClosure>)` |
+| `IS_OBJECT` (`zend_object`) | `Value::Object(Rc<RefCell<PhpObject>>)` |
 | `ZVAL_DEREF`, reference zvals | not implemented |
-| other `IS_OBJECT`, `IS_RESOURCE` | not implemented |
+| `IS_RESOURCE` | not implemented |
 
 | Behaviour | php-src location | PHPCraft |
 | --- | --- | --- |
@@ -141,6 +153,7 @@ fetch/assign instructions.
 | `tests/lang/control_structures/*.phpt` | `tests/php/04_control.php` |
 | `tests/lang/functions/*.phpt` | `tests/php/05_functions.php` |
 | `Zend/tests/closures/*.phpt` | `tests/php/15_closures.php` |
+| `Zend/tests/classes/*.phpt`, `Zend/tests/exceptions/*.phpt` | `tests/php/16_objects.php` |
 
 `scripts/phpt-subset.sh` extracts `--FILE--` sections from a php-src checkout
 and skips tests that need extensions, INI settings, request data or special

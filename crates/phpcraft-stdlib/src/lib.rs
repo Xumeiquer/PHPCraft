@@ -13,7 +13,8 @@ use std::rc::Rc;
 use phpcraft_runtime::value::parse_numeric;
 use phpcraft_runtime::{
     compare, float_to_fixed, float_to_general, float_to_repr, key_from_value, loose_eq, strict_eq,
-    Key, Numeric, PhpArray, PhpClosure, PhpError, PhpResult, RuntimeHooks, ToNumber, Value,
+    Key, Numeric, PhpArray, PhpClosure, PhpError, PhpObject, PhpResult, RuntimeHooks, ToNumber,
+    Value,
 };
 
 pub type NativeFn = fn(&mut dyn RuntimeHooks, Vec<Value>) -> PhpResult<Value>;
@@ -2359,19 +2360,21 @@ fn gettype(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
         Value::Float(_) => "double",
         Value::Str(_) => "string",
         Value::Array(_) => "array",
-        Value::Closure(_) => "object",
+        Value::Closure(_) | Value::Object(_) => "object",
     }))
 }
 
 fn get_debug_type(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("get_debug_type", &args, 1, Some(1))?;
-    Ok(Value::from_str_lit(args[0].debug_type_name()))
+    let name = args[0].debug_type_name();
+    Ok(Value::from_str_lit(&name))
 }
 
 fn get_class(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("get_class", &args, 1, Some(1))?;
     match &args[0] {
         Value::Closure(_) => Ok(Value::from_str_lit("Closure")),
+        Value::Object(object) => Ok(Value::str(object.borrow().class_name.as_bytes().to_vec())),
         other => Err(PhpError::type_error(format!(
             "get_class(): Argument #1 ($object) must be of type object, {} given",
             other.debug_type_name()
@@ -2437,7 +2440,7 @@ type_predicate!(is_float, "is_float", Value::Float(_));
 type_predicate!(is_string, "is_string", Value::Str(_));
 type_predicate!(is_bool, "is_bool", Value::Bool(_));
 type_predicate!(is_array, "is_array", Value::Array(_));
-type_predicate!(is_object, "is_object", Value::Closure(_));
+type_predicate!(is_object, "is_object", Value::Closure(_) | Value::Object(_));
 
 fn is_numeric(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("is_numeric", &args, 1, Some(1))?;
@@ -2521,6 +2524,44 @@ fn dump_value(value: &Value, depth: usize, out: &mut Vec<u8>) {
             out.extend(std::iter::repeat_n(b' ', depth * 2));
             out.extend_from_slice(b"}\n");
         }
+        Value::Object(object) => {
+            let object = object.borrow();
+            out.extend_from_slice(
+                format!(
+                    "object({})#{} ({}) {{\n",
+                    object.class_name,
+                    object.id,
+                    object.properties.len()
+                )
+                .as_bytes(),
+            );
+            for (key, item) in object.properties.iter() {
+                out.extend(std::iter::repeat_n(b' ', (depth + 1) * 2));
+                match key {
+                    Key::Int(number) => {
+                        out.extend_from_slice(format!("[{number}]=>\n").as_bytes());
+                    }
+                    Key::Str(string) => {
+                        out.extend_from_slice(b"[\"");
+                        out.extend_from_slice(string.as_bytes());
+                        let name = string.to_string_lossy();
+                        match object.property_visibility.get(&name).map(String::as_str) {
+                            Some("protected") => out.extend_from_slice(b"\":protected"),
+                            Some("private") => {
+                                out.extend_from_slice(b"\":\"");
+                                out.extend_from_slice(object.class_name.as_bytes());
+                                out.extend_from_slice(b"\":private");
+                            }
+                            _ => out.push(b'"'),
+                        }
+                        out.extend_from_slice(b"]=>\n");
+                    }
+                }
+                dump_value(item, depth + 1, out);
+            }
+            out.extend(std::iter::repeat_n(b' ', depth * 2));
+            out.extend_from_slice(b"}\n");
+        }
         Value::Closure(closure) => {
             let properties = 3
                 + usize::from(!closure.captures.is_empty())
@@ -2597,6 +2638,10 @@ fn print_array_body(array: &PhpArray, level: usize, out: &mut Vec<u8>) {
                 print_closure(child, level + 2, out);
                 out.push(b'\n');
             }
+            Value::Object(child) => {
+                print_object(child, level + 2, out);
+                out.push(b'\n');
+            }
             Value::Null => out.push(b'\n'),
             Value::Bool(true) => {
                 out.push(b'1');
@@ -2616,6 +2661,58 @@ fn print_array_body(array: &PhpArray, level: usize, out: &mut Vec<u8>) {
 fn print_array(array: &PhpArray, level: usize, out: &mut Vec<u8>) {
     out.extend_from_slice(b"Array\n");
     print_array_body(array, level, out);
+}
+
+fn print_object(object: &std::cell::RefCell<PhpObject>, level: usize, out: &mut Vec<u8>) {
+    let object = object.borrow();
+    out.extend_from_slice(object.class_name.as_bytes());
+    out.extend_from_slice(b" Object\n");
+    out.extend(std::iter::repeat_n(b' ', level * 4));
+    out.extend_from_slice(b"(\n");
+    for (key, value) in object.properties.iter() {
+        out.extend(std::iter::repeat_n(b' ', (level + 1) * 4));
+        out.push(b'[');
+        out.extend_from_slice(&key.as_display());
+        if let Key::Str(string) = key {
+            let name = string.to_string_lossy();
+            match object.property_visibility.get(&name).map(String::as_str) {
+                Some("protected") => out.extend_from_slice(b":protected"),
+                Some("private") => {
+                    out.push(b':');
+                    out.extend_from_slice(object.class_name.as_bytes());
+                    out.extend_from_slice(b":private");
+                }
+                _ => {}
+            }
+        }
+        out.extend_from_slice(b"] => ");
+        match value {
+            Value::Array(child) => {
+                print_array(child, level + 2, out);
+                out.push(b'\n');
+            }
+            Value::Closure(child) => {
+                print_closure(child, level + 2, out);
+                out.push(b'\n');
+            }
+            Value::Object(child) => {
+                print_object(child, level + 2, out);
+                out.push(b'\n');
+            }
+            Value::Null => out.push(b'\n'),
+            Value::Bool(true) => {
+                out.push(b'1');
+                out.push(b'\n');
+            }
+            Value::Bool(false) => out.push(b'\n'),
+            other => {
+                out.extend_from_slice(&other.to_bytes());
+                out.push(b'\n');
+            }
+        }
+    }
+    out.extend(std::iter::repeat_n(b' ', level * 4));
+    out.extend_from_slice(b")\n");
 }
 
 fn print_closure(closure: &PhpClosure, level: usize, out: &mut Vec<u8>) {
@@ -2654,6 +2751,7 @@ fn print_r(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     match &args[0] {
         Value::Array(array) => print_array(array, 0, &mut out),
         Value::Closure(closure) => print_closure(closure, 0, &mut out),
+        Value::Object(object) => print_object(object, 0, &mut out),
         Value::Null => {}
         Value::Bool(true) => out.push(b'1'),
         Value::Bool(false) => {}

@@ -10,10 +10,12 @@ use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use phpcraft_ast::{
-    ArrayItem, BinOp, ClosureBody, ClosureDecl, Expr, FunctionDecl, InterpPart, MatchArm, Param,
-    Program, Stmt, UnOp,
+    ArrayItem, BinOp, CatchClause, ClassDecl, ClosureBody, ClosureDecl, Expr, FunctionDecl,
+    InterpPart, MatchArm, Param, Program, Stmt, UnOp,
 };
-use phpcraft_bytecode::{Chunk, CompiledProgram, DimMode, Function, Op, ParamSlot};
+use phpcraft_bytecode::{
+    Chunk, ClassDef, ClassMethod, ClassProperty, CompiledProgram, DimMode, Function, Op, ParamSlot,
+};
 use phpcraft_runtime::{key_from_value, PhpArray, Value};
 
 #[derive(Debug, Clone)]
@@ -67,7 +69,7 @@ fn check_param_names(params: &[Param], line: u32) -> Result<(), CompileError> {
 pub fn compile(program: &Program, file: &str) -> Result<CompiledProgram, CompileError> {
     let mut compiler = FnCompiler::new_main(file);
     compiler.compile_stmts(&program.stmts)?;
-    let (main, functions) = compiler.finish();
+    let (main, functions, classes) = compiler.finish();
 
     let mut seen: HashMap<String, ()> = HashMap::new();
     for function in &functions {
@@ -79,10 +81,21 @@ pub fn compile(program: &Program, file: &str) -> Result<CompiledProgram, Compile
             ));
         }
     }
+    let mut seen_classes: HashMap<String, ()> = HashMap::new();
+    for class in &classes {
+        let key = class.name.to_ascii_lowercase();
+        if seen_classes.insert(key, ()).is_some() {
+            return Err(CompileError::new(
+                format!("Cannot declare class {}", class.name),
+                class.line,
+            ));
+        }
+    }
 
     Ok(CompiledProgram {
         main,
         functions,
+        classes,
         file: file.to_string(),
     })
 }
@@ -109,6 +122,7 @@ struct FnCompiler {
     capture_slots: Vec<u32>,
     capture_names: Vec<String>,
     functions: Vec<Function>,
+    classes: Vec<ClassDef>,
     file: String,
 }
 
@@ -130,6 +144,7 @@ impl FnCompiler {
             capture_slots: Vec::new(),
             capture_names: Vec::new(),
             functions: Vec::new(),
+            classes: Vec::new(),
             file: file.to_string(),
         }
     }
@@ -151,6 +166,7 @@ impl FnCompiler {
             capture_slots: Vec::new(),
             capture_names: Vec::new(),
             functions: Vec::new(),
+            classes: Vec::new(),
             file: file.to_string(),
         }
     }
@@ -172,11 +188,21 @@ impl FnCompiler {
             capture_slots: Vec::new(),
             capture_names: Vec::new(),
             functions: Vec::new(),
+            classes: Vec::new(),
             file: file.to_string(),
         }
     }
 
-    fn finish(mut self) -> (Function, Vec<Function>) {
+    fn new_method(name: &str, line: u32, file: &str) -> Self {
+        let mut compiler = Self::new_closure(name, line, file);
+        compiler.display_name = Some(name.to_string());
+        // Slot 0 always holds `$this`; method parameters start at slot 1.
+        compiler.locals.insert("this".to_string(), 0);
+        compiler.next_slot = 1;
+        compiler
+    }
+
+    fn finish(mut self) -> (Function, Vec<Function>, Vec<ClassDef>) {
         self.emit(Op::ReturnNull);
         let mut slot_names = vec![None; self.next_slot as usize];
         for (name, slot) in &self.locals {
@@ -196,7 +222,7 @@ impl FnCompiler {
             slot_names,
             line: self.line,
         };
-        (function, self.functions)
+        (function, self.functions, self.classes)
     }
 
     // ------------------------------------------------------------- utilities
@@ -214,6 +240,7 @@ impl FnCompiler {
             | Op::JumpIfFalseKeep(t)
             | Op::JumpIfTrueKeep(t)
             | Op::JumpIfNotNull(t) => *t = target,
+            Op::TryStart { catch_ip, .. } => *catch_ip = target,
             Op::IterNext { end, .. } => *end = target,
             other => panic!("cannot patch op {other:?}"),
         }
@@ -302,9 +329,30 @@ impl FnCompiler {
                 self.store_var(name, keep);
                 Ok(())
             }
+            Expr::Property { object, name } => {
+                let value_tmp = self.temp();
+                self.emit(Op::StoreTmp(value_tmp));
+                self.expr(object)?;
+                self.emit(Op::LoadTmp(value_tmp));
+                let index = self.const_str(name.as_bytes());
+                self.emit(Op::AssignProperty { name: index, keep });
+                Ok(())
+            }
+            Expr::StaticProperty { class, name } => {
+                let value_tmp = self.temp();
+                self.emit(Op::StoreTmp(value_tmp));
+                let class = self.const_str(class.as_bytes());
+                let name = self.const_str(name.as_bytes());
+                self.emit(Op::LoadTmp(value_tmp));
+                self.emit(Op::AssignStaticProperty { class, name, keep });
+                Ok(())
+            }
             Expr::Index { .. } => {
                 let (root, dims) = Self::lvalue_chain(target).ok_or_else(|| {
-                    CompileError::new("cannot assign to this expression", self.line)
+                    CompileError::new(
+                        "nested property/dimension assignment is not supported yet",
+                        self.line,
+                    )
                 })?;
                 let value_tmp = self.temp();
                 self.emit(Op::StoreTmp(value_tmp));
@@ -352,6 +400,25 @@ impl FnCompiler {
                     }
                     None => Err(CompileError::new("Cannot use [] for reading", self.line)),
                 }
+            }
+            Expr::Property { object, name } => {
+                self.expr(object)?;
+                let index = self.const_str(name.as_bytes());
+                self.emit(Op::LoadProperty {
+                    name: index,
+                    safe: true,
+                });
+                Ok(())
+            }
+            Expr::StaticProperty { class, name } => {
+                let class = self.const_str(class.as_bytes());
+                let name = self.const_str(name.as_bytes());
+                self.emit(Op::LoadStaticProperty {
+                    class,
+                    name,
+                    safe: true,
+                });
+                Ok(())
             }
             other => self.expr(other),
         }
@@ -405,6 +472,12 @@ impl FnCompiler {
             } => self.compile_foreach(subject, key.as_ref(), value, body),
             Stmt::Switch { subject, cases } => self.compile_switch(subject, cases),
             Stmt::Function(decl) => self.compile_function_decl(decl),
+            Stmt::Class(decl) => self.compile_class(decl),
+            Stmt::Try {
+                body,
+                catches,
+                finally,
+            } => self.compile_try(body, catches, finally.as_deref()),
             Stmt::Global(names) => {
                 if !self.is_main {
                     for name in names {
@@ -622,6 +695,141 @@ impl FnCompiler {
         Ok(())
     }
 
+    fn compile_class(&mut self, decl: &ClassDecl) -> Result<(), CompileError> {
+        if !self.is_main {
+            return Err(CompileError::new(
+                "class declarations inside functions are not supported",
+                decl.line,
+            ));
+        }
+        let mut properties = Vec::new();
+        for property in &decl.properties {
+            properties.push(ClassProperty {
+                name: property.name.clone(),
+                default: match &property.default {
+                    Some(expr) => const_expr(expr, property.line)?,
+                    None => Value::Null,
+                },
+                visibility: property.visibility,
+                static_: property.static_,
+                line: property.line,
+            });
+        }
+        let mut constants = Vec::new();
+        for constant in &decl.constants {
+            constants.push((
+                constant.name.clone(),
+                const_expr(&constant.value, constant.line)?,
+            ));
+        }
+
+        let mut methods = Vec::new();
+        for method in &decl.methods {
+            let function_name = format!("{}::{}", decl.name, method.name);
+            let mut nested = FnCompiler::new_method(&function_name, method.line, &self.file);
+            for param in &method.params {
+                let slot = nested.slot(&param.name);
+                let default = match &param.default {
+                    Some(expr) => Some(const_expr(expr, method.line)?),
+                    None => None,
+                };
+                nested.params.push(ParamSlot {
+                    name: param.name.clone(),
+                    slot,
+                    default,
+                    variadic: param.variadic,
+                });
+            }
+            check_param_names(&method.params, method.line)?;
+            nested.compile_stmts(&method.body)?;
+            let (function, inner, _) = nested.finish();
+            self.functions.push(function);
+            self.functions.extend(inner);
+            methods.push(ClassMethod {
+                name: method.name.clone(),
+                function: function_name,
+                visibility: method.visibility,
+                static_: method.static_,
+                line: method.line,
+            });
+        }
+
+        self.classes.push(ClassDef {
+            name: decl.name.clone(),
+            parent: decl.parent.clone(),
+            properties,
+            constants,
+            methods,
+            line: decl.line,
+        });
+        Ok(())
+    }
+
+    fn compile_try(
+        &mut self,
+        body: &[Stmt],
+        catches: &[CatchClause],
+        finally: Option<&[Stmt]>,
+    ) -> Result<(), CompileError> {
+        let catch_slot = self.temp();
+        let start = self.emit(Op::TryStart {
+            catch_ip: 0,
+            catch_slot,
+        });
+        self.compile_stmts(body)?;
+        self.emit(Op::TryEnd);
+        let try_done = self.emit(Op::Jump(0));
+        let catch_label = self.ops.len();
+        if let Op::TryStart { catch_ip, .. } = &mut self.ops[start] {
+            *catch_ip = catch_label;
+        }
+
+        let mut caught_jumps = Vec::new();
+        for catch in catches {
+            let mut hit_jumps = Vec::new();
+            for class in &catch.classes {
+                self.emit(Op::LoadTmp(catch_slot));
+                let index = self.const_str(class.as_bytes());
+                self.emit(Op::InstanceOf { class: index });
+                hit_jumps.push(self.emit(Op::JumpIfTrue(0)));
+            }
+            let next_catch = self.emit(Op::Jump(0));
+            let matched = self.ops.len();
+            for hit in hit_jumps {
+                self.patch(hit, matched);
+            }
+            self.emit(Op::LoadTmp(catch_slot));
+            self.store_target(&Expr::Var(catch.variable.clone()), false)?;
+            // Clear the pending exception before running a matching handler.
+            self.emit(Op::Null);
+            self.emit(Op::StoreTmp(catch_slot));
+            self.compile_stmts(&catch.body)?;
+            caught_jumps.push(self.emit(Op::Jump(0)));
+            let next_label = self.ops.len();
+            self.patch(next_catch, next_label);
+        }
+        if !catches.is_empty() {
+            self.emit(Op::Rethrow { slot: catch_slot });
+        }
+
+        let finally_label = self.ops.len();
+        if let Some(finally) = finally {
+            self.compile_stmts(finally)?;
+            self.emit(Op::RethrowIfNotNull { slot: catch_slot });
+        }
+        let end = self.ops.len();
+        let after = if finally.is_some() {
+            finally_label
+        } else {
+            end
+        };
+        self.patch(try_done, after);
+        for jump in caught_jumps {
+            self.patch(jump, after);
+        }
+        Ok(())
+    }
+
     fn compile_function_decl(&mut self, decl: &FunctionDecl) -> Result<(), CompileError> {
         check_param_names(&decl.params, decl.line)?;
         let mut nested = FnCompiler::new_function(decl, &self.file);
@@ -639,7 +847,7 @@ impl FnCompiler {
             });
         }
         nested.compile_stmts(&decl.body)?;
-        let (function, inner) = nested.finish();
+        let (function, inner, _) = nested.finish();
         self.functions.push(function);
         self.functions.extend(inner);
         Ok(())
@@ -725,7 +933,7 @@ impl FnCompiler {
                 nested.emit(Op::Return);
             }
         }
-        let (function, inner) = nested.finish();
+        let (function, inner, _) = nested.finish();
         self.functions.push(function);
         self.functions.extend(inner);
 
@@ -856,6 +1064,82 @@ impl FnCompiler {
                 self.emit(Op::CallValue {
                     argc: args.len() as u32,
                 });
+            }
+            Expr::New { class, args } => {
+                for arg in args {
+                    self.expr(arg)?;
+                }
+                let index = self.const_str(class.as_bytes());
+                self.emit(Op::NewObject {
+                    class: index,
+                    argc: args.len() as u32,
+                });
+            }
+            Expr::Property { object, name } => {
+                self.expr(object)?;
+                let index = self.const_str(name.as_bytes());
+                self.emit(Op::LoadProperty {
+                    name: index,
+                    safe: false,
+                });
+            }
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+            } => {
+                self.expr(object)?;
+                for arg in args {
+                    self.expr(arg)?;
+                }
+                let index = self.const_str(method.as_bytes());
+                self.emit(Op::CallMethod {
+                    method: index,
+                    argc: args.len() as u32,
+                });
+            }
+            Expr::StaticCall {
+                class,
+                method,
+                args,
+            } => {
+                for arg in args {
+                    self.expr(arg)?;
+                }
+                let class = self.const_str(class.as_bytes());
+                let method = self.const_str(method.as_bytes());
+                self.emit(Op::CallStaticMethod {
+                    class,
+                    method,
+                    argc: args.len() as u32,
+                });
+            }
+            Expr::StaticProperty { class, name } => {
+                let class = self.const_str(class.as_bytes());
+                let name = self.const_str(name.as_bytes());
+                self.emit(Op::LoadStaticProperty {
+                    class,
+                    name,
+                    safe: false,
+                });
+            }
+            Expr::ClassConst { class, name } => {
+                let class = self.const_str(class.as_bytes());
+                let name = self.const_str(name.as_bytes());
+                self.emit(Op::ClassConstant { class, name });
+            }
+            Expr::InstanceOf { expr, class } => {
+                self.expr(expr)?;
+                let index = self.const_str(class.as_bytes());
+                self.emit(Op::InstanceOf { class: index });
+            }
+            Expr::Clone(expr) => {
+                self.expr(expr)?;
+                self.emit(Op::CloneObject);
+            }
+            Expr::Throw(expr) => {
+                self.expr(expr)?;
+                self.emit(Op::Throw);
             }
             Expr::Closure(decl) => self.compile_closure(decl)?,
             Expr::Match { subject, arms } => self.compile_match(subject, arms)?,
@@ -1167,6 +1451,20 @@ fn collect_free_vars(
                 collect_free_vars(arg, params, out, seen);
             }
         }
+        Expr::New { args, .. } | Expr::StaticCall { args, .. } => {
+            for arg in args {
+                collect_free_vars(arg, params, out, seen);
+            }
+        }
+        Expr::Property { object, .. } => collect_free_vars(object, params, out, seen),
+        Expr::MethodCall { object, args, .. } => {
+            collect_free_vars(object, params, out, seen);
+            for arg in args {
+                collect_free_vars(arg, params, out, seen);
+            }
+        }
+        Expr::InstanceOf { expr, .. } => collect_free_vars(expr, params, out, seen),
+        Expr::Clone(expr) | Expr::Throw(expr) => collect_free_vars(expr, params, out, seen),
         Expr::Closure(decl) => {
             if decl.is_arrow() {
                 let mut nested_params = params.clone();
@@ -1201,7 +1499,9 @@ fn collect_free_vars(
         | Expr::Int(_)
         | Expr::Float(_)
         | Expr::Str(_)
-        | Expr::Name(_) => {}
+        | Expr::Name(_)
+        | Expr::StaticProperty { .. }
+        | Expr::ClassConst { .. } => {}
     }
 }
 

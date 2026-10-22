@@ -5,7 +5,7 @@
 //! slots) and every opcode maps to one or two Zend opcodes; see
 //! `docs/php-src-map.md` for the correspondence.
 
-use phpcraft_ast::{BinOp, CastKind, UnOp};
+use phpcraft_ast::{BinOp, CastKind, UnOp, Visibility};
 use phpcraft_runtime::Value;
 
 /// How one `AssignDim` level addresses the array.
@@ -108,6 +108,72 @@ pub enum Op {
         subject: u32,
     },
 
+    /// Pop `argc` constructor arguments and push a new object of `class`.
+    NewObject {
+        class: u32,
+        argc: u32,
+    },
+    /// Pop an object and push its property (warning when missing unless safe).
+    LoadProperty {
+        name: u32,
+        safe: bool,
+    },
+    /// Pop an object and a value, assign `object->name = value`, and push the
+    /// value back when `keep` is set.
+    AssignProperty {
+        name: u32,
+        keep: bool,
+    },
+    /// Pop `argc` arguments and the receiver object, then call a method.
+    CallMethod {
+        method: u32,
+        argc: u32,
+    },
+    /// Call a method statically (`Class::method`, `self::`, `parent::`).
+    CallStaticMethod {
+        class: u32,
+        method: u32,
+        argc: u32,
+    },
+    LoadStaticProperty {
+        class: u32,
+        name: u32,
+        safe: bool,
+    },
+    AssignStaticProperty {
+        class: u32,
+        name: u32,
+        keep: bool,
+    },
+    ClassConstant {
+        class: u32,
+        name: u32,
+    },
+    /// Pop a value and push whether it is an instance of `class`.
+    InstanceOf {
+        class: u32,
+    },
+    /// Shallow-copy an object, giving it a fresh handle.
+    CloneObject,
+
+    /// Throw the value on top of the stack.
+    Throw,
+    /// Install an exception handler covering the following instructions.
+    TryStart {
+        catch_ip: usize,
+        catch_slot: u32,
+    },
+    /// Remove the innermost exception handler.
+    TryEnd,
+    /// Re-throw the object stored in a slot (used when no catch clause matches).
+    Rethrow {
+        slot: u32,
+    },
+    /// Re-throw the object in `slot` when it is not null.
+    RethrowIfNotNull {
+        slot: u32,
+    },
+
     /// Pop the subject into a foreach iterator slot.
     IterInit {
         iter: u32,
@@ -182,9 +248,47 @@ impl Function {
 }
 
 #[derive(Clone, Debug)]
+pub struct ClassProperty {
+    pub name: String,
+    pub default: Value,
+    pub visibility: Visibility,
+    pub static_: bool,
+    pub line: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClassMethod {
+    pub name: String,
+    /// Internal name of the compiled function (`Class::method`).
+    pub function: String,
+    pub visibility: Visibility,
+    pub static_: bool,
+    pub line: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClassDef {
+    pub name: String,
+    pub parent: Option<String>,
+    pub properties: Vec<ClassProperty>,
+    pub constants: Vec<(String, Value)>,
+    pub methods: Vec<ClassMethod>,
+    pub line: u32,
+}
+
+impl ClassDef {
+    pub fn method(&self, name: &str) -> Option<&ClassMethod> {
+        self.methods
+            .iter()
+            .find(|method| method.name.eq_ignore_ascii_case(name))
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct CompiledProgram {
     pub main: Function,
     pub functions: Vec<Function>,
+    pub classes: Vec<ClassDef>,
     pub file: String,
 }
 

@@ -177,13 +177,30 @@ fn run(args: &[String]) -> Result<u8, u8> {
             _ => 0,
         }),
         Err(error) => {
-            let _ = writeln!(
-                stderr,
-                "PHP Fatal error:  Uncaught {}: {} in {}",
-                error.kind.label(),
-                error.message,
-                name
-            );
+            if let Some(Value::Object(object)) = &error.thrown {
+                let object = object.borrow();
+                let data = object.exception.as_ref();
+                let message = data
+                    .map(|data| data.message.as_str())
+                    .unwrap_or(error.message.as_str());
+                let file = data.map(|data| data.file.as_str()).unwrap_or(&name);
+                let line = data.map(|data| data.line).unwrap_or(1);
+                let _ = writeln!(
+                    stderr,
+                    "PHP Fatal error:  Uncaught {}: {} in {}:{}",
+                    object.class_name, message, file, line
+                );
+                let _ = writeln!(stderr, "Stack trace:\n#0 {{main}}");
+                let _ = writeln!(stderr, "  thrown in {} on line {}", file, line);
+            } else {
+                let _ = writeln!(
+                    stderr,
+                    "PHP Fatal error:  Uncaught {}: {} in {}",
+                    error.kind.label(),
+                    error.message,
+                    name
+                );
+            }
             Ok(255)
         }
     }

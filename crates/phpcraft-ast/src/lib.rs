@@ -48,6 +48,14 @@ pub enum Stmt {
         cases: Vec<SwitchCase>,
     },
     Function(FunctionDecl),
+    /// `class Name extends Parent { ... }`
+    Class(ClassDecl),
+    /// `try { ... } catch (...) { ... } finally { ... }`
+    Try {
+        body: Vec<Stmt>,
+        catches: Vec<CatchClause>,
+        finally: Option<Vec<Stmt>>,
+    },
     /// `global $a, $b;`
     Global(Vec<String>),
     Return(Option<Expr>),
@@ -76,6 +84,68 @@ pub struct Param {
     pub name: String,
     pub default: Option<Expr>,
     pub variadic: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Visibility {
+    Public,
+    Protected,
+    Private,
+}
+
+impl Visibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Visibility::Public => "public",
+            Visibility::Protected => "protected",
+            Visibility::Private => "private",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PropertyDecl {
+    pub name: String,
+    pub default: Option<Expr>,
+    pub visibility: Visibility,
+    pub static_: bool,
+    pub line: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClassConstDecl {
+    pub name: String,
+    pub value: Expr,
+    pub line: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct MethodDecl {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub body: Vec<Stmt>,
+    pub visibility: Visibility,
+    pub static_: bool,
+    pub line: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClassDecl {
+    pub name: String,
+    pub parent: Option<String>,
+    pub properties: Vec<PropertyDecl>,
+    pub constants: Vec<ClassConstDecl>,
+    pub methods: Vec<MethodDecl>,
+    pub line: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct CatchClause {
+    /// One or more class names (`catch (A|B $e)`).
+    pub classes: Vec<String>,
+    pub variable: String,
+    pub body: Vec<Stmt>,
+    pub line: u32,
 }
 
 /// A variable imported by `use (...)` on a closure.
@@ -196,6 +266,47 @@ pub enum Expr {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// `new Class(...)`.
+    New {
+        class: String,
+        args: Vec<Expr>,
+    },
+    /// `$object->name` (method calls are represented separately).
+    Property {
+        object: Box<Expr>,
+        name: String,
+    },
+    /// `$object->method(...)`.
+    MethodCall {
+        object: Box<Expr>,
+        method: String,
+        args: Vec<Expr>,
+    },
+    /// `Class::method(...)` (also `self::`, `parent::`, `static::`).
+    StaticCall {
+        class: String,
+        method: String,
+        args: Vec<Expr>,
+    },
+    /// `Class::$property`.
+    StaticProperty {
+        class: String,
+        name: String,
+    },
+    /// `Class::CONSTANT`, including `Class::class`.
+    ClassConst {
+        class: String,
+        name: String,
+    },
+    /// `$value instanceof Class`.
+    InstanceOf {
+        expr: Box<Expr>,
+        class: String,
+    },
+    /// `clone $object`.
+    Clone(Box<Expr>),
+    /// `throw $value` (an expression in PHP 8).
+    Throw(Box<Expr>),
     /// `function (...) use (...) { ... }` or `fn (...) => ...`.
     Closure(Box<ClosureDecl>),
     /// `match ($value) { 1, 2 => ..., default => ... }`.

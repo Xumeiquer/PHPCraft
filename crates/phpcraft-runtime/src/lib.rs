@@ -13,7 +13,7 @@ pub use array::{Key, PhpArray};
 pub use error::{ErrorKind, PhpError, PhpResult};
 pub use value::{
     compare, float_to_fixed, float_to_general, float_to_repr, float_to_string, key_from_value,
-    loose_eq, strict_eq, Numeric, PhpClosure, PhpStr, ToNumber, Value,
+    loose_eq, strict_eq, ExceptionData, Numeric, PhpClosure, PhpObject, PhpStr, ToNumber, Value,
 };
 
 /// Services the standard library needs from the engine while a script runs.

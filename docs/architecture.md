@@ -38,8 +38,8 @@ phpcraft-vm         execution, frames, iterators, globals, builtins
 | `phpcraft-parser` | Recursive-descent statements and Pratt expressions using the PHP 8 precedence table. Produces explicit errors for unsupported constructs. | `Zend/zend_language_parser.y` |
 | `phpcraft-bytecode` | Stack-machine `Op` set, `Chunk` constant pool, `Function` layout, `CompiledProgram`. | `Zend/zend_opcode.c`, `zend_vm_opcodes.h` |
 | `phpcraft-compiler` | AST → bytecode lowering, including short-circuiting, ternary, `??`, loops, `switch`, `foreach`, `global`, function hoisting. | `Zend/zend_compile.c` |
-| `phpcraft-vm` | Dispatch loop, call frames, variable scopes, iterators, operators, fatal/warning reporting. | `Zend/zend_vm_def.h`, `Zend/zend_execute.c` |
-| `phpcraft-runtime` | `Value`, `PhpStr`, ordered copy-on-write `PhpArray`, `Key`, numeric parsing, PHP coercions and comparisons, float formatting, `PhpError`. | `Zend/zend_types.h`, `Zend/zend_hash.c`, `Zend/zend_operators.c` |
+| `phpcraft-vm` | Dispatch loop, call frames, variable scopes, class registry, method dispatch, exception handlers, iterators, operators, fatal/warning reporting. | `Zend/zend_vm_def.h`, `Zend/zend_execute.c` |
+| `phpcraft-runtime` | `Value`, `PhpStr`, `PhpObject`, ordered copy-on-write `PhpArray`, `Key`, numeric parsing, PHP coercions and comparisons, float formatting, `PhpError`. | `Zend/zend_types.h`, `Zend/zend_hash.c`, `Zend/zend_operators.c`, `Zend/zend_exceptions.c` |
 | `phpcraft-stdlib` | Builtin functions. Each entry corresponds to a `PHP_FUNCTION` in php-src. | `ext/standard/*.c`, `Zend/zend_builtin_functions.c` |
 | `phpcraft-cli` | `phpcraft` binary: file execution, `-r`, `-l`, `-v`, stdin, `$argv`/`$argc`, stderr diagnostics. | `sapi/cli/php_cli.c` |
 
@@ -55,6 +55,8 @@ enum Value {
     Float(f64),
     Str(Rc<PhpStr>),
     Array(Rc<PhpArray>),
+    Closure(Rc<PhpClosure>),
+    Object(Rc<RefCell<PhpObject>>),
 }
 ```
 
@@ -66,6 +68,17 @@ enum Value {
   `"08"`, `"+8"`, `" 8"`, `"8 "` and `"-0"` remain strings.
 * Arrays use `Rc` plus `Rc::make_mut` for copy-on-write, so assignment copies
   lazily while preserving PHP's value semantics.
+* Objects use `Rc<RefCell<PhpObject>>`: assignment and argument passing share
+  the same object, matching PHP's handle semantics. Property storage is an
+  ordered `PhpArray`; declared visibility is kept beside it for `var_dump()`
+  and `print_r()`.
+
+Classes are compiled into `ClassDef` metadata (properties, constants and
+method entry points) next to the function table. The VM resolves inherited
+properties and methods through the parent chain. User exceptions are ordinary
+objects carrying an `ExceptionData` payload; `throw` transports the object in
+`PhpError::thrown`, and `try` handlers installed as bytecode opcodes unwind the
+current frame to the matching `catch` clause.
 
 The runtime also owns observable formatting rules: `echo` uses `precision=14`
 with scientific notation from `1e14`, `var_dump` uses the shortest round-trip
@@ -100,9 +113,12 @@ The compiler lowers structured control flow to jumps:
 ## Errors and diagnostics
 
 `PhpError` carries an `ErrorKind` (`Fatal`, `TypeError`, `ValueError`,
-`ArithmeticError`, `ArgumentCountError`). The CLI writes warnings and fatals to
-stderr and script output to stdout, matching the CLI SAPI. Fatals exit with
-status 255. Parse errors are reported before any code runs.
+`ArithmeticError`, `ArgumentCountError`, `Thrown`). A thrown userland exception
+keeps its object in `PhpError::thrown`; when an active handler matches it the
+VM binds it to the catch variable, otherwise the CLI formats it like PHP's
+uncaught-exception banner. The CLI writes warnings and fatals to stderr and
+script output to stdout, matching the CLI SAPI. Fatals exit with status 255.
+Parse errors are reported before any code runs.
 
 Unsupported syntax fails at parse or compile time with a message naming the
 feature. This is intentional: silent misbehaviour is worse than an explicit
@@ -123,10 +139,12 @@ writing), and `vendor/php-src` tracks branch `PHP-8.5`.
 
 ## Current limits
 
-Deliberately unimplemented (they produce explicit errors): classes, objects,
-namespaces, attributes, exceptions, references, by-reference closure captures,
-first-class callable syntax, `include`/`require`, `new`, property/method
-access, static access, named arguments and alternative control syntax.
-By-reference builtins such as `sort()` and `array_push()` are also absent until
-references exist. Opcodes carry no source line information yet, so runtime
-diagnostics omit the line number.
+Deliberately unimplemented (they produce explicit errors): namespaces,
+attributes, interfaces, traits, enums, references, by-reference closure
+captures, first-class callable syntax, `include`/`require`, named arguments and
+alternative control syntax. By-reference builtins such as `sort()` and
+`array_push()` are also absent until references exist. Visibility is parsed and
+reported by `var_dump()`/`print_r()`, but private/protected access is not
+enforced yet. `return` and `throw` that escape a `catch`/`finally` block can
+still skip the `finally` body. Opcodes carry no source line information yet,
+so exceptions and runtime diagnostics use line 1.

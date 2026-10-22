@@ -7,8 +7,9 @@
 //! boundary of the implementation is always explicit.
 
 use phpcraft_ast::{
-    ArrayItem, BinOp, Capture, CastKind, ClosureBody, ClosureDecl, Expr, FunctionDecl, InterpPart,
-    MatchArm, Param, Program, Stmt, SwitchCase, UnOp,
+    ArrayItem, BinOp, Capture, CastKind, CatchClause, ClassConstDecl, ClassDecl, ClosureBody,
+    ClosureDecl, Expr, FunctionDecl, InterpPart, MatchArm, MethodDecl, Param, Program,
+    PropertyDecl, Stmt, SwitchCase, UnOp, Visibility,
 };
 use phpcraft_lexer::{self, DimKey, StrPart, Tok, Token};
 
@@ -122,6 +123,13 @@ impl Parser {
 
     fn peek_keyword(&self) -> Option<String> {
         match self.peek() {
+            Tok::Ident(name) => Some(name.to_ascii_lowercase()),
+            _ => None,
+        }
+    }
+
+    fn peek_keyword_at(&self, offset: usize) -> Option<String> {
+        match self.peek_at(offset) {
             Tok::Ident(name) => Some(name.to_ascii_lowercase()),
             _ => None,
         }
@@ -256,6 +264,18 @@ impl Parser {
         if self.check_keyword("function") && matches!(self.peek_at(1), Tok::Ident(_)) {
             return Ok(Stmt::Function(self.parse_function()?));
         }
+        if self.check_keyword("class")
+            || (self.check_keyword("final") && self.peek_keyword_at(1).as_deref() == Some("class"))
+            || (self.check_keyword("abstract")
+                && self.peek_keyword_at(1).as_deref() == Some("class"))
+            || (self.check_keyword("readonly")
+                && self.peek_keyword_at(1).as_deref() == Some("class"))
+        {
+            return Ok(Stmt::Class(self.parse_class()?));
+        }
+        if self.check_keyword("try") {
+            return self.parse_try();
+        }
         if self.check_keyword("return") {
             self.advance();
             let value = if matches!(self.peek(), Tok::Semi | Tok::Eof) {
@@ -292,7 +312,6 @@ impl Parser {
         }
 
         for keyword in [
-            "class",
             "interface",
             "trait",
             "enum",
@@ -301,8 +320,6 @@ impl Parser {
             "const",
             "static",
             "unset",
-            "try",
-            "throw",
             "declare",
             "abstract",
             "final",
@@ -594,6 +611,214 @@ impl Parser {
         })
     }
 
+    fn parse_class(&mut self) -> Result<ClassDecl, ParseError> {
+        let line = self.line();
+        while matches!(
+            self.peek_keyword().as_deref(),
+            Some("final" | "abstract" | "readonly")
+        ) {
+            self.advance();
+        }
+        self.expect_keyword("class")?;
+        let name = self.expect_ident()?;
+        let parent = if self.eat_keyword("extends") {
+            Some(self.parse_qualified_name()?)
+        } else {
+            None
+        };
+        if self.check_keyword("implements") {
+            return Err(self.unsupported("interfaces (implements)"));
+        }
+        self.expect(&Tok::LBrace)?;
+
+        let mut properties = Vec::new();
+        let mut constants = Vec::new();
+        let mut methods = Vec::new();
+        while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+            if self.eat(&Tok::Semi) {
+                continue;
+            }
+            let member_line = self.line();
+            let (visibility, static_) = self.parse_member_modifiers()?;
+            if self.check_keyword("function") {
+                methods.push(self.parse_method(visibility, static_)?);
+            } else if self.check_keyword("const") {
+                self.advance();
+                loop {
+                    let name = self.expect_ident()?;
+                    self.expect(&Tok::Assign)?;
+                    let value = self.parse_expr()?;
+                    constants.push(ClassConstDecl {
+                        name,
+                        value,
+                        line: member_line,
+                    });
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.end_statement()?;
+            } else {
+                // Typed properties are accepted; the type is currently only
+                // metadata and is not enforced by the runtime.
+                while !matches!(
+                    self.peek(),
+                    Tok::Var(_) | Tok::Semi | Tok::RBrace | Tok::Eof
+                ) {
+                    self.advance();
+                }
+                loop {
+                    let name = self.expect_variable()?;
+                    let default = if self.eat(&Tok::Assign) {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    properties.push(PropertyDecl {
+                        name,
+                        default,
+                        visibility,
+                        static_,
+                        line: member_line,
+                    });
+                    if !self.eat(&Tok::Comma) {
+                        break;
+                    }
+                }
+                self.end_statement()?;
+            }
+        }
+        self.expect(&Tok::RBrace)?;
+        Ok(ClassDecl {
+            name,
+            parent,
+            properties,
+            constants,
+            methods,
+            line,
+        })
+    }
+
+    fn parse_member_modifiers(&mut self) -> Result<(Visibility, bool), ParseError> {
+        let mut visibility = Visibility::Public;
+        let mut static_ = false;
+        while let Some(keyword) = self.peek_keyword() {
+            match keyword.as_str() {
+                "public" => {
+                    self.advance();
+                    visibility = Visibility::Public;
+                }
+                "protected" => {
+                    self.advance();
+                    visibility = Visibility::Protected;
+                }
+                "private" => {
+                    self.advance();
+                    visibility = Visibility::Private;
+                }
+                "static" => {
+                    self.advance();
+                    static_ = true;
+                }
+                "var" => {
+                    self.advance();
+                }
+                "final" | "abstract" | "readonly" => {
+                    self.advance();
+                }
+                _ => break,
+            }
+        }
+        Ok((visibility, static_))
+    }
+
+    fn parse_method(
+        &mut self,
+        visibility: Visibility,
+        static_: bool,
+    ) -> Result<MethodDecl, ParseError> {
+        let line = self.line();
+        self.expect_keyword("function")?;
+        if matches!(self.peek(), Tok::BitAnd) {
+            return Err(self.unsupported("by-reference method returns"));
+        }
+        let name = self.expect_ident()?;
+        self.expect(&Tok::LParen)?;
+        let params = self.parse_params()?;
+        if self.eat(&Tok::Colon) {
+            while !matches!(self.peek(), Tok::LBrace | Tok::Semi | Tok::Eof) {
+                self.advance();
+            }
+        }
+        if self.eat(&Tok::Semi) {
+            return Err(self.unsupported("abstract/interface method declarations"));
+        }
+        self.expect(&Tok::LBrace)?;
+        let body = self.parse_block_body()?;
+        Ok(MethodDecl {
+            name,
+            params,
+            body,
+            visibility,
+            static_,
+            line,
+        })
+    }
+
+    fn parse_qualified_name(&mut self) -> Result<String, ParseError> {
+        let mut name = String::new();
+        if self.eat(&Tok::Backslash) {
+            name.push('\\');
+        }
+        name.push_str(&self.expect_ident()?);
+        while self.eat(&Tok::Backslash) {
+            name.push('\\');
+            name.push_str(&self.expect_ident()?);
+        }
+        Ok(name)
+    }
+
+    fn parse_try(&mut self) -> Result<Stmt, ParseError> {
+        self.expect_keyword("try")?;
+        self.expect(&Tok::LBrace)?;
+        let body = self.parse_block_body()?;
+        let mut catches = Vec::new();
+        while self.eat_keyword("catch") {
+            let line = self.line();
+            self.expect(&Tok::LParen)?;
+            let mut classes = vec![self.parse_qualified_name()?];
+            while self.eat(&Tok::BitOr) {
+                classes.push(self.parse_qualified_name()?);
+            }
+            let variable = self.expect_variable()?;
+            self.expect(&Tok::RParen)?;
+            self.expect(&Tok::LBrace)?;
+            let body = self.parse_block_body()?;
+            catches.push(CatchClause {
+                classes,
+                variable,
+                body,
+                line,
+            });
+        }
+        let finally = if self.eat_keyword("finally") {
+            self.expect(&Tok::LBrace)?;
+            Some(self.parse_block_body()?)
+        } else {
+            None
+        };
+        if catches.is_empty() && finally.is_none() {
+            return Err(self.error(
+                "syntax error, unexpected end of try block, expecting \"catch\" or \"finally\"",
+            ));
+        }
+        Ok(Stmt::Try {
+            body,
+            catches,
+            finally,
+        })
+    }
+
     fn parse_closure_expr(&mut self, arrow: bool) -> Result<Expr, ParseError> {
         let line = self.line();
         if arrow {
@@ -790,11 +1015,70 @@ impl Parser {
                 };
                 continue;
             }
-            if matches!(self.peek(), Tok::Arrow) {
-                return Err(self.unsupported("object property access (->)"));
+            if self.eat(&Tok::Arrow) {
+                let name = match self.peek().clone() {
+                    Tok::Ident(name) => {
+                        self.advance();
+                        name
+                    }
+                    Tok::Var(_) => return Err(self.unsupported("dynamic property names")),
+                    other => {
+                        return Err(self.error(format!(
+                            "syntax error, unexpected {}, expecting property name",
+                            other.describe()
+                        )))
+                    }
+                };
+                lhs = if self.eat(&Tok::LParen) {
+                    let args = self.parse_call_args()?;
+                    Expr::MethodCall {
+                        object: Box::new(lhs),
+                        method: name,
+                        args,
+                    }
+                } else {
+                    Expr::Property {
+                        object: Box::new(lhs),
+                        name,
+                    }
+                };
+                continue;
             }
-            if matches!(self.peek(), Tok::DoubleColon) {
-                return Err(self.unsupported("class constants and static access (::)"));
+            if self.eat(&Tok::DoubleColon) {
+                let class = match &lhs {
+                    Expr::Name(name) => name.clone(),
+                    _ => return Err(self.unsupported("dynamic class names")),
+                };
+                if let Tok::Var(name) = self.peek().clone() {
+                    self.advance();
+                    lhs = Expr::StaticProperty { class, name };
+                    continue;
+                }
+                let name = self.expect_ident()?;
+                lhs = if self.eat(&Tok::LParen) {
+                    let args = self.parse_call_args()?;
+                    Expr::StaticCall {
+                        class,
+                        method: name,
+                        args,
+                    }
+                } else {
+                    Expr::ClassConst { class, name }
+                };
+                continue;
+            }
+            if self.check_keyword("instanceof") {
+                const INSTANCEOF_BP: u8 = 13;
+                if INSTANCEOF_BP < min_bp {
+                    break;
+                }
+                self.advance();
+                let class = self.parse_qualified_name()?;
+                lhs = Expr::InstanceOf {
+                    expr: Box::new(lhs),
+                    class,
+                };
+                continue;
             }
 
             // Assignment (right associative, lowest precedence after and/or/xor).
@@ -1046,7 +1330,27 @@ impl Parser {
                         Ok(Expr::Empty(Box::new(expr)))
                     }
                     "list" => Err(self.unsupported("list() destructuring")),
-                    "new" | "clone" => Err(self.unsupported("objects")),
+                    "new" => {
+                        self.advance();
+                        if self.check_keyword("class") {
+                            return Err(self.unsupported("anonymous classes"));
+                        }
+                        let class = self.parse_qualified_name()?;
+                        let args = if self.eat(&Tok::LParen) {
+                            self.parse_call_args()?
+                        } else {
+                            Vec::new()
+                        };
+                        Ok(Expr::New { class, args })
+                    }
+                    "clone" => {
+                        self.advance();
+                        Ok(Expr::Clone(Box::new(self.parse_bp(18)?)))
+                    }
+                    "throw" => {
+                        self.advance();
+                        Ok(Expr::Throw(Box::new(self.parse_bp(0)?)))
+                    }
                     "static"
                         if matches!(
                             self.peek_at(1),
@@ -1062,11 +1366,14 @@ impl Parser {
                         );
                         self.parse_closure_expr(arrow)
                     }
+                    "static" if self.peek_at(1) == &Tok::DoubleColon => {
+                        self.advance();
+                        Ok(Expr::Name("static".to_string()))
+                    }
                     "function" => self.parse_closure_expr(false),
                     "fn" => self.parse_closure_expr(true),
                     "match" if self.peek_at(1) == &Tok::LParen => self.parse_match(),
                     "yield" => Err(self.unsupported("generators")),
-                    "throw" => Err(self.unsupported("exceptions")),
                     "print" => Err(self.unsupported("the print expression; use echo")),
                     "exit" | "die" => Err(self.unsupported("exit/die")),
                     "include" | "include_once" | "require" | "require_once" => {
@@ -1232,7 +1539,8 @@ fn assignment_op(tok: &Tok) -> Option<Option<BinOp>> {
 fn is_valid_target(expr: &Expr) -> bool {
     match expr {
         Expr::Var(_) => true,
-        Expr::Index { base, .. } => matches!(**base, Expr::Var(_) | Expr::Index { .. }),
+        Expr::Property { .. } | Expr::StaticProperty { .. } => true,
+        Expr::Index { base, .. } => is_valid_target(base),
         _ => false,
     }
 }
@@ -1356,7 +1664,46 @@ mod tests {
 
     #[test]
     fn reports_unsupported_constructs() {
-        let err = parse_file(b"<?php class Foo {}").unwrap_err();
-        assert!(err.message.contains("class"));
+        let err = parse_file(b"<?php interface Foo {}").unwrap_err();
+        assert!(err.message.contains("interface"));
+    }
+
+    #[test]
+    fn parses_classes_methods_and_exceptions() {
+        let program = parse_file(
+            br#"<?php
+                class Foo extends Bar {
+                    public int $x = 1;
+                    private static $count = 0;
+                    const KIND = "foo";
+                    public function __construct($x) { $this->x = $x; }
+                    public function get(): int { return $this->x; }
+                }
+                try { throw new Foo(2); }
+                catch (Foo | Exception $e) { echo $e->getMessage(); }
+                finally { echo "done"; }
+            "#,
+        )
+        .unwrap();
+        match &program.stmts[0] {
+            Stmt::Class(class) => {
+                assert_eq!(class.name, "Foo");
+                assert_eq!(class.parent.as_deref(), Some("Bar"));
+                assert_eq!(class.methods.len(), 2);
+                assert_eq!(class.properties.len(), 2);
+                assert_eq!(class.constants.len(), 1);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &program.stmts[1] {
+            Stmt::Try {
+                catches, finally, ..
+            } => {
+                assert_eq!(catches.len(), 1);
+                assert_eq!(catches[0].classes.len(), 2);
+                assert!(finally.is_some());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

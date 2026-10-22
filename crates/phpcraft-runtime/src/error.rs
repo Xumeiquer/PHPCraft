@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+use crate::Value;
+
 /// Category of a fatal PHP error. The name is used verbatim in the CLI banner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
@@ -16,6 +18,8 @@ pub enum ErrorKind {
     ArithmeticError,
     ParseError,
     UnhandledMatch,
+    /// A userland `throw` (the value is carried in `PhpError::thrown`).
+    Thrown,
 }
 
 impl ErrorKind {
@@ -28,15 +32,18 @@ impl ErrorKind {
             ErrorKind::ArithmeticError => "ArithmeticError",
             ErrorKind::ParseError => "Parse error",
             ErrorKind::UnhandledMatch => "UnhandledMatchError",
+            ErrorKind::Thrown => "Exception",
         }
     }
 }
 
 /// A fatal PHP error: message plus the class it is reported under.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PhpError {
     pub kind: ErrorKind,
     pub message: String,
+    /// Present for `ErrorKind::Thrown`: the thrown object.
+    pub thrown: Option<Value>,
 }
 
 impl PhpError {
@@ -44,6 +51,15 @@ impl PhpError {
         Self {
             kind,
             message: message.into(),
+            thrown: None,
+        }
+    }
+
+    pub fn thrown(value: Value, message: impl Into<String>) -> Self {
+        Self {
+            kind: ErrorKind::Thrown,
+            message: message.into(),
+            thrown: Some(value),
         }
     }
 

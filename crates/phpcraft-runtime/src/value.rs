@@ -3,7 +3,9 @@
 //! Strings are byte strings, like PHP's `zend_string`. Arrays are handled by
 //! [`crate::PhpArray`] and share with `Rc` (copy-on-write, like Zend).
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
@@ -68,6 +70,41 @@ impl fmt::Debug for PhpClosure {
     }
 }
 
+/// Payload carried by built-in `Exception`/`Error` instances.
+#[derive(Clone, Debug)]
+pub struct ExceptionData {
+    pub message: String,
+    pub code: i64,
+    pub file: String,
+    pub line: u32,
+    pub trace: Vec<String>,
+}
+
+/// A userland object (`zend_object`). Property storage is a PHP array, so
+/// object properties preserve insertion order like dynamic properties do.
+#[derive(Clone, Debug)]
+pub struct PhpObject {
+    pub class_name: String,
+    pub id: u64,
+    pub properties: PhpArray,
+    /// Declared visibility by property name (`public` for dynamic properties
+    /// and for names absent from this map).
+    pub property_visibility: HashMap<String, String>,
+    pub exception: Option<ExceptionData>,
+}
+
+impl PhpObject {
+    pub fn new(class_name: impl Into<String>, id: u64) -> Self {
+        Self {
+            class_name: class_name.into(),
+            id,
+            properties: PhpArray::new(),
+            property_visibility: HashMap::new(),
+            exception: None,
+        }
+    }
+}
+
 /// A numeric value produced by PHP's numeric conversion.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Numeric {
@@ -116,6 +153,7 @@ pub enum Value {
     Str(Rc<PhpStr>),
     Array(Rc<PhpArray>),
     Closure(Rc<PhpClosure>),
+    Object(Rc<RefCell<PhpObject>>),
 }
 
 impl Value {
@@ -153,6 +191,19 @@ impl Value {
         }))
     }
 
+    pub fn object(object: PhpObject) -> Self {
+        Value::Object(Rc::new(RefCell::new(object)))
+    }
+
+    /// The class name of an object, or `None` for non-objects.
+    pub fn object_class(&self) -> Option<String> {
+        match self {
+            Value::Object(object) => Some(object.borrow().class_name.clone()),
+            Value::Closure(_) => Some("Closure".to_string()),
+            _ => None,
+        }
+    }
+
     /// PHP's `gettype()` name.
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -162,20 +213,21 @@ impl Value {
             Value::Float(_) => "float",
             Value::Str(_) => "string",
             Value::Array(_) => "array",
-            Value::Closure(_) => "object",
+            Value::Closure(_) | Value::Object(_) => "object",
         }
     }
 
     /// PHP's `get_debug_type()` name, used in error messages.
-    pub fn debug_type_name(&self) -> &'static str {
+    pub fn debug_type_name(&self) -> String {
         match self {
-            Value::Null => "null",
-            Value::Bool(_) => "bool",
-            Value::Int(_) => "int",
-            Value::Float(_) => "float",
-            Value::Str(_) => "string",
-            Value::Array(_) => "array",
-            Value::Closure(_) => "Closure",
+            Value::Null => "null".to_string(),
+            Value::Bool(_) => "bool".to_string(),
+            Value::Int(_) => "int".to_string(),
+            Value::Float(_) => "float".to_string(),
+            Value::Str(_) => "string".to_string(),
+            Value::Array(_) => "array".to_string(),
+            Value::Closure(_) => "Closure".to_string(),
+            Value::Object(object) => object.borrow().class_name.clone(),
         }
     }
 
@@ -199,7 +251,7 @@ impl Value {
             Value::Float(f) => *f != 0.0,
             Value::Str(s) => !(s.0.is_empty() || s.0 == b"0"),
             Value::Array(a) => !a.is_empty(),
-            Value::Closure(_) => true,
+            Value::Closure(_) | Value::Object(_) => true,
         }
     }
 
@@ -214,6 +266,7 @@ impl Value {
             Value::Str(s) => s.0.clone(),
             Value::Array(_) => b"Array".to_vec(),
             Value::Closure(_) => b"Closure".to_vec(),
+            Value::Object(object) => object.borrow().class_name.as_bytes().to_vec(),
         }
     }
 
@@ -236,7 +289,7 @@ impl Value {
                 None => 0,
             },
             Value::Array(a) => i64::from(!a.is_empty()),
-            Value::Closure(_) => 1,
+            Value::Closure(_) | Value::Object(_) => 1,
         }
     }
 
@@ -252,7 +305,7 @@ impl Value {
                 None => 0.0,
             },
             Value::Array(a) => f64::from(u8::from(!a.is_empty())),
-            Value::Closure(_) => 1.0,
+            Value::Closure(_) | Value::Object(_) => 1.0,
         }
     }
 
@@ -268,7 +321,7 @@ impl Value {
                 Some((n, false)) => ToNumber::Leading(n),
                 None => ToNumber::Invalid,
             },
-            Value::Array(_) | Value::Closure(_) => ToNumber::Invalid,
+            Value::Array(_) | Value::Closure(_) | Value::Object(_) => ToNumber::Invalid,
         }
     }
 
@@ -282,6 +335,10 @@ impl Value {
             Value::Closure(_) => Err(PhpError::type_error(
                 "Object of class Closure could not be converted to string",
             )),
+            Value::Object(object) => Err(PhpError::type_error(format!(
+                "Object of class {} could not be converted to string",
+                object.borrow().class_name
+            ))),
             other => Ok(Rc::new(PhpStr::new(other.to_bytes()))),
         }
     }
@@ -297,6 +354,7 @@ impl fmt::Debug for Value {
             Value::Str(s) => write!(f, "string({:?})", s.to_string_lossy()),
             Value::Array(a) => write!(f, "array({})", a.len()),
             Value::Closure(c) => write!(f, "closure({})", c.function),
+            Value::Object(o) => write!(f, "object({}#{})", o.borrow().class_name, o.borrow().id),
         }
     }
 }
@@ -561,6 +619,8 @@ pub fn strict_eq(a: &Value, b: &Value) -> bool {
                 .all(|((ka, va), (kb, vb))| ka == kb && strict_eq(va, vb))
         }
         (Value::Closure(x), Value::Closure(y)) => Rc::ptr_eq(x, y),
+        (Value::Object(x), Value::Object(y)) => Rc::ptr_eq(x, y),
+        (Value::Object(_), Value::Closure(_)) | (Value::Closure(_), Value::Object(_)) => false,
         _ => false,
     }
 }
@@ -614,8 +674,13 @@ pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
         } else {
             Ordering::Greater
         }),
-        (Closure(_), _) => Some(Ordering::Greater),
-        (_, Closure(_)) => Some(Ordering::Less),
+        (Object(x), Object(y)) => Some(if Rc::ptr_eq(x, y) {
+            Ordering::Equal
+        } else {
+            Ordering::Greater
+        }),
+        (Closure(_), _) | (Object(_), _) => Some(Ordering::Greater),
+        (_, Closure(_)) | (_, Object(_)) => Some(Ordering::Less),
         (Null, _) | (_, Null) | (Bool(_), _) | (_, Bool(_)) => Some(a.to_bool().cmp(&b.to_bool())),
     }
 }
@@ -661,7 +726,7 @@ pub fn key_from_value(value: &Value) -> PhpResult<Key> {
         Value::Bool(b) => Key::Int(i64::from(*b)),
         Value::Float(f) => Key::Int(float_to_int(*f)),
         Value::Null => Key::Str(Rc::new(PhpStr::from_str(""))),
-        Value::Array(_) | Value::Closure(_) => {
+        Value::Array(_) | Value::Closure(_) | Value::Object(_) => {
             return Err(PhpError::type_error(
                 "Illegal offset type: array keys must be int or string",
             ))

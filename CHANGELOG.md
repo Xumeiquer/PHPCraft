@@ -10,6 +10,18 @@ The reference behaviour is PHP 8.5.4.
 
 ### Added
 
+- Classes and objects: constructors, properties (including typed and static
+  declarations), methods, inheritance, `$this`, `parent::`, `self::`,
+  `static::`, class constants, `new`, `clone`, `instanceof`, object identity
+  and PHP-style `var_dump()`/`print_r()` output with visibility metadata.
+- Exceptions: `throw` expressions, `try`/`catch`/`finally` with union catch
+  types, user exception subclasses, the built-in `Exception`/`Error` hierarchy
+  (including `TypeError`, `ValueError`, `RuntimeException` and
+  `LogicException`), exception accessors and PHP-like uncaught diagnostics.
+- Runtime errors raised by builtins are catchable as their corresponding
+  `Error` subclasses.
+- Differential coverage for classes, inheritance, static members, object
+  identity, cloning and exception handling.
 - Closures and arrow functions: `function (...) use (...)` captures, implicit
   arrow-function captures, default/variadic parameters, nested closures and
   by-value capture semantics.
@@ -65,8 +77,8 @@ The reference behaviour is PHP 8.5.4.
 
 ### Tested
 
-- 43 Rust unit/integration tests.
-- 15 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
+- 47 Rust unit/integration tests.
+- 16 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
   status.
 
 ### Planned
@@ -74,8 +86,9 @@ The reference behaviour is PHP 8.5.4.
 - References and by-reference builtins (`sort`, `array_push`, `unset`,
   `foreach &$value`), including by-reference closure captures.
 - First-class callable syntax (`strlen(...)`) and callable arrays.
-- Classes, objects, property access and exceptions.
-- `include`/`require` and namespaces.
+- `include`/`require`, namespaces and qualified-name resolution.
+- Visibility enforcement, `__toString()` in every stdlib coercion path, and
+  `finally` on `return`/`throw` paths.
 
 ## [0.1.0] - 2026-10-22
 
