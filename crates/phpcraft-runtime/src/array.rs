@@ -54,11 +54,23 @@ impl fmt::Debug for Key {
 
 /// PHP array. `index` maps keys to positions in `entries` to keep `get` O(1)
 /// while preserving insertion order.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PhpArray {
     entries: Vec<(Key, Value)>,
     index: HashMap<Key, usize>,
+    /// Zend's `nNextFreeElement`; `i64::MIN` is the "no integer key seen"
+    /// sentinel, which append treats as 0.
     next_index: i64,
+}
+
+impl Default for PhpArray {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            index: HashMap::new(),
+            next_index: i64::MIN,
+        }
+    }
 }
 
 impl PhpArray {
@@ -70,7 +82,7 @@ impl PhpArray {
         Self {
             entries: Vec::with_capacity(cap),
             index: HashMap::with_capacity(cap),
-            next_index: 0,
+            next_index: i64::MIN,
         }
     }
 
@@ -92,7 +104,11 @@ impl PhpArray {
 
     /// The key that `$a[] = ...` will use next.
     pub fn next_index(&self) -> i64 {
-        self.next_index
+        if self.next_index == i64::MIN {
+            0
+        } else {
+            self.next_index
+        }
     }
 
     pub fn get(&self, key: &Key) -> Option<&Value> {
@@ -128,7 +144,7 @@ impl PhpArray {
 
     /// `$a[] = $value`.
     pub fn push(&mut self, value: Value) -> Key {
-        let key = Key::Int(self.next_index);
+        let key = Key::Int(self.next_index());
         self.insert(key.clone(), value);
         key
     }
@@ -231,6 +247,20 @@ mod tests {
         let mut a = PhpArray::new();
         a.insert_int(5, Value::Int(1));
         assert_eq!(a.push(Value::Int(2)), Key::Int(6));
+    }
+
+    #[test]
+    fn append_uses_next_integer_after_negative_key() {
+        let mut a = PhpArray::new();
+        a.insert_int(-5, Value::Int(1));
+        assert_eq!(a.push(Value::Int(2)), Key::Int(-4));
+    }
+
+    #[test]
+    fn append_starts_at_zero_without_integer_keys() {
+        let mut a = PhpArray::new();
+        a.insert_str("name", Value::Int(1));
+        assert_eq!(a.push(Value::Int(2)), Key::Int(0));
     }
 
     #[test]

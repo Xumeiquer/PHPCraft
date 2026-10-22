@@ -30,6 +30,7 @@ static REGISTRY: &[(&str, NativeFn)] = &[
     ("rtrim", rtrim),
     ("substr", substr),
     ("strpos", strpos),
+    ("strrpos", strrpos),
     ("str_contains", str_contains),
     ("str_starts_with", str_starts_with),
     ("str_ends_with", str_ends_with),
@@ -360,6 +361,41 @@ fn strpos(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
         start = 0;
     }
     match find_sub(&haystack, &needle, start as usize) {
+        Some(position) => Ok(Value::Int(position as i64)),
+        None => Ok(Value::Bool(false)),
+    }
+}
+
+fn strrpos(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("strrpos", &args, 2, Some(3))?;
+    let haystack = as_string(&args, 0, "strrpos", "haystack")?;
+    let needle = as_string(&args, 1, "strrpos", "needle")?;
+    let offset = if args.len() > 2 {
+        as_int(&args, 2, "strrpos", "offset")?
+    } else {
+        0
+    };
+    let len = haystack.len() as i64;
+    let start = if offset < 0 { 0 } else { offset };
+    let end = if offset < 0 {
+        (len + offset).max(0) as usize
+    } else {
+        haystack.len()
+    };
+    if needle.is_empty() {
+        return Ok(Value::Int(len));
+    }
+    let mut position = start.max(0) as usize;
+    let mut found = None;
+    while position + needle.len() <= end {
+        if haystack[position..].starts_with(&needle) {
+            found = Some(position);
+            position += 1;
+        } else {
+            position += 1;
+        }
+    }
+    match found {
         Some(position) => Ok(Value::Int(position as i64)),
         None => Ok(Value::Bool(false)),
     }

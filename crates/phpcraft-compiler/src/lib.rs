@@ -759,19 +759,16 @@ impl FnCompiler {
         increment: bool,
         prefix: bool,
     ) -> Result<(), CompileError> {
-        let op = if increment { BinOp::Add } else { BinOp::Sub };
         if prefix {
             self.expr(target)?;
-            self.emit(Op::Int(1));
-            self.emit(Op::Binary(op));
+            self.emit(Op::IncDec { increment });
             self.store_target(target, true)?;
         } else {
             let old = self.temp();
             self.expr(target)?;
             self.emit(Op::StoreTmp(old));
-            self.expr(target)?;
-            self.emit(Op::Int(1));
-            self.emit(Op::Binary(op));
+            self.emit(Op::LoadTmp(old));
+            self.emit(Op::IncDec { increment });
             self.store_target(target, false)?;
             self.emit(Op::LoadTmp(old));
         }

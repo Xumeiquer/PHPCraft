@@ -320,6 +320,15 @@ impl Vm {
                     let result = self.cast_value(*kind, value);
                     stack.push(result);
                 }
+                Op::IncDec { increment } => {
+                    let value = stack.pop().unwrap_or(Value::Null);
+                    let result = if *increment {
+                        increment_value(value)
+                    } else {
+                        decrement_value(value)
+                    };
+                    stack.push(result);
+                }
                 Op::ToBool => {
                     let value = stack.pop().unwrap_or(Value::Null);
                     stack.push(Value::Bool(value.to_bool()));
@@ -858,6 +867,100 @@ impl RuntimeHooks for Vm {
     }
 }
 
+/// `increment_function()` from `Zend/zend_operators.c`.
+fn increment_value(value: Value) -> Value {
+    match value {
+        Value::Int(number) => match number.checked_add(1) {
+            Some(result) => Value::Int(result),
+            None => Value::Float(number as f64 + 1.0),
+        },
+        Value::Float(number) => Value::Float(number + 1.0),
+        Value::Null => Value::Int(1),
+        Value::Str(string) => match phpcraft_runtime::value::parse_numeric(&string.0) {
+            Some((Numeric::Int(number), _)) => match number.checked_add(1) {
+                Some(result) => Value::Int(result),
+                None => Value::Float(number as f64 + 1.0),
+            },
+            Some((Numeric::Float(number), _)) => Value::Float(number + 1.0),
+            None => Value::str(increment_string(&string.0)),
+        },
+        other => other,
+    }
+}
+
+/// `decrement_function()`: strings are only incremented in PHP.
+fn decrement_value(value: Value) -> Value {
+    match value {
+        Value::Int(number) => match number.checked_sub(1) {
+            Some(result) => Value::Int(result),
+            None => Value::Float(number as f64 - 1.0),
+        },
+        Value::Float(number) => Value::Float(number - 1.0),
+        Value::Str(string) if string.0.is_empty() => Value::Int(-1),
+        Value::Str(string) => match phpcraft_runtime::value::parse_numeric(&string.0) {
+            Some((Numeric::Int(number), _)) => match number.checked_sub(1) {
+                Some(result) => Value::Int(result),
+                None => Value::Float(number as f64 - 1.0),
+            },
+            Some((Numeric::Float(number), _)) => Value::Float(number - 1.0),
+            None => Value::Str(string),
+        },
+        other => other,
+    }
+}
+
+/// Perl-style string increment (`increment_string` in `zend_operators.c`).
+fn increment_string(bytes: &[u8]) -> Vec<u8> {
+    if bytes.is_empty() {
+        return b"1".to_vec();
+    }
+    let mut result = bytes.to_vec();
+    let mut carry = false;
+    let mut last = b'a';
+    let mut position = result.len() - 1;
+    loop {
+        let ch = result[position];
+        if ch.is_ascii_lowercase() {
+            last = b'a';
+            if ch == b'z' {
+                result[position] = b'a';
+                carry = true;
+            } else {
+                result[position] = ch + 1;
+                carry = false;
+            }
+        } else if ch.is_ascii_uppercase() {
+            last = b'A';
+            if ch == b'Z' {
+                result[position] = b'A';
+                carry = true;
+            } else {
+                result[position] = ch + 1;
+                carry = false;
+            }
+        } else if ch.is_ascii_digit() {
+            last = b'1';
+            if ch == b'9' {
+                result[position] = b'0';
+                carry = true;
+            } else {
+                result[position] = ch + 1;
+                carry = false;
+            }
+        } else {
+            break;
+        }
+        if !carry || position == 0 {
+            break;
+        }
+        position -= 1;
+    }
+    if carry {
+        result.insert(0, last);
+    }
+    result
+}
+
 fn display_key(key: &Key) -> String {
     match key {
         Key::Int(number) => number.to_string(),
@@ -979,5 +1082,30 @@ mod tests {
             echo $counter;
         "#);
         assert_eq!(out, "2");
+    }
+
+    #[test]
+    fn increment_and_decrement_follow_php() {
+        let (out, _) = run(r#"<?php
+            $s = "a"; $s++; echo $s, "|";
+            $s = "Az"; $s++; echo $s, "|";
+            $s = "z"; $s++; echo $s, "|";
+            $s = "a9"; $s++; echo $s, "|";
+            $s = "9"; $s++; echo $s, "|";
+            $n = null; $n++; echo $n, "|";
+            $n = null; $n--; var_dump($n);
+            $s = "abc"; $s--; echo $s;
+        "#);
+        assert_eq!(out, "b|Ba|aa|b0|10|1|NULL\nabc");
+    }
+
+    #[test]
+    fn append_uses_next_index_after_negative_key() {
+        let (out, _) = run(r#"<?php
+            $a = [-5 => "a"];
+            $a[] = "b";
+            echo implode(",", array_keys($a));
+        "#);
+        assert_eq!(out, "-5,-4");
     }
 }

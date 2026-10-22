@@ -49,6 +49,10 @@ pub enum Op {
 
     Binary(BinOp),
     Unary(UnOp),
+    /// `++`/`--` on the top of the stack, including PHP's string increment.
+    IncDec {
+        increment: bool,
+    },
     /// Convert the top of the stack to another type (`(int)`, `(string)`, ...).
     Cast(CastKind),
     /// Pop a value and push its truthiness.
