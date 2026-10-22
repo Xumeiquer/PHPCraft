@@ -7,6 +7,7 @@
 //! Functions receive `&mut dyn RuntimeHooks`, so they can write output, warn,
 //! call back into userland and read constants without depending on the VM.
 
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use phpcraft_runtime::value::parse_numeric;
@@ -29,6 +30,12 @@ static REGISTRY: &[(&str, NativeFn)] = &[
     ("ltrim", ltrim),
     ("rtrim", rtrim),
     ("substr", substr),
+    ("strstr", strstr),
+    ("strrchr", strrchr),
+    ("strpbrk", strpbrk),
+    ("substr_count", substr_count),
+    ("ucwords", ucwords),
+    ("nl2br", nl2br),
     ("strpos", strpos),
     ("strrpos", strrpos),
     ("str_contains", str_contains),
@@ -46,6 +53,10 @@ static REGISTRY: &[(&str, NativeFn)] = &[
     ("strcmp", strcmp),
     ("chr", chr),
     ("ord", ord),
+    ("urlencode", urlencode),
+    ("urldecode", urldecode),
+    ("rawurlencode", rawurlencode),
+    ("rawurldecode", rawurldecode),
     // arrays
     ("count", count),
     ("sizeof", count),
@@ -57,6 +68,16 @@ static REGISTRY: &[(&str, NativeFn)] = &[
     ("array_sum", array_sum),
     ("array_product", array_product),
     ("array_reverse", array_reverse),
+    ("array_key_first", array_key_first),
+    ("array_key_last", array_key_last),
+    ("array_is_list", array_is_list),
+    ("array_unique", array_unique),
+    ("array_diff", array_diff),
+    ("array_intersect", array_intersect),
+    ("array_diff_key", array_diff_key),
+    ("array_intersect_key", array_intersect_key),
+    ("array_chunk", array_chunk),
+    ("array_pad", array_pad),
     ("array_slice", array_slice),
     ("array_merge", array_merge),
     ("array_fill", array_fill),
@@ -73,6 +94,23 @@ static REGISTRY: &[(&str, NativeFn)] = &[
     ("pow", pow),
     ("intdiv", intdiv),
     ("fmod", fmod),
+    ("fdiv", fdiv),
+    ("log", log),
+    ("log10", log10),
+    ("exp", exp),
+    ("sin", sin),
+    ("cos", cos),
+    ("tan", tan),
+    ("asin", asin),
+    ("acos", acos),
+    ("atan", atan),
+    ("atan2", atan2),
+    ("hypot", hypot),
+    ("deg2rad", deg2rad),
+    ("rad2deg", rad2deg),
+    ("is_nan", is_nan),
+    ("is_finite", is_finite),
+    ("is_infinite", is_infinite),
     ("max", max),
     ("min", min),
     ("pi", pi),
@@ -1019,6 +1057,155 @@ fn strcmp(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     }))
 }
 
+fn strstr(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("strstr", &args, 2, Some(3))?;
+    let haystack = as_string(&args, 0, "strstr", "haystack")?;
+    let needle = as_string(&args, 1, "strstr", "needle")?;
+    if needle.is_empty() {
+        return Ok(string_value(haystack));
+    }
+    let before = as_bool(&args, 2);
+    match find_sub(&haystack, &needle, 0) {
+        Some(position) if before => Ok(string_value(haystack[..position].to_vec())),
+        Some(position) => Ok(string_value(haystack[position..].to_vec())),
+        None => Ok(Value::Bool(false)),
+    }
+}
+
+fn strrchr(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("strrchr", &args, 2, Some(2))?;
+    let haystack = as_string(&args, 0, "strrchr", "haystack")?;
+    let needle = as_string(&args, 1, "strrchr", "needle")?;
+    if needle.is_empty() {
+        return Ok(Value::Bool(false));
+    }
+    let mut found = None;
+    let mut from = 0;
+    while let Some(position) = find_sub(&haystack, &needle, from) {
+        found = Some(position);
+        from = position + 1;
+    }
+    match found {
+        Some(position) => Ok(string_value(haystack[position..].to_vec())),
+        None => Ok(Value::Bool(false)),
+    }
+}
+
+fn strpbrk(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("strpbrk", &args, 2, Some(2))?;
+    let haystack = as_string(&args, 0, "strpbrk", "string")?;
+    let characters = as_string(&args, 1, "strpbrk", "characters")?;
+    if characters.is_empty() {
+        return Err(PhpError::value_error(
+            "strpbrk(): Argument #2 ($characters) must be a non-empty string",
+        ));
+    }
+    match haystack.iter().position(|byte| characters.contains(byte)) {
+        Some(position) => Ok(string_value(haystack[position..].to_vec())),
+        None => Ok(Value::Bool(false)),
+    }
+}
+
+fn substr_count(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("substr_count", &args, 2, Some(4))?;
+    let haystack = as_string(&args, 0, "substr_count", "haystack")?;
+    let needle = as_string(&args, 1, "substr_count", "needle")?;
+    if needle.is_empty() {
+        return Err(PhpError::value_error(
+            "substr_count(): Argument #2 ($needle) must not be empty",
+        ));
+    }
+    let total = haystack.len() as i64;
+    let offset = if args.len() > 2 {
+        as_int(&args, 2, "substr_count", "offset")?
+    } else {
+        0
+    };
+    let start = if offset < 0 {
+        total.saturating_add(offset)
+    } else {
+        offset
+    };
+    if start < 0 || start > total {
+        return Err(PhpError::value_error(
+            "substr_count(): Argument #3 ($offset) must be contained in argument #1 ($haystack)",
+        ));
+    }
+    let end = if args.len() > 3 && !args[3].is_null() {
+        let length = as_int(&args, 3, "substr_count", "length")?;
+        let end = if length < 0 {
+            total.saturating_add(length)
+        } else {
+            start.saturating_add(length)
+        };
+        if end < start || end > total {
+            return Err(PhpError::value_error(
+                "substr_count(): Argument #4 ($length) must be contained in argument #1 ($haystack)",
+            ));
+        }
+        end
+    } else {
+        total
+    };
+
+    let slice = &haystack[start as usize..end as usize];
+    let mut count = 0i64;
+    let mut from = 0;
+    while let Some(position) = find_sub(slice, &needle, from) {
+        count += 1;
+        from = position + needle.len();
+    }
+    Ok(Value::Int(count))
+}
+
+fn ucwords(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("ucwords", &args, 1, Some(2))?;
+    let mut bytes = as_string(&args, 0, "ucwords", "string")?;
+    let separators = if args.len() > 1 {
+        as_string(&args, 1, "ucwords", "separators")?
+    } else {
+        b" \t\n\r\x0c\x0b".to_vec()
+    };
+    let mut at_word_start = true;
+    for byte in &mut bytes {
+        if at_word_start {
+            byte.make_ascii_uppercase();
+        }
+        at_word_start = separators.contains(byte);
+    }
+    Ok(string_value(bytes))
+}
+
+fn nl2br(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("nl2br", &args, 1, Some(2))?;
+    let bytes = as_string(&args, 0, "nl2br", "string")?;
+    let xhtml = if args.len() > 1 {
+        args[1].to_bool()
+    } else {
+        true
+    };
+    let break_tag: &[u8] = if xhtml { b"<br />" } else { b"<br>" };
+    let mut out = Vec::new();
+    reserve_exact(&mut out, bytes.len())?;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte == b'\r' || byte == b'\n' {
+            out.extend_from_slice(break_tag);
+            out.push(byte);
+            i += 1;
+            if byte == b'\r' && bytes.get(i) == Some(&b'\n') {
+                out.push(b'\n');
+                i += 1;
+            }
+        } else {
+            out.push(byte);
+            i += 1;
+        }
+    }
+    Ok(string_value(out))
+}
+
 fn chr(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("chr", &args, 1, Some(1))?;
     let value = as_int(&args, 0, "chr", "codepoint")?;
@@ -1029,6 +1216,86 @@ fn ord(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("ord", &args, 1, Some(1))?;
     let bytes = as_string(&args, 0, "ord", "character")?;
     Ok(Value::Int(bytes.first().copied().unwrap_or(0) as i64))
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn url_encode_bytes(bytes: &[u8], raw: bool) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = Vec::new();
+    for &byte in bytes {
+        let unreserved = byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.')
+            || (raw && byte == b'~');
+        if unreserved {
+            out.push(byte);
+        } else if !raw && byte == b' ' {
+            out.push(b'+');
+        } else {
+            out.push(b'%');
+            out.push(HEX[(byte >> 4) as usize]);
+            out.push(HEX[(byte & 0x0f) as usize]);
+        }
+    }
+    out
+}
+
+fn urlencode(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("urlencode", &args, 1, Some(1))?;
+    let bytes = as_string(&args, 0, "urlencode", "string")?;
+    Ok(string_value(url_encode_bytes(&bytes, false)))
+}
+
+fn rawurlencode(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("rawurlencode", &args, 1, Some(1))?;
+    let bytes = as_string(&args, 0, "rawurlencode", "string")?;
+    Ok(string_value(url_encode_bytes(&bytes, true)))
+}
+
+fn url_decode_bytes(bytes: &[u8], raw: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if !raw && byte == b'+' {
+            out.push(b' ');
+            i += 1;
+        } else if byte == b'%' && i + 2 < bytes.len() {
+            match (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                (Some(high), Some(low)) => {
+                    out.push(high * 16 + low);
+                    i += 3;
+                }
+                _ => {
+                    out.push(byte);
+                    i += 1;
+                }
+            }
+        } else {
+            out.push(byte);
+            i += 1;
+        }
+    }
+    out
+}
+
+fn urldecode(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("urldecode", &args, 1, Some(1))?;
+    let bytes = as_string(&args, 0, "urldecode", "string")?;
+    Ok(string_value(url_decode_bytes(&bytes, false)))
+}
+
+fn rawurldecode(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("rawurldecode", &args, 1, Some(1))?;
+    let bytes = as_string(&args, 0, "rawurldecode", "string")?;
+    Ok(string_value(url_decode_bytes(&bytes, true)))
 }
 
 // ------------------------------------------------------------------- arrays
@@ -1202,6 +1469,246 @@ fn array_reverse(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<V
             Key::Int(_) => {
                 out.push(value);
             }
+        }
+    }
+    Ok(Value::array(out))
+}
+
+fn array_key_first(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_key_first", &args, 1, Some(1))?;
+    let array = as_array(&args, 0, "array_key_first", "array")?;
+    Ok(array.first_key().map(key_to_value).unwrap_or(Value::Null))
+}
+
+fn array_key_last(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_key_last", &args, 1, Some(1))?;
+    let array = as_array(&args, 0, "array_key_last", "array")?;
+    Ok(array
+        .iter()
+        .last()
+        .map(|(key, _)| key_to_value(key))
+        .unwrap_or(Value::Null))
+}
+
+fn array_is_list(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_is_list", &args, 1, Some(1))?;
+    let array = as_array(&args, 0, "array_is_list", "array")?;
+    for (index, (key, _)) in array.iter().enumerate() {
+        if key != &Key::Int(index as i64) {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+fn numeric_for_array_unique(value: &Value) -> f64 {
+    match value.to_number() {
+        ToNumber::Num(number) | ToNumber::Leading(number) => number.to_float(),
+        ToNumber::Invalid => 0.0,
+    }
+}
+
+fn array_unique(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_unique", &args, 1, Some(2))?;
+    let array = as_array(&args, 0, "array_unique", "array")?;
+    let flags = if args.len() > 1 {
+        as_int(&args, 1, "array_unique", "flags")?
+    } else {
+        2 // SORT_STRING
+    };
+    let mut out = PhpArray::try_with_capacity(array.len()).ok_or_else(allocation_error)?;
+    let mut seen_strings: HashSet<Vec<u8>> = HashSet::new();
+    let mut seen_numeric: Vec<f64> = Vec::new();
+    let mut seen_values: Vec<Value> = Vec::new();
+    for (key, value) in array.iter() {
+        let duplicate = match flags {
+            0 => seen_values.iter().any(|seen| loose_eq(seen, value)),
+            1 => {
+                let number = numeric_for_array_unique(value);
+                seen_numeric.contains(&number)
+            }
+            _ => {
+                let text = value.to_bytes();
+                if seen_strings.contains(&text) {
+                    true
+                } else {
+                    seen_strings.insert(text);
+                    false
+                }
+            }
+        };
+        if duplicate {
+            continue;
+        }
+        match flags {
+            0 => seen_values.push(value.clone()),
+            1 => seen_numeric.push(numeric_for_array_unique(value)),
+            _ => {}
+        }
+        out.insert(key.clone(), value.clone());
+    }
+    Ok(Value::array(out))
+}
+
+fn comparison_text(value: &Value) -> Vec<u8> {
+    value.to_bytes()
+}
+
+fn array_diff(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_diff", &args, 1, None)?;
+    let first = as_array(&args, 0, "array_diff", "array")?;
+    let mut others: Vec<HashSet<Vec<u8>>> = Vec::new();
+    for index in 1..args.len() {
+        let array = as_array(&args, index, "array_diff", "arrays")?;
+        let mut set = HashSet::with_capacity(array.len());
+        for value in array.values() {
+            set.insert(comparison_text(&value));
+        }
+        others.push(set);
+    }
+    let mut out = PhpArray::try_with_capacity(first.len()).ok_or_else(allocation_error)?;
+    for (key, value) in first.iter() {
+        let text = comparison_text(value);
+        if !others.iter().any(|set| set.contains(&text)) {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(Value::array(out))
+}
+
+fn array_intersect(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_intersect", &args, 1, None)?;
+    let first = as_array(&args, 0, "array_intersect", "array")?;
+    let mut others: Vec<HashSet<Vec<u8>>> = Vec::new();
+    for index in 1..args.len() {
+        let array = as_array(&args, index, "array_intersect", "arrays")?;
+        let mut set = HashSet::with_capacity(array.len());
+        for value in array.values() {
+            set.insert(comparison_text(&value));
+        }
+        others.push(set);
+    }
+    let mut out = PhpArray::try_with_capacity(first.len()).ok_or_else(allocation_error)?;
+    for (key, value) in first.iter() {
+        let text = comparison_text(value);
+        if others.iter().all(|set| set.contains(&text)) {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(Value::array(out))
+}
+
+fn array_diff_key(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_diff_key", &args, 1, None)?;
+    let first = as_array(&args, 0, "array_diff_key", "array")?;
+    let mut others: Vec<HashSet<Key>> = Vec::new();
+    for index in 1..args.len() {
+        let array = as_array(&args, index, "array_diff_key", "arrays")?;
+        others.push(array.keys().into_iter().collect());
+    }
+    let mut out = PhpArray::try_with_capacity(first.len()).ok_or_else(allocation_error)?;
+    for (key, value) in first.iter() {
+        if !others.iter().any(|set| set.contains(key)) {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(Value::array(out))
+}
+
+fn array_intersect_key(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_intersect_key", &args, 1, None)?;
+    let first = as_array(&args, 0, "array_intersect_key", "array")?;
+    let mut others: Vec<HashSet<Key>> = Vec::new();
+    for index in 1..args.len() {
+        let array = as_array(&args, index, "array_intersect_key", "arrays")?;
+        others.push(array.keys().into_iter().collect());
+    }
+    let mut out = PhpArray::try_with_capacity(first.len()).ok_or_else(allocation_error)?;
+    for (key, value) in first.iter() {
+        if others.iter().all(|set| set.contains(key)) {
+            out.insert(key.clone(), value.clone());
+        }
+    }
+    Ok(Value::array(out))
+}
+
+fn array_chunk(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_chunk", &args, 2, Some(3))?;
+    let array = as_array(&args, 0, "array_chunk", "array")?;
+    let length = as_int(&args, 1, "array_chunk", "length")?;
+    if length <= 0 {
+        return Err(PhpError::value_error(
+            "array_chunk(): Argument #2 ($length) must be greater than 0",
+        ));
+    }
+    let preserve_keys = as_bool(&args, 2);
+    let entries: Vec<(Key, Value)> = array
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    if entries.is_empty() {
+        return Ok(Value::array(PhpArray::new()));
+    }
+    let length = usize::try_from(length).unwrap_or(usize::MAX);
+    let chunk_count = (entries.len() as u128).div_ceil(length as u128);
+    let mut out = PhpArray::try_with_capacity(chunk_count as usize).ok_or_else(allocation_error)?;
+    for chunk in entries.chunks(length) {
+        let mut part = PhpArray::try_with_capacity(chunk.len()).ok_or_else(allocation_error)?;
+        for (key, value) in chunk {
+            if preserve_keys {
+                part.insert(key.clone(), value.clone());
+            } else {
+                part.push(value.clone());
+            }
+        }
+        out.push(Value::array(part));
+    }
+    Ok(Value::array(out))
+}
+
+fn array_pad(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("array_pad", &args, 3, Some(3))?;
+    let array = as_array(&args, 0, "array_pad", "array")?;
+    let length = as_int(&args, 1, "array_pad", "length")?;
+    let target = length.unsigned_abs() as u128;
+    if target >= HT_MAX_SIZE {
+        return Err(PhpError::value_error(
+            "array_pad(): Argument #2 ($length) must not exceed the maximum allowed array size",
+        ));
+    }
+    if target <= array.len() as u128 {
+        return Ok(Value::Array(array));
+    }
+    let target = target as usize;
+    let pad_count = target - array.len();
+    let mut out = PhpArray::try_with_capacity(target).ok_or_else(allocation_error)?;
+    if length < 0 {
+        for _ in 0..pad_count {
+            out.push(args[2].clone());
+        }
+        for (key, value) in array.iter() {
+            match key {
+                Key::Str(_) => {
+                    out.insert(key.clone(), value.clone());
+                }
+                Key::Int(_) => {
+                    out.push(value.clone());
+                }
+            }
+        }
+    } else {
+        for (key, value) in array.iter() {
+            match key {
+                Key::Str(_) => {
+                    out.insert(key.clone(), value.clone());
+                }
+                Key::Int(_) => {
+                    out.push(value.clone());
+                }
+            }
+        }
+        for _ in 0..pad_count {
+            out.push(args[2].clone());
         }
     }
     Ok(Value::array(out))
@@ -1728,6 +2235,111 @@ fn min(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     extremum(&args, false, "min")
 }
 
+fn log(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("log", &args, 1, Some(2))?;
+    let number = as_float(&args, 0, "log", "num")?;
+    let result = if args.len() > 1 {
+        number.log(as_float(&args, 1, "log", "base")?)
+    } else {
+        number.ln()
+    };
+    Ok(Value::Float(result))
+}
+
+fn log10(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("log10", &args, 1, Some(1))?;
+    Ok(Value::Float(as_float(&args, 0, "log10", "num")?.log10()))
+}
+
+fn exp(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("exp", &args, 1, Some(1))?;
+    Ok(Value::Float(as_float(&args, 0, "exp", "num")?.exp()))
+}
+
+fn sin(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("sin", &args, 1, Some(1))?;
+    Ok(Value::Float(as_float(&args, 0, "sin", "num")?.sin()))
+}
+
+fn cos(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("cos", &args, 1, Some(1))?;
+    Ok(Value::Float(as_float(&args, 0, "cos", "num")?.cos()))
+}
+
+fn tan(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("tan", &args, 1, Some(1))?;
+    Ok(Value::Float(as_float(&args, 0, "tan", "num")?.tan()))
+}
+
+fn asin(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("asin", &args, 1, Some(1))?;
+    Ok(Value::Float(as_float(&args, 0, "asin", "num")?.asin()))
+}
+
+fn acos(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("acos", &args, 1, Some(1))?;
+    Ok(Value::Float(as_float(&args, 0, "acos", "num")?.acos()))
+}
+
+fn atan(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("atan", &args, 1, Some(1))?;
+    Ok(Value::Float(as_float(&args, 0, "atan", "num")?.atan()))
+}
+
+fn atan2(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("atan2", &args, 2, Some(2))?;
+    Ok(Value::Float(
+        as_float(&args, 0, "atan2", "y")?.atan2(as_float(&args, 1, "atan2", "x")?),
+    ))
+}
+
+fn hypot(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("hypot", &args, 2, Some(2))?;
+    Ok(Value::Float(
+        as_float(&args, 0, "hypot", "x")?.hypot(as_float(&args, 1, "hypot", "y")?),
+    ))
+}
+
+fn deg2rad(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("deg2rad", &args, 1, Some(1))?;
+    Ok(Value::Float(
+        as_float(&args, 0, "deg2rad", "num")?.to_radians(),
+    ))
+}
+
+fn rad2deg(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("rad2deg", &args, 1, Some(1))?;
+    Ok(Value::Float(
+        as_float(&args, 0, "rad2deg", "num")?.to_degrees(),
+    ))
+}
+
+fn fdiv(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("fdiv", &args, 2, Some(2))?;
+    let numerator = as_float(&args, 0, "fdiv", "num1")?;
+    let denominator = as_float(&args, 1, "fdiv", "num2")?;
+    Ok(Value::Float(numerator / denominator))
+}
+
+fn is_nan(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("is_nan", &args, 1, Some(1))?;
+    Ok(Value::Bool(as_float(&args, 0, "is_nan", "num")?.is_nan()))
+}
+
+fn is_finite(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("is_finite", &args, 1, Some(1))?;
+    Ok(Value::Bool(
+        as_float(&args, 0, "is_finite", "num")?.is_finite(),
+    ))
+}
+
+fn is_infinite(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("is_infinite", &args, 1, Some(1))?;
+    Ok(Value::Bool(
+        as_float(&args, 0, "is_infinite", "num")?.is_infinite(),
+    ))
+}
+
 fn pi(_hooks: &mut dyn RuntimeHooks, _args: Vec<Value>) -> PhpResult<Value> {
     Ok(Value::Float(std::f64::consts::PI))
 }
@@ -2063,6 +2675,66 @@ mod tests {
         let formatted =
             number_format(&mut hooks, vec![Value::Float(1.5), Value::Int(100_000)]).unwrap();
         assert_eq!(formatted.to_bytes().len(), 100_002);
+    }
+
+    #[test]
+    fn stdlib_batch_boundaries_fail_cleanly() {
+        let mut hooks = NullHooks { output: vec![] };
+        assert!(array_pad(
+            &mut hooks,
+            vec![
+                Value::array(PhpArray::new()),
+                Value::Int(i64::MAX),
+                Value::Int(0)
+            ]
+        )
+        .is_err());
+        assert!(array_pad(
+            &mut hooks,
+            vec![
+                Value::array(PhpArray::new()),
+                Value::Int(i64::MIN),
+                Value::Int(0)
+            ]
+        )
+        .is_err());
+        assert!(array_chunk(
+            &mut hooks,
+            vec![Value::array(PhpArray::new()), Value::Int(0)]
+        )
+        .is_err());
+        assert!(substr_count(
+            &mut hooks,
+            vec![Value::str(b"abc".to_vec()), Value::str(Vec::new())]
+        )
+        .is_err());
+        assert!(strpbrk(
+            &mut hooks,
+            vec![Value::str(b"abc".to_vec()), Value::str(Vec::new())]
+        )
+        .is_err());
+
+        let chunked = array_chunk(
+            &mut hooks,
+            vec![
+                Value::array(PhpArray::from_pairs(vec![
+                    (Key::Int(0), Value::Int(1)),
+                    (Key::Int(1), Value::Int(2)),
+                ])),
+                Value::Int(i64::MAX),
+            ],
+        )
+        .unwrap();
+        match chunked {
+            Value::Array(chunks) => {
+                assert_eq!(chunks.len(), 1);
+                match chunks.get_int(0) {
+                    Some(Value::Array(chunk)) => assert_eq!(chunk.len(), 2),
+                    other => panic!("expected chunk, got {other:?}"),
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
     }
 
     #[test]

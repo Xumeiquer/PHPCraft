@@ -130,9 +130,9 @@ fetch/assign instructions.
 | `tests/lang/arrays/*.phpt` | `tests/php/03_arrays.php` |
 | `tests/lang/strings/*.phpt` | `tests/php/02_strings.php` |
 | `Zend/tests/arithmetic/*.phpt` | `tests/php/01_basics.php`, `tests/php/08_floats.php` |
-| `ext/standard/tests/strings/*.phpt` | `tests/php/02_strings.php`, `tests/php/07_stdlib.php` |
-| `ext/standard/tests/array/*.phpt` | `tests/php/03_arrays.php` |
-| `ext/standard/tests/math/*.phpt` | `tests/php/07_stdlib.php`, `tests/php/08_floats.php` |
+| `ext/standard/tests/strings/*.phpt` | `tests/php/02_strings.php`, `tests/php/07_stdlib.php`, `tests/php/14_stdlib_batch.php` |
+| `ext/standard/tests/array/*.phpt` | `tests/php/03_arrays.php`, `tests/php/14_stdlib_batch.php` |
+| `ext/standard/tests/math/*.phpt` | `tests/php/07_stdlib.php`, `tests/php/08_floats.php`, `tests/php/14_stdlib_batch.php` |
 | `tests/lang/control_structures/*.phpt` | `tests/php/04_control.php` |
 | `tests/lang/functions/*.phpt` | `tests/php/05_functions.php` |
 

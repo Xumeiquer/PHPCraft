@@ -14,6 +14,17 @@ The reference behaviour is PHP 8.5.4.
   comparison, a `default` arm in any position, trailing commas, nested
   expressions and `UnhandledMatchError` when no arm matches.
 - Differential coverage for `match` and integer-boundary builtin calls.
+- 37 standard builtins:
+  - strings: `strstr`, `strrchr`, `strpbrk`, `substr_count`, `ucwords`,
+    `nl2br`
+  - arrays: `array_key_first`, `array_key_last`, `array_is_list`,
+    `array_unique`, `array_diff`, `array_intersect`, `array_diff_key`,
+    `array_intersect_key`, `array_chunk`, `array_pad`
+  - math: `log`, `log10`, `exp`, `sin`, `cos`, `tan`, `asin`, `acos`,
+    `atan`, `atan2`, `hypot`, `deg2rad`, `rad2deg`, `fdiv`, `is_nan`,
+    `is_finite`, `is_infinite`
+  - URL: `urlencode`, `urldecode`, `rawurlencode`, `rawurldecode`
+- Differential coverage for the new stdlib batch.
 
 ### Fixed
 
@@ -44,8 +55,8 @@ The reference behaviour is PHP 8.5.4.
 
 ### Tested
 
-- 39 Rust unit/integration tests.
-- 13 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
+- 40 Rust unit/integration tests.
+- 14 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
   status.
 
 ### Planned
