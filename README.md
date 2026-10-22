@@ -9,7 +9,17 @@ This repository currently implements an end-to-end vertical slice: real PHP
 scripts using scalar values, strings, ordered arrays, control flow, functions,
 `global`, `isset`/`empty`, and a growing standard library execute correctly.
 
-## Quick start
+## Building and testing
+
+```sh
+make            # debug build
+make check      # fmt + clippy + unit tests + differential tests
+make run FILE=tests/php/01_basics.php
+make repl CODE='echo "hello ", 1 + 2, PHP_EOL;'
+make help       # every target
+```
+
+Or use Cargo directly:
 
 ```sh
 cargo build
@@ -70,6 +80,7 @@ that require extensions, INI settings, request data or special headers.
 
 See [`docs/architecture.md`](docs/architecture.md) for the design and
 [`docs/php-src-map.md`](docs/php-src-map.md) for the php-src correspondence.
+Release highlights live in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Status and limits
 
