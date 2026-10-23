@@ -162,7 +162,7 @@ fetch/assign instructions.
 | `tests/lang/functions/*.phpt` | `tests/php/05_functions.php` |
 | `Zend/tests/closures/*.phpt` | `tests/php/15_closures.php` |
 | `Zend/tests/classes/*.phpt`, `Zend/tests/exceptions/*.phpt` | `tests/php/16_objects.php` |
-| `Zend/tests/ns/*.phpt`, `Zend/tests/use/*.phpt` | `tests/php/17_namespaces_includes.php`, `tests/php/18_namespace_blocks.php` |
+| `Zend/tests/ns/*.phpt`, `Zend/tests/use/*.phpt` | `tests/php/17_namespaces_includes.php`, `tests/php/18_namespace_blocks.php`, `tests/php/25_group_use.php` |
 | `Zend/tests/ref/*.phpt` | `tests/php/19_references.php`, `tests/php/20_references_advanced.php` |
 | `ext/standard/tests/array/sort/*.phpt` | `tests/php/19_references.php`, `tests/php/20_references_advanced.php`, `tests/php/24_byref_sorts.php` |
 | `Zend/tests/list/*.phpt`, `Zend/tests/foreach_list.phpt` | `tests/php/23_destructuring.php` |

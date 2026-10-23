@@ -655,38 +655,95 @@ impl Parser {
         } else {
             UseKind::Class
         };
-        let mut imports = Vec::new();
-        loop {
-            let mut target = self.parse_qualified_name()?;
-            if target.starts_with('\\') {
-                target.remove(0);
+
+        // Parse the first name segment by segment so a trailing `\{` can be
+        // recognised as group-use syntax.
+        let mut prefix = String::new();
+        if self.eat(&Tok::Backslash) {
+            prefix.push('\\');
+        }
+        prefix.push_str(&self.expect_ident()?);
+        while self.eat(&Tok::Backslash) {
+            if self.eat(&Tok::LBrace) {
+                let imports = self.parse_use_group(&prefix, kind)?;
+                self.end_statement()?;
+                return Ok(Stmt::Use(imports));
             }
-            if self.check_keyword("as") {
-                self.advance();
-                let alias = self.expect_ident()?;
-                imports.push(UseDecl {
-                    target,
-                    alias,
-                    kind,
-                });
+            prefix.push('\\');
+            prefix.push_str(&self.expect_ident()?);
+        }
+
+        let mut imports = Vec::new();
+        let mut target = prefix;
+        loop {
+            target = target.trim_start_matches('\\').to_string();
+            let alias = if self.eat_keyword("as") {
+                self.expect_ident()?
             } else {
-                let alias = target
+                target
                     .rsplit('\\')
                     .next()
                     .unwrap_or(target.as_str())
-                    .to_string();
-                imports.push(UseDecl {
-                    target,
-                    alias,
-                    kind,
-                });
-            }
+                    .to_string()
+            };
+            imports.push(UseDecl {
+                target,
+                alias,
+                kind,
+            });
             if !self.eat(&Tok::Comma) {
                 break;
             }
+            target = self.parse_qualified_name()?;
         }
         self.end_statement()?;
         Ok(Stmt::Use(imports))
+    }
+
+    /// Parse the `{...}` part of `use Prefix\{Name, function f, const C}`.
+    /// Group items may override the statement's default import kind.
+    fn parse_use_group(
+        &mut self,
+        prefix: &str,
+        default_kind: UseKind,
+    ) -> Result<Vec<UseDecl>, ParseError> {
+        let prefix = prefix.trim_matches('\\');
+        let mut imports = Vec::new();
+        loop {
+            if self.eat(&Tok::RBrace) {
+                break;
+            }
+            let kind = if self.eat_keyword("function") {
+                UseKind::Function
+            } else if self.eat_keyword("const") {
+                UseKind::Constant
+            } else {
+                default_kind
+            };
+            let item = self.parse_qualified_name()?;
+            let item = item.trim_start_matches('\\');
+            let target = if prefix.is_empty() {
+                item.to_string()
+            } else {
+                format!("{prefix}\\{item}")
+            };
+            let alias = if self.eat_keyword("as") {
+                self.expect_ident()?
+            } else {
+                item.rsplit('\\').next().unwrap_or(item).to_string()
+            };
+            imports.push(UseDecl {
+                target,
+                alias,
+                kind,
+            });
+            if self.eat(&Tok::Comma) {
+                continue;
+            }
+            self.expect(&Tok::RBrace)?;
+            break;
+        }
+        Ok(imports)
     }
 
     fn parse_class(&mut self) -> Result<ClassDecl, ParseError> {
@@ -2031,6 +2088,57 @@ mod tests {
             &program.stmts[6],
             Stmt::NamespaceBlock { name: Some(name), .. } if name == "Other"
         ));
+    }
+
+    #[test]
+    fn parses_group_use_declarations() {
+        let program = parse_file(
+            br#"<?php
+                use Foo\Bar\{Baz, Qux as Q, function helper as h, const VERSION};
+                use function Foo\Funcs\{first, second as two};
+                use const Foo\Values\{FIRST, SECOND as TWO};
+            "#,
+        )
+        .unwrap();
+        match &program.stmts[0] {
+            Stmt::Use(imports) => {
+                assert_eq!(imports.len(), 4);
+                assert_eq!(imports[0].target, "Foo\\Bar\\Baz");
+                assert_eq!(imports[0].alias, "Baz");
+                assert_eq!(imports[0].kind, UseKind::Class);
+                assert_eq!(imports[1].target, "Foo\\Bar\\Qux");
+                assert_eq!(imports[1].alias, "Q");
+                assert_eq!(imports[2].target, "Foo\\Bar\\helper");
+                assert_eq!(imports[2].alias, "h");
+                assert_eq!(imports[2].kind, UseKind::Function);
+                assert_eq!(imports[3].target, "Foo\\Bar\\VERSION");
+                assert_eq!(imports[3].alias, "VERSION");
+                assert_eq!(imports[3].kind, UseKind::Constant);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &program.stmts[1] {
+            Stmt::Use(imports) => {
+                assert_eq!(imports.len(), 2);
+                assert_eq!(imports[0].target, "Foo\\Funcs\\first");
+                assert_eq!(imports[0].kind, UseKind::Function);
+                assert_eq!(imports[1].target, "Foo\\Funcs\\second");
+                assert_eq!(imports[1].alias, "two");
+                assert_eq!(imports[1].kind, UseKind::Function);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &program.stmts[2] {
+            Stmt::Use(imports) => {
+                assert_eq!(imports.len(), 2);
+                assert_eq!(imports[0].target, "Foo\\Values\\FIRST");
+                assert_eq!(imports[0].kind, UseKind::Constant);
+                assert_eq!(imports[1].target, "Foo\\Values\\SECOND");
+                assert_eq!(imports[1].alias, "TWO");
+                assert_eq!(imports[1].kind, UseKind::Constant);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

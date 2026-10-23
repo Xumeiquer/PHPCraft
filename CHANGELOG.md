@@ -31,9 +31,9 @@ The reference behaviour is PHP 8.5.4.
   a `try` block.
 - Namespaces: `namespace Name;`, braced namespace blocks (including the global
   `namespace { ... }` form), `use` imports for classes, functions and
-  constants, aliases, qualified and fully-qualified names, and the
-  `namespace\Name` relative syntax. Unqualified function and constant lookups
-  fall back to the global namespace as in PHP.
+  constants, aliases, group `use` declarations, qualified and fully-qualified
+  names, and the `namespace\Name` relative syntax. Unqualified function and
+  constant lookups fall back to the global namespace as in PHP.
 - Magic constants `__FILE__`, `__DIR__`, `__NAMESPACE__`, `__CLASS__`,
   `__METHOD__`, `__FUNCTION__` and `__LINE__`.
 - `include`, `include_once`, `require` and `require_once`, including return
@@ -124,14 +124,13 @@ The reference behaviour is PHP 8.5.4.
 
 ### Tested
 
-- 58 Rust unit/integration tests.
-- 24 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
+- 59 Rust unit/integration tests.
+- 25 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
   status.
 
 ### Planned
 
-- Group `use` declarations, `include_path`, class autoloading and namespaced
-  constant declarations.
+- `include_path`, class autoloading and namespaced constant declarations.
 - `break`/`continue` leaving a `try` block currently bypasses its `finally`
   body (return and throw paths are covered).
 
