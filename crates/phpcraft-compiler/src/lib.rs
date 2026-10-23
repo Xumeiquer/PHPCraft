@@ -66,9 +66,82 @@ fn check_param_names(params: &[Param], line: u32) -> Result<(), CompileError> {
     Ok(())
 }
 
+type RefSignature = (Vec<bool>, bool);
+
+fn collect_ref_signatures(
+    stmts: &[Stmt],
+    namespace: &str,
+    signatures: &mut HashMap<String, RefSignature>,
+) {
+    let qualify = |name: &str, namespace: &str| -> String {
+        let name = name.trim_start_matches('\\');
+        if namespace.is_empty() || name.contains('\\') {
+            name.to_string()
+        } else {
+            format!("{namespace}\\{name}")
+        }
+    };
+    let mut active_namespace = namespace.to_string();
+    for stmt in stmts {
+        match stmt {
+            Stmt::NamespaceMark(name) => {
+                active_namespace = name.clone().unwrap_or_default();
+            }
+            Stmt::NamespaceBlock { name, body } => {
+                collect_ref_signatures(body, name.as_deref().unwrap_or_default(), signatures);
+            }
+            Stmt::Function(decl) => {
+                let name = qualify(&decl.name, &active_namespace);
+                signatures.insert(
+                    name.to_ascii_lowercase(),
+                    (
+                        decl.params.iter().map(|param| param.by_ref).collect(),
+                        decl.params
+                            .last()
+                            .map(|param| param.variadic)
+                            .unwrap_or(false),
+                    ),
+                );
+                collect_ref_signatures(&decl.body, &active_namespace, signatures);
+            }
+            Stmt::Class(decl) => {
+                let class = qualify(&decl.name, &active_namespace);
+                for method in &decl.methods {
+                    signatures.insert(
+                        format!("{}::{}", class, method.name).to_ascii_lowercase(),
+                        (
+                            method.params.iter().map(|param| param.by_ref).collect(),
+                            method
+                                .params
+                                .last()
+                                .map(|param| param.variadic)
+                                .unwrap_or(false),
+                        ),
+                    );
+                    collect_ref_signatures(&method.body, &active_namespace, signatures);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn argument_is_by_ref(signature: Option<&RefSignature>, index: usize) -> bool {
+    let Some((params, variadic)) = signature else {
+        return false;
+    };
+    match params.get(index) {
+        Some(by_ref) => *by_ref,
+        None => *variadic && params.last().copied().unwrap_or(false),
+    }
+}
+
 /// Compile a parsed program. `file` is only used for diagnostics.
 pub fn compile(program: &Program, file: &str) -> Result<CompiledProgram, CompileError> {
+    let mut signatures = HashMap::new();
+    collect_ref_signatures(&program.stmts, "", &mut signatures);
     let mut compiler = FnCompiler::new_main(file);
+    compiler.signatures = signatures;
     compiler.compile_stmts(&program.stmts)?;
     let (main, functions, classes) = compiler.finish();
 
@@ -123,12 +196,14 @@ struct FnCompiler {
     capture_slots: Vec<u32>,
     capture_names: Vec<String>,
     capture_refs: Vec<bool>,
+    returns_ref: bool,
     functions: Vec<Function>,
     classes: Vec<ClassDef>,
     namespace: String,
     class_uses: HashMap<String, String>,
     function_uses: HashMap<String, String>,
     const_uses: HashMap<String, String>,
+    signatures: HashMap<String, RefSignature>,
     file: String,
 }
 
@@ -150,12 +225,14 @@ impl FnCompiler {
             capture_slots: Vec::new(),
             capture_names: Vec::new(),
             capture_refs: Vec::new(),
+            returns_ref: false,
             functions: Vec::new(),
             classes: Vec::new(),
             namespace: String::new(),
             class_uses: HashMap::new(),
             function_uses: HashMap::new(),
             const_uses: HashMap::new(),
+            signatures: HashMap::new(),
             file: file.to_string(),
         }
     }
@@ -177,12 +254,14 @@ impl FnCompiler {
             capture_slots: Vec::new(),
             capture_names: Vec::new(),
             capture_refs: Vec::new(),
+            returns_ref: decl.returns_ref,
             functions: Vec::new(),
             classes: Vec::new(),
             namespace: String::new(),
             class_uses: HashMap::new(),
             function_uses: HashMap::new(),
             const_uses: HashMap::new(),
+            signatures: HashMap::new(),
             file: file.to_string(),
         }
     }
@@ -204,12 +283,14 @@ impl FnCompiler {
             capture_slots: Vec::new(),
             capture_names: Vec::new(),
             capture_refs: Vec::new(),
+            returns_ref: false,
             functions: Vec::new(),
             classes: Vec::new(),
             namespace: String::new(),
             class_uses: HashMap::new(),
             function_uses: HashMap::new(),
             const_uses: HashMap::new(),
+            signatures: HashMap::new(),
             file: file.to_string(),
         }
     }
@@ -236,6 +317,7 @@ impl FnCompiler {
             capture_slots: self.capture_slots,
             capture_names: self.capture_names,
             capture_refs: self.capture_refs,
+            returns_ref: self.returns_ref,
             chunk: Chunk {
                 ops: self.ops,
                 consts: self.consts,
@@ -467,6 +549,117 @@ impl FnCompiler {
         }
     }
 
+    /// Push a reference cell for a supported reference source.
+    fn load_ref_source(&mut self, source: &Expr) -> Result<(), CompileError> {
+        match source {
+            Expr::Var(name) => {
+                if name == "this" {
+                    return Err(CompileError::new("Cannot re-assign $this", self.line));
+                }
+                self.load_var_ref(name);
+            }
+            Expr::Index { .. } => {
+                let (root, dims) = Self::lvalue_chain(source).ok_or_else(|| {
+                    CompileError::new(
+                        "references to array elements currently require a variable root",
+                        self.line,
+                    )
+                })?;
+                self.load_var(&root);
+                let mut modes = Vec::with_capacity(dims.len());
+                for dim in dims {
+                    match dim {
+                        Some(index) => {
+                            self.expr(index)?;
+                            modes.push(DimMode::Key);
+                        }
+                        None => {
+                            return Err(CompileError::new(
+                                "cannot take a reference to an appended array element",
+                                self.line,
+                            ))
+                        }
+                    }
+                }
+                self.emit(Op::MakeDimRef { modes });
+                self.store_var(&root, false);
+            }
+            Expr::Property { object, name } => {
+                self.expr(object)?;
+                let name = self.const_str(name.as_bytes());
+                self.emit(Op::MakePropertyRef { name });
+            }
+            Expr::StaticProperty { class, name } => {
+                let class = self.qualify_class(class);
+                let class = self.const_str(class.as_bytes());
+                let name = self.const_str(name.as_bytes());
+                self.emit(Op::MakeStaticPropertyRef { class, name });
+            }
+            Expr::Call { .. }
+            | Expr::DynamicCall { .. }
+            | Expr::MethodCall { .. }
+            | Expr::StaticCall { .. } => self.expr(source)?,
+            _ => {
+                return Err(CompileError::new(
+                    "references can only be taken of variables, array elements, properties or reference-returning calls",
+                    self.line,
+                ))
+            }
+        }
+        Ok(())
+    }
+
+    /// Store the reference on top of the stack into a reference target.
+    fn store_ref_target(&mut self, target: &Expr) -> Result<(), CompileError> {
+        match target {
+            Expr::Var(name) => {
+                if name == "this" {
+                    return Err(CompileError::new("Cannot re-assign $this", self.line));
+                }
+                self.store_var_ref(name);
+            }
+            Expr::Index { .. } => {
+                let (root, dims) = Self::lvalue_chain(target).ok_or_else(|| {
+                    CompileError::new(
+                        "reference assignment targets currently require a variable root",
+                        self.line,
+                    )
+                })?;
+                self.load_var(&root);
+                let mut modes = Vec::with_capacity(dims.len());
+                for dim in dims {
+                    match dim {
+                        Some(index) => {
+                            self.expr(index)?;
+                            modes.push(DimMode::Key);
+                        }
+                        None => modes.push(DimMode::Append),
+                    }
+                }
+                self.emit(Op::SetDimRef { modes });
+                self.store_var(&root, false);
+            }
+            Expr::Property { object, name } => {
+                self.expr(object)?;
+                let name = self.const_str(name.as_bytes());
+                self.emit(Op::SetPropertyRef { name });
+            }
+            Expr::StaticProperty { class, name } => {
+                let class = self.qualify_class(class);
+                let class = self.const_str(class.as_bytes());
+                let name = self.const_str(name.as_bytes());
+                self.emit(Op::SetStaticPropertyRef { class, name });
+            }
+            _ => {
+                return Err(CompileError::new(
+                    "reference assignment target must be a variable, array element or property",
+                    self.line,
+                ))
+            }
+        }
+        Ok(())
+    }
+
     fn expr_arg(&mut self, expr: &Expr) -> Result<(), CompileError> {
         if let Expr::Var(name) = expr {
             if name != "this" {
@@ -475,6 +668,35 @@ impl FnCompiler {
             }
         }
         self.expr(expr)
+    }
+
+    /// Evaluate an argument that the callee declares by reference. Array
+    /// elements and properties must become shared cells before the call.
+    fn expr_arg_ref(&mut self, expr: &Expr) -> Result<(), CompileError> {
+        match expr {
+            Expr::Var(_)
+            | Expr::Index { .. }
+            | Expr::Property { .. }
+            | Expr::StaticProperty { .. } => self.load_ref_source(expr),
+            _ => self.expr(expr),
+        }
+    }
+
+    /// Method calls do not carry a compile-time receiver type. Promote an
+    /// element/property argument when every known method with this name takes
+    /// that position by reference.
+    fn method_argument_by_ref(&self, method: &str, index: usize) -> bool {
+        let suffix = format!("::{}", method.to_ascii_lowercase());
+        let mut found = false;
+        for (name, signature) in &self.signatures {
+            if name.ends_with(&suffix) {
+                found = true;
+                if !argument_is_by_ref(Some(signature), index) {
+                    return false;
+                }
+            }
+        }
+        found
     }
 
     fn load_var_safe(&mut self, name: &str) {
@@ -665,8 +887,9 @@ impl FnCompiler {
                 subject,
                 key,
                 value,
+                by_ref,
                 body,
-            } => self.compile_foreach(subject, key.as_ref(), value, body),
+            } => self.compile_foreach(subject, key.as_ref(), value, *by_ref, body),
             Stmt::Switch { subject, cases } => self.compile_switch(subject, cases),
             Stmt::Function(decl) => self.compile_function_decl(decl),
             Stmt::Class(decl) => self.compile_class(decl),
@@ -714,8 +937,13 @@ impl FnCompiler {
                 }
                 Ok(())
             }
+            Stmt::Unset(targets) => self.compile_unset(targets),
             Stmt::Return(value) => {
                 match value {
+                    Some(expr) if self.returns_ref => {
+                        self.load_ref_source(expr)?;
+                        self.emit(Op::Return);
+                    }
                     Some(expr) => {
                         self.expr(expr)?;
                         self.emit(Op::Return);
@@ -842,9 +1070,15 @@ impl FnCompiler {
         subject: &Expr,
         key: Option<&Expr>,
         value: &Expr,
+        by_ref: bool,
         body: &[Stmt],
     ) -> Result<(), CompileError> {
         self.expr(subject)?;
+        if by_ref {
+            self.emit(Op::PrepareRefs);
+            self.emit(Op::Dup);
+            self.store_target(subject, false)?;
+        }
         let iter = self.temp();
         self.emit(Op::IterInit { iter });
 
@@ -855,6 +1089,7 @@ impl FnCompiler {
             iter,
             key: key_tmp,
             value: value_tmp,
+            by_ref,
             end: 0,
         });
 
@@ -863,8 +1098,19 @@ impl FnCompiler {
             self.emit(Op::LoadTmp(key_slot));
             self.store_target(key_target, false)?;
         }
-        self.emit(Op::LoadTmp(value_tmp));
-        self.store_target(value, false)?;
+        if by_ref {
+            let Expr::Var(name) = value else {
+                return Err(CompileError::new(
+                    "by-reference foreach value must be a variable",
+                    self.line,
+                ));
+            };
+            self.emit(Op::LoadTmp(value_tmp));
+            self.store_var_ref(name);
+        } else {
+            self.emit(Op::LoadTmp(value_tmp));
+            self.store_target(value, false)?;
+        }
         self.compile_stmts(body)?;
 
         let ctx = self.loops.pop().expect("loop context");
@@ -876,6 +1122,64 @@ impl FnCompiler {
         self.patch(next, end);
         for jump in ctx.breaks {
             self.patch(jump, end);
+        }
+        Ok(())
+    }
+
+    fn compile_unset(&mut self, targets: &[Expr]) -> Result<(), CompileError> {
+        for target in targets {
+            match target {
+                Expr::Var(name) => {
+                    if name == "this" {
+                        return Err(CompileError::new("Cannot unset $this", self.line));
+                    }
+                    if self.is_main || self.globals.contains(name) {
+                        let index = self.const_str(name.as_bytes());
+                        self.emit(Op::UnsetGlobal(index));
+                    } else {
+                        let slot = self.slot(name);
+                        self.emit(Op::UnsetVar(slot));
+                    }
+                }
+                Expr::Index { .. } => {
+                    let (root, dims) = Self::lvalue_chain(target).ok_or_else(|| {
+                        CompileError::new(
+                            "unset() targets currently require a variable root",
+                            self.line,
+                        )
+                    })?;
+                    self.load_var(&root);
+                    let mut modes = Vec::with_capacity(dims.len());
+                    for dim in dims {
+                        match dim {
+                            Some(index) => {
+                                self.expr(index)?;
+                                modes.push(DimMode::Key);
+                            }
+                            None => modes.push(DimMode::Append),
+                        }
+                    }
+                    self.emit(Op::UnsetDim { modes });
+                    self.store_var(&root, false);
+                }
+                Expr::Property { object, name } => {
+                    self.expr(object)?;
+                    let name = self.const_str(name.as_bytes());
+                    self.emit(Op::UnsetProperty { name });
+                }
+                Expr::StaticProperty { class, name } => {
+                    let class = self.qualify_class(class);
+                    let class = self.const_str(class.as_bytes());
+                    let name = self.const_str(name.as_bytes());
+                    self.emit(Op::UnsetStaticProperty { class, name });
+                }
+                _ => {
+                    return Err(CompileError::new(
+                        "unset() expects a variable, array element or property",
+                        self.line,
+                    ))
+                }
+            }
         }
         Ok(())
     }
@@ -960,6 +1264,8 @@ impl FnCompiler {
         for method in &decl.methods {
             let function_name = format!("{}::{}", class_name, method.name);
             let mut nested = FnCompiler::new_method(&function_name, method.line, &self.file);
+            nested.signatures = self.signatures.clone();
+            nested.returns_ref = method.returns_ref;
             nested.namespace = self.namespace.clone();
             nested.class_uses = self.class_uses.clone();
             nested.function_uses = self.function_uses.clone();
@@ -1147,6 +1453,8 @@ impl FnCompiler {
 
         let name = next_closure_name(decl.line);
         let mut nested = FnCompiler::new_closure(&name, decl.line, &self.file);
+        nested.signatures = self.signatures.clone();
+        nested.returns_ref = decl.returns_ref;
         nested.namespace = self.namespace.clone();
         nested.class_uses = self.class_uses.clone();
         nested.function_uses = self.function_uses.clone();
@@ -1174,7 +1482,11 @@ impl FnCompiler {
         match &decl.body {
             ClosureBody::Block(body) => nested.compile_stmts(body)?,
             ClosureBody::Expr(body) => {
-                nested.expr(body)?;
+                if nested.returns_ref {
+                    nested.load_ref_source(body)?;
+                } else {
+                    nested.expr(body)?;
+                }
                 nested.emit(Op::Return);
             }
         }
@@ -1323,10 +1635,19 @@ impl FnCompiler {
                 }
             }
             Expr::Call { name, args } => {
-                for arg in args {
-                    self.expr_arg(arg)?;
-                }
                 let (name, fallback) = self.resolve_function_call(name);
+                let signature = self.signatures.get(&name.to_ascii_lowercase()).cloned();
+                let short_name = name.rsplit('\\').next().unwrap_or(&name);
+                let builtin_by_ref = phpcraft_stdlib::by_ref_params(short_name);
+                for (arg_index, arg) in args.iter().enumerate() {
+                    if argument_is_by_ref(signature.as_ref(), arg_index)
+                        || (signature.is_none() && builtin_by_ref.contains(&arg_index))
+                    {
+                        self.expr_arg_ref(arg)?;
+                    } else {
+                        self.expr(arg)?;
+                    }
+                }
                 let index = self.const_str(name.as_bytes());
                 self.emit(Op::Call {
                     name: index,
@@ -1344,11 +1665,19 @@ impl FnCompiler {
                 });
             }
             Expr::New { class, args } => {
-                for arg in args {
-                    self.expr_arg(arg)?;
+                let class_name = self.qualify_class(class);
+                let signature = self
+                    .signatures
+                    .get(&format!("{}::__construct", class_name).to_ascii_lowercase())
+                    .cloned();
+                for (arg_index, arg) in args.iter().enumerate() {
+                    if argument_is_by_ref(signature.as_ref(), arg_index) {
+                        self.expr_arg_ref(arg)?;
+                    } else {
+                        self.expr_arg(arg)?;
+                    }
                 }
-                let class = self.qualify_class(class);
-                let index = self.const_str(class.as_bytes());
+                let index = self.const_str(class_name.as_bytes());
                 self.emit(Op::NewObject {
                     class: index,
                     argc: args.len() as u32,
@@ -1368,8 +1697,12 @@ impl FnCompiler {
                 args,
             } => {
                 self.expr(object)?;
-                for arg in args {
-                    self.expr_arg(arg)?;
+                for (arg_index, arg) in args.iter().enumerate() {
+                    if self.method_argument_by_ref(method, arg_index) {
+                        self.expr_arg_ref(arg)?;
+                    } else {
+                        self.expr_arg(arg)?;
+                    }
                 }
                 let index = self.const_str(method.as_bytes());
                 self.emit(Op::CallMethod {
@@ -1382,11 +1715,19 @@ impl FnCompiler {
                 method,
                 args,
             } => {
-                for arg in args {
-                    self.expr_arg(arg)?;
+                let class_name = self.qualify_class(class);
+                let signature = self
+                    .signatures
+                    .get(&format!("{}::{}", class_name, method).to_ascii_lowercase())
+                    .cloned();
+                for (arg_index, arg) in args.iter().enumerate() {
+                    if argument_is_by_ref(signature.as_ref(), arg_index) {
+                        self.expr_arg_ref(arg)?;
+                    } else {
+                        self.expr_arg(arg)?;
+                    }
                 }
-                let class = self.qualify_class(class);
-                let class = self.const_str(class.as_bytes());
+                let class = self.const_str(class_name.as_bytes());
                 let method = self.const_str(method.as_bytes());
                 self.emit(Op::CallStaticMethod {
                     class,
@@ -1533,27 +1874,9 @@ impl FnCompiler {
         match op {
             None => {
                 if let Expr::Reference(source) = value {
-                    let Expr::Var(source) = source.as_ref() else {
-                        return Err(CompileError::new(
-                            "references can only be taken of variables",
-                            self.line,
-                        ));
-                    };
-                    if source == "this" {
-                        return Err(CompileError::new("Cannot re-assign $this", self.line));
-                    }
-                    self.load_var_ref(source);
+                    self.load_ref_source(source)?;
                     self.emit(Op::Dup);
-                    let Expr::Var(target) = target else {
-                        return Err(CompileError::new(
-                            "reference assignment target must be a variable",
-                            self.line,
-                        ));
-                    };
-                    if target == "this" {
-                        return Err(CompileError::new("Cannot re-assign $this", self.line));
-                    }
-                    self.store_var_ref(target);
+                    self.store_ref_target(target)?;
                     return Ok(());
                 }
                 self.expr(value)?;

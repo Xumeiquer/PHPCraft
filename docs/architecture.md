@@ -75,10 +75,16 @@ enum Value {
   and `print_r()`.
 * References are `Value::Ref(Rc<RefCell<Value>>)`. Reads dereference the cell,
   ordinary stores write through it, and `$a = &$b` rebinds both variables to
-  the same cell. Function and method calls evaluate simple variable arguments
-  as reference candidates; by-value parameters copy the dereferenced value and
-  by-reference parameters bind the cell itself. Native calls preserve cells
-  only for the argument positions listed in `phpcraft_stdlib::by_ref_params`.
+  the same cell. Array elements and object/static properties can also hold
+  reference cells; assignment, nested writes and `unset()` update the shared
+  cell rather than replacing it. Function and method calls evaluate simple
+  variable arguments as reference candidates, and compile-time signatures
+  promote array-element/property arguments for by-reference parameters;
+  by-value parameters copy the dereferenced value and by-reference parameters
+  bind the cell itself. Native calls preserve cells only for the argument
+  positions listed in `phpcraft_stdlib::by_ref_params`. By-reference `foreach`
+  converts the subject’s elements/properties with `PrepareRefs`, and returns
+  preserve the cell only when the function carries `returns_ref`.
 
 Classes are compiled into `ClassDef` metadata (properties, constants and
 method entry points) next to the function table. The VM resolves inherited
@@ -155,12 +161,14 @@ writing), and `vendor/php-src` tracks branch `PHP-8.5`.
 ## Current limits
 
 Deliberately unimplemented (they produce explicit errors): attributes,
-interfaces, traits, enums, by-reference `foreach`, references to array
-elements and object properties, by-reference returns, `unset`, first-class
-callable syntax, named arguments and alternative control syntax. The
-implemented by-reference builtins are `sort`, `rsort`, `array_push`,
-`array_pop`, `array_shift` and `array_unshift`; `sort` flags are parsed but
-ignored. Namespace support covers ordinary and braced declarations,
+interfaces, traits, enums, references rooted inside object/static-property
+dimensions, reference destructuring in `list()`, first-class callable syntax,
+named arguments and alternative control syntax. The implemented
+by-reference builtins are `sort`, `rsort`, `asort`, `arsort`, `ksort`,
+`krsort`, `array_push`, `array_pop`, `array_shift` and `array_unshift`.
+`sort()` flags cover `SORT_REGULAR`, `SORT_NUMERIC`, `SORT_STRING`,
+`SORT_LOCALE_STRING` and `SORT_FLAG_CASE`; `SORT_NATURAL` and unknown flags
+raise explicit errors. Namespace support covers ordinary and braced declarations,
 per-kind `use` imports and aliases; group `use`, namespaced `const`
 declarations and autoloading are not implemented. Includes search the calling
 script's directory and then the current directory; `include_path` is ignored

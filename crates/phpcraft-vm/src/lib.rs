@@ -5,6 +5,7 @@
 //! a call frame with slots, and a value stack. Function calls recurse in Rust
 //! (Zend also uses the C stack), with an explicit nesting guard.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -150,6 +151,9 @@ impl Vm {
         constants.insert("SORT_REGULAR".to_string(), Value::Int(0));
         constants.insert("SORT_NUMERIC".to_string(), Value::Int(1));
         constants.insert("SORT_STRING".to_string(), Value::Int(2));
+        constants.insert("SORT_LOCALE_STRING".to_string(), Value::Int(5));
+        constants.insert("SORT_NATURAL".to_string(), Value::Int(6));
+        constants.insert("SORT_FLAG_CASE".to_string(), Value::Int(8));
         constants.insert("COUNT_NORMAL".to_string(), Value::Int(0));
         constants.insert("COUNT_RECURSIVE".to_string(), Value::Int(1));
 
@@ -389,17 +393,21 @@ impl Vm {
         let mut arg_index = 0usize;
         for (param_index, param) in function.params.iter().enumerate() {
             if param.variadic {
-                let rest: Vec<Value> = args
-                    .iter()
-                    .skip(arg_index)
-                    .map(|value| {
-                        if param.by_ref {
-                            value.clone()
-                        } else {
-                            value.deref()
+                let mut rest = Vec::new();
+                for (offset, value) in args.iter().skip(arg_index).enumerate() {
+                    if param.by_ref {
+                        if value.as_ref_cell().is_none() {
+                            return Err(PhpError::fatal(format!(
+                                "{}(): Argument #{} could not be passed by reference",
+                                function.display_name(),
+                                arg_index + offset + 1
+                            )));
                         }
-                    })
-                    .collect();
+                        rest.push(value.clone());
+                    } else {
+                        rest.push(value.deref());
+                    }
+                }
                 frame.set(param.slot, Value::array(PhpArray::from(rest)));
                 break;
             }
@@ -434,7 +442,11 @@ impl Vm {
         self.depth += 1;
         let result = self.run_chunk(&function.chunk, &function.slot_names, &mut frame);
         self.depth -= 1;
-        result
+        match result {
+            Ok(value) if function.returns_ref => Ok(value),
+            Ok(value) => Ok(value.deref()),
+            Err(err) => Err(err),
+        }
     }
 
     /// Invoke a callable value: a closure or a function name.
@@ -848,12 +860,14 @@ impl Vm {
     }
 
     fn assign_property(&mut self, object: Value, name: &str, value: Value) -> PhpResult<()> {
-        match object {
+        match object.deref() {
             Value::Object(object) => {
-                object
-                    .borrow_mut()
-                    .properties
-                    .insert_str(name, value.deref());
+                let mut object = object.borrow_mut();
+                if let Some(Value::Ref(cell)) = object.properties.get_str(name) {
+                    *cell.borrow_mut() = value.deref();
+                } else {
+                    object.properties.insert_str(name, value.deref());
+                }
                 Ok(())
             }
             other => Err(PhpError::type_error(format!(
@@ -892,10 +906,15 @@ impl Vm {
         let owner = self
             .static_property_owner(class, name)
             .unwrap_or_else(|| Self::normalize_class(class));
-        self.static_properties
+        let properties = self
+            .static_properties
             .entry(owner.to_ascii_lowercase())
-            .or_default()
-            .insert_str(name, value.deref());
+            .or_default();
+        if let Some(Value::Ref(cell)) = properties.get_str(name) {
+            *cell.borrow_mut() = value.deref();
+        } else {
+            properties.insert_str(name, value.deref());
+        }
         Ok(())
     }
 
@@ -1075,6 +1094,11 @@ impl Vm {
                     }
                     Op::StoreVarRef(slot) => {
                         let value = stack.pop().unwrap_or(Value::Null);
+                        if value.as_ref_cell().is_none() {
+                            return Err(PhpError::fatal(
+                                "Only variables should be assigned by reference",
+                            ));
+                        }
                         frame.set(*slot, value);
                     }
                     Op::LoadGlobal(index) => {
@@ -1140,6 +1164,11 @@ impl Vm {
                     Op::StoreGlobalRef(index) => {
                         let name = String::from_utf8_lossy(chunk.const_str(*index)).into_owned();
                         let value = stack.pop().unwrap_or(Value::Null);
+                        if value.as_ref_cell().is_none() {
+                            return Err(PhpError::fatal(
+                                "Only variables should be assigned by reference",
+                            ));
+                        }
                         self.globals.insert(Key::from_str(&name), value);
                     }
                     Op::LoadTmp(slot) => stack.push(frame.get(*slot).clone()),
@@ -1285,6 +1314,86 @@ impl Vm {
                         self.insert_path(&mut array, &keys, value.deref())?;
                         stack.push(Value::array(array));
                     }
+                    Op::MakeDimRef { modes } => {
+                        let mut keys: Vec<Option<Value>> = Vec::with_capacity(modes.len());
+                        for mode in modes.iter().rev() {
+                            match mode {
+                                DimMode::Key => {
+                                    keys.push(Some(stack.pop().unwrap_or(Value::Null).deref()))
+                                }
+                                DimMode::Append => keys.push(None),
+                            }
+                        }
+                        keys.reverse();
+                        let base = stack.pop().unwrap_or(Value::Null).deref();
+                        let mut array = match base {
+                            Value::Array(array) => (*array).clone(),
+                            Value::Null => PhpArray::new(),
+                            other => {
+                                self.warn(format!(
+                                    "Cannot use a value of type {} as an array",
+                                    other.debug_type_name()
+                                ));
+                                PhpArray::new()
+                            }
+                        };
+                        let cell = self.make_dim_ref(&mut array, &keys)?;
+                        stack.push(cell);
+                        stack.push(Value::array(array));
+                    }
+                    Op::SetDimRef { modes } => {
+                        let mut keys: Vec<Option<Value>> = Vec::with_capacity(modes.len());
+                        for mode in modes.iter().rev() {
+                            match mode {
+                                DimMode::Key => {
+                                    keys.push(Some(stack.pop().unwrap_or(Value::Null).deref()))
+                                }
+                                DimMode::Append => keys.push(None),
+                            }
+                        }
+                        keys.reverse();
+                        let base = stack.pop().unwrap_or(Value::Null).deref();
+                        let cell = stack.pop().unwrap_or(Value::Null);
+                        let mut array = match base {
+                            Value::Array(array) => (*array).clone(),
+                            Value::Null => PhpArray::new(),
+                            other => {
+                                self.warn(format!(
+                                    "Cannot use a value of type {} as an array",
+                                    other.debug_type_name()
+                                ));
+                                PhpArray::new()
+                            }
+                        };
+                        self.set_dim_ref(&mut array, &keys, cell)?;
+                        stack.push(Value::array(array));
+                    }
+                    Op::UnsetDim { modes } => {
+                        let mut keys: Vec<Option<Value>> = Vec::with_capacity(modes.len());
+                        for mode in modes.iter().rev() {
+                            match mode {
+                                DimMode::Key => {
+                                    keys.push(Some(stack.pop().unwrap_or(Value::Null).deref()))
+                                }
+                                DimMode::Append => keys.push(None),
+                            }
+                        }
+                        keys.reverse();
+                        let base = stack.pop().unwrap_or(Value::Null).deref();
+                        let mut array = match base {
+                            Value::Array(array) => (*array).clone(),
+                            Value::Null => PhpArray::new(),
+                            other => {
+                                self.warn(format!(
+                                    "Cannot use a value of type {} as an array",
+                                    other.debug_type_name()
+                                ));
+                                PhpArray::new()
+                            }
+                        };
+                        self.unset_dim(&mut array, &keys)?;
+                        stack.push(Value::array(array));
+                    }
                     Op::Call {
                         name,
                         argc,
@@ -1404,6 +1513,18 @@ impl Vm {
                             stack.push(value);
                         }
                     }
+                    Op::MakePropertyRef { name } => {
+                        let object = stack.pop().unwrap_or(Value::Null);
+                        let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        let cell = self.make_property_ref(object, &name)?;
+                        stack.push(cell);
+                    }
+                    Op::SetPropertyRef { name } => {
+                        let object = stack.pop().unwrap_or(Value::Null);
+                        let cell = stack.pop().unwrap_or(Value::Null);
+                        let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        self.set_property_ref(object, &name, cell)?;
+                    }
                     Op::CallMethod { method, argc } => {
                         let argc = *argc as usize;
                         let args = if argc == 0 {
@@ -1445,6 +1566,19 @@ impl Vm {
                         if *keep {
                             stack.push(value);
                         }
+                    }
+                    Op::MakeStaticPropertyRef { class, name } => {
+                        let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
+                        let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        let class = self.resolve_class_marker(&class, frame)?;
+                        stack.push(self.make_static_property_ref(&class, &name));
+                    }
+                    Op::SetStaticPropertyRef { class, name } => {
+                        let cell = stack.pop().unwrap_or(Value::Null);
+                        let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
+                        let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        let class = self.resolve_class_marker(&class, frame)?;
+                        self.set_static_property_ref(&class, &name, cell)?;
                     }
                     Op::ClassConstant { class, name } => {
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
@@ -1489,6 +1623,10 @@ impl Vm {
                             return Err(self.throw_value(value));
                         }
                     }
+                    Op::PrepareRefs => {
+                        let subject = stack.pop().unwrap_or(Value::Null);
+                        stack.push(self.prepare_refs(subject));
+                    }
                     Op::IterInit { iter } => {
                         let subject = stack.pop().unwrap_or(Value::Null);
                         let array = match subject {
@@ -1508,6 +1646,7 @@ impl Vm {
                         iter,
                         key,
                         value,
+                        by_ref,
                         end,
                     } => {
                         let next = match frame.iters.get_mut(iter) {
@@ -1524,7 +1663,14 @@ impl Vm {
                         };
                         match next {
                             Some((entry_key, entry_value)) => {
-                                frame.set(*value, entry_value);
+                                frame.set(
+                                    *value,
+                                    if *by_ref {
+                                        entry_value
+                                    } else {
+                                        entry_value.deref()
+                                    },
+                                );
                                 if let Some(key_slot) = key {
                                     let key_value = match entry_key {
                                         Key::Int(number) => Value::Int(number),
@@ -1538,6 +1684,38 @@ impl Vm {
                                 ip = *end;
                             }
                         }
+                    }
+                    Op::UnsetVar(slot) => {
+                        let index = *slot as usize;
+                        if index < frame.slots.len() {
+                            frame.slots[index] = Value::Null;
+                            frame.defined[index] = false;
+                        }
+                    }
+                    Op::UnsetGlobal(index) => {
+                        let name = String::from_utf8_lossy(chunk.const_str(*index)).into_owned();
+                        self.globals.remove(&Key::from_str(&name));
+                    }
+                    Op::UnsetProperty { name } => {
+                        let object = stack.pop().unwrap_or(Value::Null);
+                        let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        if let Value::Object(object) = object.deref() {
+                            object.borrow_mut().properties.remove(&Key::from_str(&name));
+                        } else {
+                            self.warn(format!(
+                                "Attempt to unset property \"{}\" on non-object",
+                                name
+                            ));
+                        }
+                    }
+                    Op::UnsetStaticProperty { class, name } => {
+                        let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
+                        let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        let class = self.resolve_class_marker(&class, frame)?;
+                        return Err(PhpError::fatal(format!(
+                            "Attempt to unset static property {}::${}",
+                            class, name
+                        )));
                     }
                     Op::Return => {
                         return Ok(Control::Return(stack.pop().unwrap_or(Value::Null)));
@@ -1633,6 +1811,197 @@ impl Vm {
         }
     }
 
+    fn prepare_refs(&mut self, subject: Value) -> Value {
+        match subject.deref() {
+            Value::Array(array) => {
+                let mut prepared = PhpArray::with_capacity(array.len());
+                for (key, value) in array.iter() {
+                    prepared.insert(key.clone(), into_ref(value.clone()));
+                }
+                Value::array(prepared)
+            }
+            Value::Object(object) => {
+                let entries: Vec<(Key, Value)> = object
+                    .borrow()
+                    .properties
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                {
+                    let mut object_ref = object.borrow_mut();
+                    for (key, value) in entries {
+                        object_ref.properties.insert(key, into_ref(value));
+                    }
+                }
+                Value::Object(object)
+            }
+            other => other,
+        }
+    }
+
+    fn child_array(&mut self, value: Value) -> PhpArray {
+        match value.deref() {
+            Value::Array(child) => (*child).clone(),
+            Value::Null => PhpArray::new(),
+            _ => {
+                self.warn("Cannot use a scalar value as an array");
+                PhpArray::new()
+            }
+        }
+    }
+
+    fn dim_child(&mut self, array: &PhpArray, key: &Key) -> (PhpArray, Option<Rc<RefCell<Value>>>) {
+        match array.get(key).cloned() {
+            Some(Value::Ref(cell)) => {
+                let value = cell.borrow().deref();
+                (self.child_array(value), Some(cell))
+            }
+            Some(value) => (self.child_array(value), None),
+            None => (PhpArray::new(), None),
+        }
+    }
+
+    fn make_dim_ref(&mut self, array: &mut PhpArray, keys: &[Option<Value>]) -> PhpResult<Value> {
+        let (first, rest) = keys.split_first().expect("at least one key");
+        let key = match first {
+            Some(key_value) => key_from_value(key_value)?,
+            None => Key::Int(array.next_index()),
+        };
+        if rest.is_empty() {
+            let cell = match array.get(&key) {
+                Some(Value::Ref(cell)) => cell.clone(),
+                Some(value) => Rc::new(RefCell::new(value.deref())),
+                None => Rc::new(RefCell::new(Value::Null)),
+            };
+            array.insert(key, Value::Ref(cell.clone()));
+            return Ok(Value::Ref(cell));
+        }
+        let (mut child, target) = self.dim_child(array, &key);
+        let cell = self.make_dim_ref(&mut child, rest)?;
+        if let Some(target) = target {
+            *target.borrow_mut() = Value::array(child);
+        } else {
+            array.insert(key, Value::array(child));
+        }
+        Ok(cell)
+    }
+
+    fn set_dim_ref(
+        &mut self,
+        array: &mut PhpArray,
+        keys: &[Option<Value>],
+        cell: Value,
+    ) -> PhpResult<()> {
+        if cell.as_ref_cell().is_none() {
+            return Err(PhpError::fatal(
+                "Only variables should be assigned by reference",
+            ));
+        }
+        let (first, rest) = keys.split_first().expect("at least one key");
+        let key = match first {
+            Some(key_value) => key_from_value(key_value)?,
+            None => Key::Int(array.next_index()),
+        };
+        if rest.is_empty() {
+            array.insert(key, cell);
+            return Ok(());
+        }
+        let (mut child, target) = self.dim_child(array, &key);
+        self.set_dim_ref(&mut child, rest, cell)?;
+        if let Some(target) = target {
+            *target.borrow_mut() = Value::array(child);
+        } else {
+            array.insert(key, Value::array(child));
+        }
+        Ok(())
+    }
+
+    fn unset_dim(&mut self, array: &mut PhpArray, keys: &[Option<Value>]) -> PhpResult<()> {
+        let (first, rest) = keys.split_first().expect("at least one key");
+        let key = match first {
+            Some(key_value) => key_from_value(key_value)?,
+            None => Key::Int(array.next_index()),
+        };
+        if rest.is_empty() {
+            array.remove(&key);
+            return Ok(());
+        }
+        let (mut child, target) = self.dim_child(array, &key);
+        self.unset_dim(&mut child, rest)?;
+        if let Some(target) = target {
+            *target.borrow_mut() = Value::array(child);
+        } else {
+            array.insert(key, Value::array(child));
+        }
+        Ok(())
+    }
+
+    fn make_property_ref(&mut self, object: Value, name: &str) -> PhpResult<Value> {
+        let Value::Object(object) = object.deref() else {
+            return Err(PhpError::type_error(format!(
+                "Attempt to modify property \"{}\" on non-object",
+                name
+            )));
+        };
+        let mut object = object.borrow_mut();
+        let cell = match object.properties.get_str(name) {
+            Some(Value::Ref(cell)) => cell.clone(),
+            Some(value) => Rc::new(RefCell::new(value.deref())),
+            None => Rc::new(RefCell::new(Value::Null)),
+        };
+        object.properties.insert_str(name, Value::Ref(cell.clone()));
+        Ok(Value::Ref(cell))
+    }
+
+    fn set_property_ref(&mut self, object: Value, name: &str, cell: Value) -> PhpResult<()> {
+        if cell.as_ref_cell().is_none() {
+            return Err(PhpError::fatal(
+                "Only variables should be assigned by reference",
+            ));
+        }
+        let Value::Object(object) = object.deref() else {
+            return Err(PhpError::type_error(format!(
+                "Attempt to assign property \"{}\" on non-object",
+                name
+            )));
+        };
+        object.borrow_mut().properties.insert_str(name, cell);
+        Ok(())
+    }
+
+    fn make_static_property_ref(&mut self, class: &str, name: &str) -> Value {
+        let owner = self
+            .static_property_owner(class, name)
+            .unwrap_or_else(|| Self::normalize_class(class));
+        let properties = self
+            .static_properties
+            .entry(owner.to_ascii_lowercase())
+            .or_default();
+        let cell = match properties.get_str(name) {
+            Some(Value::Ref(cell)) => cell.clone(),
+            Some(value) => Rc::new(RefCell::new(value.deref())),
+            None => Rc::new(RefCell::new(Value::Null)),
+        };
+        properties.insert_str(name, Value::Ref(cell.clone()));
+        Value::Ref(cell)
+    }
+
+    fn set_static_property_ref(&mut self, class: &str, name: &str, cell: Value) -> PhpResult<()> {
+        if cell.as_ref_cell().is_none() {
+            return Err(PhpError::fatal(
+                "Only variables should be assigned by reference",
+            ));
+        }
+        let owner = self
+            .static_property_owner(class, name)
+            .unwrap_or_else(|| Self::normalize_class(class));
+        self.static_properties
+            .entry(owner.to_ascii_lowercase())
+            .or_default()
+            .insert_str(name, cell);
+        Ok(())
+    }
+
     fn insert_path(
         &mut self,
         array: &mut PhpArray,
@@ -1645,19 +2014,20 @@ impl Vm {
             None => Key::Int(array.next_index()),
         };
         if rest.is_empty() {
-            array.insert(key, value);
+            if let Some(Value::Ref(cell)) = array.get(&key) {
+                *cell.borrow_mut() = value.deref();
+            } else {
+                array.insert(key, value.deref());
+            }
             return Ok(());
         }
-        let mut child = match array.get(&key) {
-            Some(Value::Array(child)) => (**child).clone(),
-            Some(_) => {
-                self.warn("Cannot use a scalar value as an array");
-                PhpArray::new()
-            }
-            None => PhpArray::new(),
-        };
+        let (mut child, target) = self.dim_child(array, &key);
         self.insert_path(&mut child, rest, value)?;
-        array.insert(key, Value::array(child));
+        if let Some(target) = target {
+            *target.borrow_mut() = Value::array(child);
+        } else {
+            array.insert(key, Value::array(child));
+        }
         Ok(())
     }
 
@@ -1929,6 +2299,14 @@ impl RuntimeHooks for Vm {
 }
 
 /// `increment_function()` from `Zend/zend_operators.c`.
+fn into_ref(value: Value) -> Value {
+    if matches!(value, Value::Ref(_)) {
+        value
+    } else {
+        Value::reference(value.deref())
+    }
+}
+
 fn increment_value(value: Value) -> Value {
     match value {
         Value::Int(number) => match number.checked_add(1) {
@@ -2258,6 +2636,67 @@ mod tests {
                 echo $a, "|", $b, "|", implode(",", $arr), "|", $popped, "|", $x;
             "#);
         assert_eq!(out, "3|3|1,2,3|4|5");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn advanced_references_unset_and_sorted_arrays() {
+        let (out, warnings) = run(r#"<?php
+                function &refAt(array &$values) { return $values[1]; }
+                function assignRef(&$target, $value) { $target = $value; }
+                function assignVariadic(&...$values) {
+                    foreach ($values as &$value) { $value += 1; }
+                    unset($value);
+                }
+
+                $values = [1, 2, 3];
+                $ref = &refAt($values);
+                $ref = 10;
+                assignRef($values[0], 20);
+                assignVariadic($values[0], $values[1]);
+                echo $values[0], "|", $values[1], "|", $ref, "|";
+
+                $nested = [["x" => 1]];
+                $nestedRef = &$nested[0]["x"];
+                $nestedRef = 7;
+                $nested[0]["x"] = 8;
+                echo $nestedRef, "|";
+
+                class RefHolder {
+                    public $value = 1;
+                    public static $shared = 2;
+                    public function &getValue() { return $this->value; }
+                    public static function &getShared() { return self::$shared; }
+                }
+                $holder = new RefHolder();
+                $property = &$holder->value;
+                $property = 30;
+                $method = &$holder->getValue();
+                $method = 31;
+                $static = &RefHolder::getShared();
+                $static = 32;
+                echo $holder->value, "|", RefHolder::$shared, "|";
+
+                $loop = [1, 2];
+                foreach ($loop as &$item) { $item *= 3; }
+                unset($item);
+                echo implode(",", $loop), "|";
+
+                $remove = [1, 2, 3];
+                $removedRef = &$remove[1];
+                unset($remove[1]);
+                $remove[1] = 9;
+                echo count($remove), "|", $removedRef, "|", implode(",", $remove), "|";
+
+                $numbers = ["10", 2, "1"];
+                sort($numbers, SORT_NUMERIC);
+                $assoc = ["b" => 2, "a" => 3, "c" => 1];
+                asort($assoc);
+                ksort($assoc);
+                echo implode(",", $numbers), "|";
+                foreach ($assoc as $key => $value) { echo $key, $value; }
+            "#);
+        assert_eq!(out, "21|11|11|8|31|32|3,6|3|2|1,3,9|1,2,10|a3b2c1");
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 

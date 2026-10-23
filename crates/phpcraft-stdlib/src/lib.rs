@@ -88,6 +88,10 @@ static REGISTRY: &[(&str, NativeFn)] = &[
     ("array_map", array_map),
     ("sort", sort),
     ("rsort", rsort),
+    ("asort", asort),
+    ("arsort", arsort),
+    ("ksort", ksort),
+    ("krsort", krsort),
     ("array_push", array_push),
     ("array_pop", array_pop),
     ("array_shift", array_shift),
@@ -173,7 +177,8 @@ pub fn names() -> impl Iterator<Item = &'static str> {
 /// argument before the call.
 pub fn by_ref_params(name: &str) -> &'static [usize] {
     match name.to_ascii_lowercase().as_str() {
-        "sort" | "rsort" | "array_push" | "array_pop" | "array_shift" | "array_unshift" => &[0],
+        "sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort" | "array_push" | "array_pop"
+        | "array_shift" | "array_unshift" => &[0],
         _ => &[],
     }
 }
@@ -1939,21 +1944,134 @@ fn ref_array(
     }
 }
 
+fn sort_flags(fname: &str, args: &[Value]) -> PhpResult<i64> {
+    let flags = if args.len() > 1 {
+        as_int(args, 1, fname, "flags")?
+    } else {
+        0
+    };
+    let base = flags & !8;
+    if !matches!(base, 0 | 1 | 2 | 5) {
+        return Err(PhpError::fatal(format!(
+            "{fname}(): sort flags {flags} are not supported"
+        )));
+    }
+    Ok(flags)
+}
+
+fn numeric_sort_key(value: &Value) -> Numeric {
+    match value.deref().to_number() {
+        ToNumber::Num(number) | ToNumber::Leading(number) => number,
+        ToNumber::Invalid => Numeric::Int(0),
+    }
+}
+
+fn lower_ascii(bytes: &[u8]) -> Vec<u8> {
+    bytes.iter().map(u8::to_ascii_lowercase).collect()
+}
+
+fn compare_sort_values(a: &Value, b: &Value, flags: i64) -> Ordering {
+    let base = flags & !8;
+    let case_insensitive = flags & 8 != 0;
+    match base {
+        1 => {
+            let (left, right) = (numeric_sort_key(a), numeric_sort_key(b));
+            match (left, right) {
+                (Numeric::Int(x), Numeric::Int(y)) => x.cmp(&y),
+                _ => left
+                    .to_float()
+                    .partial_cmp(&right.to_float())
+                    .unwrap_or(Ordering::Equal),
+            }
+        }
+        2 | 5 => {
+            let (left, right) = (a.deref().to_bytes(), b.deref().to_bytes());
+            if case_insensitive {
+                lower_ascii(&left).cmp(&lower_ascii(&right))
+            } else {
+                left.cmp(&right)
+            }
+        }
+        _ => compare(a, b).unwrap_or(Ordering::Equal),
+    }
+}
+
+fn key_as_value(key: &Key) -> Value {
+    match key {
+        Key::Int(value) => Value::Int(*value),
+        Key::Str(value) => Value::Str(value.clone()),
+    }
+}
+
 fn sort(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("sort", &args, 1, Some(2))?;
+    let flags = sort_flags("sort", &args)?;
     let (cell, array) = ref_array(&args, 0, "sort", "array")?;
     let mut values = array.values();
-    values.sort_by(|a, b| compare(a, b).unwrap_or(Ordering::Equal));
+    values.sort_by(|a, b| compare_sort_values(a, b, flags));
     *cell.borrow_mut() = Value::array(PhpArray::from(values));
     Ok(Value::Bool(true))
 }
 
 fn rsort(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("rsort", &args, 1, Some(2))?;
+    let flags = sort_flags("rsort", &args)?;
     let (cell, array) = ref_array(&args, 0, "rsort", "array")?;
     let mut values = array.values();
-    values.sort_by(|a, b| compare(b, a).unwrap_or(Ordering::Equal));
+    values.sort_by(|a, b| compare_sort_values(b, a, flags));
     *cell.borrow_mut() = Value::array(PhpArray::from(values));
+    Ok(Value::Bool(true))
+}
+
+fn asort(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("asort", &args, 1, Some(2))?;
+    let flags = sort_flags("asort", &args)?;
+    let (cell, array) = ref_array(&args, 0, "asort", "array")?;
+    let mut pairs: Vec<(Key, Value)> = array
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    pairs.sort_by(|(_, a), (_, b)| compare_sort_values(a, b, flags));
+    *cell.borrow_mut() = Value::array(PhpArray::from_pairs(pairs));
+    Ok(Value::Bool(true))
+}
+
+fn arsort(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("arsort", &args, 1, Some(2))?;
+    let flags = sort_flags("arsort", &args)?;
+    let (cell, array) = ref_array(&args, 0, "arsort", "array")?;
+    let mut pairs: Vec<(Key, Value)> = array
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    pairs.sort_by(|(_, a), (_, b)| compare_sort_values(b, a, flags));
+    *cell.borrow_mut() = Value::array(PhpArray::from_pairs(pairs));
+    Ok(Value::Bool(true))
+}
+
+fn ksort(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("ksort", &args, 1, Some(2))?;
+    let flags = sort_flags("ksort", &args)?;
+    let (cell, array) = ref_array(&args, 0, "ksort", "array")?;
+    let mut pairs: Vec<(Key, Value)> = array
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    pairs.sort_by(|(a, _), (b, _)| compare_sort_values(&key_as_value(a), &key_as_value(b), flags));
+    *cell.borrow_mut() = Value::array(PhpArray::from_pairs(pairs));
+    Ok(Value::Bool(true))
+}
+
+fn krsort(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("krsort", &args, 1, Some(2))?;
+    let flags = sort_flags("krsort", &args)?;
+    let (cell, array) = ref_array(&args, 0, "krsort", "array")?;
+    let mut pairs: Vec<(Key, Value)> = array
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    pairs.sort_by(|(a, _), (b, _)| compare_sort_values(&key_as_value(b), &key_as_value(a), flags));
+    *cell.borrow_mut() = Value::array(PhpArray::from_pairs(pairs));
     Ok(Value::Bool(true))
 }
 
@@ -2605,13 +2723,35 @@ fn is_callable(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Valu
 fn call_user_func(hooks: &mut dyn RuntimeHooks, mut args: Vec<Value>) -> PhpResult<Value> {
     arity("call_user_func", &args, 1, None)?;
     let callable = args.remove(0);
+    // Dynamic calls cannot know the callee signature. Give each value a
+    // temporary reference cell so by-reference parameters can still bind,
+    // matching PHP's "value given" warning path without changing the caller.
+    let args = args
+        .into_iter()
+        .map(|value| {
+            if value.as_ref_cell().is_some() {
+                value
+            } else {
+                Value::reference(value.deref())
+            }
+        })
+        .collect();
     hooks.call_value(&callable, args)
 }
 
 fn call_user_func_array(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("call_user_func_array", &args, 2, Some(2))?;
     let array = as_array(&args, 1, "call_user_func_array", "args")?;
-    let values = array.iter().map(|(_, value)| value.clone()).collect();
+    let values = array
+        .iter()
+        .map(|(_, value)| {
+            if value.as_ref_cell().is_some() {
+                value.clone()
+            } else {
+                Value::reference(value.deref())
+            }
+        })
+        .collect();
     hooks.call_value(&args[0], values)
 }
 
@@ -2625,10 +2765,36 @@ fn function_exists(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<
 
 // ------------------------------------------------------------------- output
 
-fn dump_value(value: &Value, depth: usize, out: &mut Vec<u8>) {
+fn dump_container_id(value: &Value) -> Option<usize> {
+    match value {
+        Value::Array(array) => Some(Rc::as_ptr(array) as usize),
+        Value::Object(object) => Some(Rc::as_ptr(object) as usize),
+        _ => None,
+    }
+}
+
+fn dump_value(
+    value: &Value,
+    depth: usize,
+    mark_ref: bool,
+    active: &mut HashSet<usize>,
+    out: &mut Vec<u8>,
+) {
+    let is_ref = mark_ref && matches!(value, Value::Ref(_));
     let deref = value.deref();
     let value = &deref;
+    let container = dump_container_id(value);
+    if let Some(id) = container {
+        if !active.insert(id) {
+            out.extend(std::iter::repeat_n(b' ', depth * 2));
+            out.extend_from_slice(b"*RECURSION*\n");
+            return;
+        }
+    }
     out.extend(std::iter::repeat_n(b' ', depth * 2));
+    if is_ref {
+        out.push(b'&');
+    }
     match value {
         Value::Null => out.extend_from_slice(b"NULL\n"),
         Value::Bool(true) => out.extend_from_slice(b"bool(true)\n"),
@@ -2656,7 +2822,7 @@ fn dump_value(value: &Value, depth: usize, out: &mut Vec<u8>) {
                         out.extend_from_slice(b"\"]=>\n");
                     }
                 }
-                dump_value(item, depth + 1, out);
+                dump_value(item, depth + 1, true, active, out);
             }
             out.extend(std::iter::repeat_n(b' ', depth * 2));
             out.extend_from_slice(b"}\n");
@@ -2694,7 +2860,7 @@ fn dump_value(value: &Value, depth: usize, out: &mut Vec<u8>) {
                         out.extend_from_slice(b"]=>\n");
                     }
                 }
-                dump_value(item, depth + 1, out);
+                dump_value(item, depth + 1, true, active, out);
             }
             out.extend(std::iter::repeat_n(b' ', depth * 2));
             out.extend_from_slice(b"}\n");
@@ -2709,13 +2875,31 @@ fn dump_value(value: &Value, depth: usize, out: &mut Vec<u8>) {
             let property_indent = (depth + 1) * 2;
             out.extend(std::iter::repeat_n(b' ', property_indent));
             out.extend_from_slice(b"[\"name\"]=>\n");
-            dump_value(&Value::from_str_lit(&closure.name), depth + 1, out);
+            dump_value(
+                &Value::from_str_lit(&closure.name),
+                depth + 1,
+                false,
+                active,
+                out,
+            );
             out.extend(std::iter::repeat_n(b' ', property_indent));
             out.extend_from_slice(b"[\"file\"]=>\n");
-            dump_value(&Value::from_str_lit(&closure.file), depth + 1, out);
+            dump_value(
+                &Value::from_str_lit(&closure.file),
+                depth + 1,
+                false,
+                active,
+                out,
+            );
             out.extend(std::iter::repeat_n(b' ', property_indent));
             out.extend_from_slice(b"[\"line\"]=>\n");
-            dump_value(&Value::Int(i64::from(closure.line)), depth + 1, out);
+            dump_value(
+                &Value::Int(i64::from(closure.line)),
+                depth + 1,
+                false,
+                active,
+                out,
+            );
             if !closure.captures.is_empty() {
                 out.extend(std::iter::repeat_n(b' ', property_indent));
                 out.extend_from_slice(b"[\"static\"]=>\n");
@@ -2723,7 +2907,7 @@ fn dump_value(value: &Value, depth: usize, out: &mut Vec<u8>) {
                 for (name, value) in closure.capture_names.iter().zip(closure.captures.iter()) {
                     captured.insert(Key::from_str(name), value.clone());
                 }
-                dump_value(&Value::array(captured), depth + 1, out);
+                dump_value(&Value::array(captured), depth + 1, false, active, out);
             }
             if !closure.parameters.is_empty() {
                 out.extend(std::iter::repeat_n(b' ', property_indent));
@@ -2739,25 +2923,34 @@ fn dump_value(value: &Value, depth: usize, out: &mut Vec<u8>) {
                         }),
                     );
                 }
-                dump_value(&Value::array(parameters), depth + 1, out);
+                dump_value(&Value::array(parameters), depth + 1, false, active, out);
             }
             out.extend(std::iter::repeat_n(b' ', depth * 2));
             out.extend_from_slice(b"}\n");
         }
         Value::Ref(_) => unreachable!("deref removes reference cells"),
     }
+    if let Some(id) = container {
+        active.remove(&id);
+    }
 }
 
 fn var_dump(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     let mut out = Vec::new();
     for value in &args {
-        dump_value(value, 0, &mut out);
+        let mut active = HashSet::new();
+        dump_value(value, 0, false, &mut active, &mut out);
     }
     hooks.write(&out);
     Ok(Value::Null)
 }
 
-fn print_array_body(array: &PhpArray, level: usize, out: &mut Vec<u8>) {
+fn print_array_body(
+    array: &PhpArray,
+    level: usize,
+    active: &mut HashSet<usize>,
+    out: &mut Vec<u8>,
+) {
     out.extend(std::iter::repeat_n(b' ', level * 4));
     out.extend_from_slice(b"(\n");
     for (key, value) in array.iter() {
@@ -2765,19 +2958,20 @@ fn print_array_body(array: &PhpArray, level: usize, out: &mut Vec<u8>) {
         out.push(b'[');
         out.extend_from_slice(&key.as_display());
         out.extend_from_slice(b"] => ");
-        match value {
+        let deref = value.deref();
+        match &deref {
             Value::Array(child) => {
-                print_array(child, level + 2, out);
+                print_array(child, level + 2, active, out);
                 // Nested arrays already end with a newline; PHP leaves a blank
                 // line before the next element.
                 out.push(b'\n');
             }
             Value::Closure(child) => {
-                print_closure(child, level + 2, out);
+                print_closure(child, level + 2, active, out);
                 out.push(b'\n');
             }
             Value::Object(child) => {
-                print_object(child, level + 2, out);
+                print_object(child, level + 2, active, out);
                 out.push(b'\n');
             }
             Value::Null => out.push(b'\n'),
@@ -2796,12 +2990,28 @@ fn print_array_body(array: &PhpArray, level: usize, out: &mut Vec<u8>) {
     out.extend_from_slice(b")\n");
 }
 
-fn print_array(array: &PhpArray, level: usize, out: &mut Vec<u8>) {
+fn print_array(array: &PhpArray, level: usize, active: &mut HashSet<usize>, out: &mut Vec<u8>) {
+    let id = array as *const PhpArray as usize;
+    if !active.insert(id) {
+        out.extend_from_slice(b"*RECURSION*\n");
+        return;
+    }
     out.extend_from_slice(b"Array\n");
-    print_array_body(array, level, out);
+    print_array_body(array, level, active, out);
+    active.remove(&id);
 }
 
-fn print_object(object: &std::cell::RefCell<PhpObject>, level: usize, out: &mut Vec<u8>) {
+fn print_object(
+    object: &std::cell::RefCell<PhpObject>,
+    level: usize,
+    active: &mut HashSet<usize>,
+    out: &mut Vec<u8>,
+) {
+    let id = object as *const std::cell::RefCell<PhpObject> as usize;
+    if !active.insert(id) {
+        out.extend_from_slice(b"*RECURSION*\n");
+        return;
+    }
     let object = object.borrow();
     out.extend_from_slice(object.class_name.as_bytes());
     out.extend_from_slice(b" Object\n");
@@ -2824,17 +3034,18 @@ fn print_object(object: &std::cell::RefCell<PhpObject>, level: usize, out: &mut 
             }
         }
         out.extend_from_slice(b"] => ");
-        match value {
+        let deref = value.deref();
+        match &deref {
             Value::Array(child) => {
-                print_array(child, level + 2, out);
+                print_array(child, level + 2, active, out);
                 out.push(b'\n');
             }
             Value::Closure(child) => {
-                print_closure(child, level + 2, out);
+                print_closure(child, level + 2, active, out);
                 out.push(b'\n');
             }
             Value::Object(child) => {
-                print_object(child, level + 2, out);
+                print_object(child, level + 2, active, out);
                 out.push(b'\n');
             }
             Value::Null => out.push(b'\n'),
@@ -2851,9 +3062,16 @@ fn print_object(object: &std::cell::RefCell<PhpObject>, level: usize, out: &mut 
     }
     out.extend(std::iter::repeat_n(b' ', level * 4));
     out.extend_from_slice(b")\n");
+    drop(object);
+    active.remove(&id);
 }
 
-fn print_closure(closure: &PhpClosure, level: usize, out: &mut Vec<u8>) {
+fn print_closure(
+    closure: &PhpClosure,
+    level: usize,
+    active: &mut HashSet<usize>,
+    out: &mut Vec<u8>,
+) {
     out.extend_from_slice(b"Closure Object\n");
     let mut properties = PhpArray::new();
     properties.insert_str("name", Value::from_str_lit(&closure.name));
@@ -2880,16 +3098,17 @@ fn print_closure(closure: &PhpClosure, level: usize, out: &mut Vec<u8>) {
         }
         properties.insert_str("parameter", Value::array(parameters));
     }
-    print_array_body(&properties, level, out);
+    print_array_body(&properties, level, active, out);
 }
 
 fn print_r(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("print_r", &args, 1, Some(2))?;
     let mut out = Vec::new();
+    let mut active = HashSet::new();
     match &args[0] {
-        Value::Array(array) => print_array(array, 0, &mut out),
-        Value::Closure(closure) => print_closure(closure, 0, &mut out),
-        Value::Object(object) => print_object(object, 0, &mut out),
+        Value::Array(array) => print_array(array, 0, &mut active, &mut out),
+        Value::Closure(closure) => print_closure(closure, 0, &mut active, &mut out),
+        Value::Object(object) => print_object(object, 0, &mut active, &mut out),
         Value::Null => {}
         Value::Bool(true) => out.push(b'1'),
         Value::Bool(false) => {}
@@ -3192,6 +3411,20 @@ mod tests {
             other => panic!("expected array, got {other:?}"),
         }
         assert!(range(&mut hooks, vec![Value::Int(0), Value::Int(i64::MAX)]).is_err());
+    }
+
+    #[test]
+    fn var_dump_detects_reference_cycles() {
+        let cell = Rc::new(std::cell::RefCell::new(Value::Null));
+        let mut array = PhpArray::new();
+        array.push(Value::Ref(cell.clone()));
+        *cell.borrow_mut() = Value::array(array.clone());
+        let mut hooks = NullHooks { output: vec![] };
+        var_dump(&mut hooks, vec![Value::Ref(cell)]).unwrap();
+        assert_eq!(
+            String::from_utf8(hooks.output).unwrap(),
+            "array(1) {\n  [0]=>\n  *RECURSION*\n}\n"
+        );
     }
 
     #[test]

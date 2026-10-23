@@ -32,6 +32,7 @@ dependencies = [
  "phpcraft-bytecode",
  "phpcraft-parser",
  "phpcraft-runtime",
+ "phpcraft-stdlib",
 ]
 
 [[package]]

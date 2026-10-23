@@ -90,12 +90,17 @@ comparison semantics, `if`/`while`/`do`/`for`/`foreach`/`switch`, `match`
 expressions, functions, closures and arrow functions, dynamic calls, classes
 and objects (inheritance, static members, cloning and object identity),
 exceptions with `try`/`catch`/`finally`, namespaces and `use` imports, magic
-constants, `include`/`require` forms, references and by-reference parameters,
-closure captures and array builtins, `global`, `isset`/`empty`, casts,
+constants, `include`/`require` forms, references (variables, array elements,
+object properties, static properties, by-reference `foreach` and returns,
+by-reference variadics), by-reference parameters and closure captures,
+`unset`, closure captures and array builtins, `global`, `isset`/`empty`, casts,
 string/array/math/type builtins, and CLI behaviour matching `php`
 (stdout/stderr separation, exit status 255 on fatal errors).
 
-Not yet implemented: by-reference `foreach`, references to array elements and
-object properties, by-reference returns, `unset`, first-class callable syntax,
-named arguments and alternative control syntax. Unsupported constructs produce
-explicit parse or compile errors rather than silently misbehaving.
+Not yet implemented: references rooted inside object/static-property
+dimensions (for example taking `&$object->items[0]`), reference destructuring
+in `list()`, first-class callable syntax, named arguments and alternative
+control syntax. `sort()` supports `SORT_REGULAR`, `SORT_NUMERIC`,
+`SORT_STRING`, `SORT_LOCALE_STRING` and `SORT_FLAG_CASE`; `SORT_NATURAL` and
+unknown flags raise explicit errors. Unsupported constructs produce explicit
+parse or compile errors rather than silently misbehaving.

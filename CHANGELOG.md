@@ -30,9 +30,13 @@ The reference behaviour is PHP 8.5.4.
 - `include`, `include_once`, `require` and `require_once`, including return
   values, shared globals, included definitions and once-per-file tracking.
 - References: `$a = &$b`, by-reference parameters for functions, methods and
-  closures, by-reference closure captures, write-through assignment, and the
-  by-reference array builtins `sort`, `rsort`, `array_push`, `array_pop`,
-  `array_shift` and `array_unshift`.
+  closures, by-reference variadics, by-reference closure captures,
+  write-through assignment, references to array elements and object/static
+  properties, by-reference `foreach`, by-reference returns, `unset()`, and the
+  by-reference array builtins `sort`, `rsort`, `asort`, `arsort`, `ksort`,
+  `krsort`, `array_push`, `array_pop`, `array_shift` and `array_unshift`.
+  `sort()` flags include regular, numeric, string, locale-string and
+  case-insensitive string comparison.
 - Differential coverage for classes, inheritance, static members, object
   identity, cloning, exception handling, namespaces, includes and references.
 - Closures and arrow functions: `function (...) use (...)` captures, implicit
@@ -93,14 +97,15 @@ The reference behaviour is PHP 8.5.4.
 
 ### Tested
 
-- 52 Rust unit/integration tests.
-- 19 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
+- 55 Rust unit/integration tests.
+- 20 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
   status.
 
 ### Planned
 
-- By-reference `foreach`, references to array elements and object properties,
-  by-reference returns, `unset`, and the remaining by-reference builtins.
+- References rooted in object/static-property dimensions, reference
+  destructuring, and the remaining by-reference builtins (`shuffle`,
+  comparator-based sorts and `array_multisort`).
 - First-class callable syntax (`strlen(...)`) and callable arrays.
 - Group `use` declarations, `include_path`, class autoloading and namespaced
   constant declarations.

@@ -95,6 +95,19 @@ pub enum Op {
     AssignDim {
         modes: Vec<DimMode>,
     },
+    /// Create or reuse a reference cell at a dimension path.
+    MakeDimRef {
+        modes: Vec<DimMode>,
+    },
+    /// Bind the reference on the stack at a dimension path, leaving the
+    /// updated array on the stack for the caller to store back.
+    SetDimRef {
+        modes: Vec<DimMode>,
+    },
+    /// Remove a dimension path from the array on the stack.
+    UnsetDim {
+        modes: Vec<DimMode>,
+    },
 
     Call {
         name: u32,
@@ -140,6 +153,14 @@ pub enum Op {
         name: u32,
         keep: bool,
     },
+    /// Create or reuse a reference cell for an object property.
+    MakePropertyRef {
+        name: u32,
+    },
+    /// Bind the reference on the stack to an object property.
+    SetPropertyRef {
+        name: u32,
+    },
     /// Pop `argc` arguments and the receiver object, then call a method.
     CallMethod {
         method: u32,
@@ -160,6 +181,16 @@ pub enum Op {
         class: u32,
         name: u32,
         keep: bool,
+    },
+    /// Create or reuse a reference cell for a static property.
+    MakeStaticPropertyRef {
+        class: u32,
+        name: u32,
+    },
+    /// Bind the reference on the stack to a static property.
+    SetStaticPropertyRef {
+        class: u32,
+        name: u32,
     },
     ClassConstant {
         class: u32,
@@ -190,6 +221,9 @@ pub enum Op {
         slot: u32,
     },
 
+    /// Convert array elements or object properties into reference cells so a
+    /// by-reference `foreach` can bind them.
+    PrepareRefs,
     /// Pop the subject into a foreach iterator slot.
     IterInit {
         iter: u32,
@@ -199,7 +233,18 @@ pub enum Op {
         iter: u32,
         key: Option<u32>,
         value: u32,
+        by_ref: bool,
         end: usize,
+    },
+
+    UnsetVar(u32),
+    UnsetGlobal(u32),
+    UnsetProperty {
+        name: u32,
+    },
+    UnsetStaticProperty {
+        class: u32,
+        name: u32,
     },
 
     Return,
@@ -247,6 +292,8 @@ pub struct Function {
     pub capture_names: Vec<String>,
     /// Whether each capture is bound by reference, parallel to `capture_slots`.
     pub capture_refs: Vec<bool>,
+    /// `function &name()` returns a reference cell.
+    pub returns_ref: bool,
     pub chunk: Chunk,
     pub max_slots: u32,
     /// Variable name per slot (temps have `None`); used in diagnostics.

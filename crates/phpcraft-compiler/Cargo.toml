@@ -10,6 +10,7 @@ description = "Compiles the PHP AST into PHPCraft bytecode"
 phpcraft-ast.workspace = true
 phpcraft-bytecode.workspace = true
 phpcraft-runtime.workspace = true
+phpcraft-stdlib.workspace = true
 
 [dev-dependencies]
 phpcraft-parser.workspace = true

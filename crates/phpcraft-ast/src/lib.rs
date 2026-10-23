@@ -41,6 +41,7 @@ pub enum Stmt {
         subject: Expr,
         key: Option<Expr>,
         value: Expr,
+        by_ref: bool,
         body: Vec<Stmt>,
     },
     Switch {
@@ -67,6 +68,8 @@ pub enum Stmt {
     },
     /// `global $a, $b;`
     Global(Vec<String>),
+    /// `unset($a, $b[0], $object->property);`
+    Unset(Vec<Expr>),
     Return(Option<Expr>),
     Break(Option<u32>),
     Continue(Option<u32>),
@@ -85,6 +88,8 @@ pub struct FunctionDecl {
     pub name: String,
     pub params: Vec<Param>,
     pub body: Vec<Stmt>,
+    /// `function &name()` returns by reference.
+    pub returns_ref: bool,
     pub line: u32,
 }
 
@@ -152,6 +157,8 @@ pub struct MethodDecl {
     pub body: Vec<Stmt>,
     pub visibility: Visibility,
     pub static_: bool,
+    /// `function &name()` returns by reference.
+    pub returns_ref: bool,
     pub line: u32,
 }
 
@@ -196,6 +203,8 @@ pub struct ClosureDecl {
     /// capture free variables implicitly.
     pub captures: Vec<Capture>,
     pub body: ClosureBody,
+    /// `function &()` / `fn&()` returns by reference.
+    pub returns_ref: bool,
     pub line: u32,
 }
 

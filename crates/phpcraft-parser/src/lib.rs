@@ -261,7 +261,11 @@ impl Parser {
         }
         // A statement starting with `function` is a declaration only when a
         // name follows; otherwise it is a closure expression.
-        if self.check_keyword("function") && matches!(self.peek_at(1), Tok::Ident(_)) {
+        if self.check_keyword("function")
+            && (matches!(self.peek_at(1), Tok::Ident(_))
+                || (matches!(self.peek_at(1), Tok::BitAnd)
+                    && matches!(self.peek_at(2), Tok::Ident(_))))
+        {
             return Ok(Stmt::Function(self.parse_function()?));
         }
         if self.check_keyword("class")
@@ -316,6 +320,14 @@ impl Parser {
             self.end_statement()?;
             return Ok(Stmt::Global(names));
         }
+        if self.check_keyword("unset") {
+            self.advance();
+            self.expect(&Tok::LParen)?;
+            let targets = self.parse_expr_list_until(&Tok::RParen)?;
+            self.expect(&Tok::RParen)?;
+            self.end_statement()?;
+            return Ok(Stmt::Unset(targets));
+        }
 
         for keyword in [
             "interface",
@@ -323,7 +335,6 @@ impl Parser {
             "enum",
             "const",
             "static",
-            "unset",
             "declare",
             "abstract",
             "final",
@@ -503,18 +514,17 @@ impl Parser {
         if self.check_keyword("list") {
             return Err(self.unsupported("list() destructuring in foreach"));
         }
-        if matches!(self.peek(), Tok::BitAnd) {
-            return Err(self.unsupported("foreach by reference (&$value)"));
-        }
+        let first_by_ref = self.eat(&Tok::BitAnd);
         let first = self.parse_expr()?;
-        let (key, value) = if self.eat(&Tok::DoubleArrow) {
-            if matches!(self.peek(), Tok::BitAnd) {
-                return Err(self.unsupported("foreach by reference (&$value)"));
+        let (key, value, by_ref) = if self.eat(&Tok::DoubleArrow) {
+            if first_by_ref {
+                return Err(self.error("foreach key cannot be a reference"));
             }
+            let by_ref = self.eat(&Tok::BitAnd);
             let value = self.parse_expr()?;
-            (Some(first), value)
+            (Some(first), value, by_ref)
         } else {
-            (None, first)
+            (None, first, first_by_ref)
         };
         if let Some(key) = &key {
             if !is_valid_target(key) {
@@ -523,6 +533,9 @@ impl Parser {
         }
         if !is_valid_target(&value) {
             return Err(self.error("foreach value must be a variable"));
+        }
+        if by_ref && !matches!(value, Expr::Var(_)) {
+            return Err(self.unsupported("foreach by reference targets other than variables"));
         }
         self.expect(&Tok::RParen)?;
         if matches!(self.peek(), Tok::Colon) {
@@ -533,6 +546,7 @@ impl Parser {
             subject,
             key,
             value,
+            by_ref,
             body,
         })
     }
@@ -593,6 +607,7 @@ impl Parser {
         if matches!(self.peek(), Tok::LParen) {
             return Err(self.unsupported("anonymous functions (closures)"));
         }
+        let returns_ref = self.eat(&Tok::BitAnd);
         let name = self.expect_ident()?;
         self.expect(&Tok::LParen)?;
         let params = self.parse_params()?;
@@ -611,6 +626,7 @@ impl Parser {
             name,
             params,
             body,
+            returns_ref,
             line,
         })
     }
@@ -804,9 +820,7 @@ impl Parser {
     ) -> Result<MethodDecl, ParseError> {
         let line = self.line();
         self.expect_keyword("function")?;
-        if matches!(self.peek(), Tok::BitAnd) {
-            return Err(self.unsupported("by-reference method returns"));
-        }
+        let returns_ref = self.eat(&Tok::BitAnd);
         let name = self.expect_ident()?;
         self.expect(&Tok::LParen)?;
         let params = self.parse_params()?;
@@ -826,6 +840,7 @@ impl Parser {
             body,
             visibility,
             static_,
+            returns_ref,
             line,
         })
     }
@@ -891,9 +906,7 @@ impl Parser {
         } else {
             self.expect_keyword("function")?;
         }
-        if matches!(self.peek(), Tok::BitAnd) {
-            return Err(self.unsupported("by-reference closure returns"));
-        }
+        let returns_ref = self.eat(&Tok::BitAnd);
         self.expect(&Tok::LParen)?;
         let params = self.parse_params()?;
 
@@ -943,6 +956,7 @@ impl Parser {
             params,
             captures,
             body,
+            returns_ref,
             line,
         })))
     }
@@ -965,9 +979,6 @@ impl Parser {
             }
             let by_ref = self.eat(&Tok::BitAnd);
             let variadic = self.eat(&Tok::Ellipsis);
-            if by_ref && variadic {
-                return Err(self.unsupported("by-reference variadic parameters (&...$param)"));
-            }
             let name = self.expect_variable()?;
             let default = if self.eat(&Tok::Assign) {
                 Some(self.parse_expr()?)
@@ -1859,12 +1870,44 @@ mod tests {
     }
 
     #[test]
+    fn parses_advanced_reference_forms() {
+        let program = parse_file(
+            br#"<?php
+                function &collect(&...$values) {
+                    unset($values[0]);
+                    foreach ($values as $key => &$value) {
+                        $value = $key;
+                    }
+                    return $values;
+                }
+                unset($a[0], $b);
+            "#,
+        )
+        .unwrap();
+        match &program.stmts[0] {
+            Stmt::Function(decl) => {
+                assert!(decl.returns_ref);
+                assert!(decl.params[0].by_ref);
+                assert!(decl.params[0].variadic);
+                assert!(matches!(decl.body[0], Stmt::Unset(_)));
+                match &decl.body[1] {
+                    Stmt::Foreach { by_ref, value, .. } => {
+                        assert!(by_ref);
+                        assert!(matches!(value, Expr::Var(name) if name == "value"));
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+                assert!(matches!(decl.body[2], Stmt::Return(_)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(&program.stmts[1], Stmt::Unset(targets) if targets.len() == 2));
+    }
+
+    #[test]
     fn reports_unsupported_constructs() {
         let err = parse_file(b"<?php interface Foo {}").unwrap_err();
         assert!(err.message.contains("interface"));
-
-        let err = parse_file(b"<?php function f(&...$values) {}").unwrap_err();
-        assert!(err.message.contains("by-reference variadic"));
     }
 
     #[test]

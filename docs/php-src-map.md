@@ -69,23 +69,26 @@ fetch/assign instructions.
 | `Index` | `ZEND_FETCH_DIM_R` |
 | `IndexSafe` | `ZEND_FETCH_DIM_IS` |
 | `AssignDim` | `ZEND_ASSIGN_DIM`, `ZEND_ASSIGN_DIM_OP` |
+| `MakeDimRef`, `SetDimRef`, `UnsetDim` | `ZEND_FETCH_DIM_W`, `ZEND_ASSIGN_DIM_REF`, `ZEND_UNSET_DIM` |
 | `Call` | `ZEND_INIT_FCALL`, `ZEND_SEND_VAL`, `ZEND_DO_FCALL` |
 | `CallValue` | `ZEND_INIT_DYNAMIC_CALL`, `ZEND_DO_FCALL` |
 | `Include` | `ZEND_INCLUDE_OR_EVAL` |
 | `MakeClosure` | `ZEND_DECLARE_LAMBDA_FUNCTION`, `ZEND_BIND_LEXICAL` |
 | `NewObject` | `ZEND_NEW`, `ZEND_DO_FCALL` (constructor) |
-| `LoadProperty`, `AssignProperty` | `ZEND_FETCH_OBJ_R`, `ZEND_ASSIGN_OBJ` |
+| `LoadProperty`, `AssignProperty`, `MakePropertyRef`, `SetPropertyRef`, `UnsetProperty` | `ZEND_FETCH_OBJ_R`, `ZEND_ASSIGN_OBJ`, `ZEND_ASSIGN_OBJ_REF`, `ZEND_UNSET_OBJ` |
 | `CallMethod`, `CallStaticMethod` | `ZEND_INIT_METHOD_CALL`, `ZEND_INIT_STATIC_METHOD_CALL`, `ZEND_DO_FCALL` |
-| `LoadStaticProperty`, `AssignStaticProperty` | `ZEND_FETCH_STATIC_PROP_*`, `ZEND_ASSIGN_STATIC_PROP_*` |
+| `LoadStaticProperty`, `AssignStaticProperty`, `MakeStaticPropertyRef`, `SetStaticPropertyRef` | `ZEND_FETCH_STATIC_PROP_*`, `ZEND_ASSIGN_STATIC_PROP_*`, `ZEND_ASSIGN_STATIC_PROP_REF` |
 | `ClassConstant` | `ZEND_FETCH_CLASS_CONSTANT` |
 | `InstanceOf` | `ZEND_INSTANCEOF` |
 | `CloneObject` | `ZEND_CLONE` |
 | `Throw` | `ZEND_THROW` |
 | `TryStart`, `TryEnd`, `Rethrow`, `RethrowIfNotNull` | `ZEND_CATCH`, `ZEND_FAST_CALL`, `ZEND_FAST_RET` and handler-table unwinding |
 | `ThrowUnhandledMatch` | `ZEND_MATCH_ERROR` |
-| `IterInit` | `ZEND_FE_RESET_R` |
-| `IterNext` | `ZEND_FE_FETCH_R`, `ZEND_FE_FREE` |
-| `Return`, `ReturnNull` | `ZEND_RETURN`, `ZEND_RETURN` with `null` |
+| `PrepareRefs` | `ZEND_FE_RESET_RW` preparation (`ZVAL_MAKE_REF` on iteration targets) |
+| `IterInit` | `ZEND_FE_RESET_R`, `ZEND_FE_RESET_RW` |
+| `IterNext` | `ZEND_FE_FETCH_R`, `ZEND_FE_FETCH_RW`, `ZEND_FE_FREE` |
+| `UnsetVar`, `UnsetGlobal` | `ZEND_UNSET_CV`, `ZEND_UNSET_VAR` |
+| `Return`, `ReturnNull` | `ZEND_RETURN`, `ZEND_RETURN_BY_REF`, `ZEND_RETURN` with `null` |
 
 `switch` uses only the comparison and jump opcodes above; Zend additionally has
 `ZEND_SWITCH_LONG`/`ZEND_SWITCH_STRING` fast paths, which are not needed yet.
@@ -157,7 +160,7 @@ fetch/assign instructions.
 | `Zend/tests/closures/*.phpt` | `tests/php/15_closures.php` |
 | `Zend/tests/classes/*.phpt`, `Zend/tests/exceptions/*.phpt` | `tests/php/16_objects.php` |
 | `Zend/tests/ns/*.phpt`, `Zend/tests/use/*.phpt` | `tests/php/17_namespaces_includes.php`, `tests/php/18_namespace_blocks.php` |
-| `Zend/tests/ref/*.phpt`, `ext/standard/tests/array/sort*.phpt` | `tests/php/19_references.php` |
+| `Zend/tests/ref/*.phpt`, `ext/standard/tests/array/sort*.phpt` | `tests/php/19_references.php`, `tests/php/20_references_advanced.php` |
 
 `scripts/phpt-subset.sh` extracts `--FILE--` sections from a php-src checkout
 and skips tests that need extensions, INI settings, request data or special
