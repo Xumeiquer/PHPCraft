@@ -151,6 +151,8 @@ impl Vm {
         constants.insert("SORT_REGULAR".to_string(), Value::Int(0));
         constants.insert("SORT_NUMERIC".to_string(), Value::Int(1));
         constants.insert("SORT_STRING".to_string(), Value::Int(2));
+        constants.insert("SORT_DESC".to_string(), Value::Int(3));
+        constants.insert("SORT_ASC".to_string(), Value::Int(4));
         constants.insert("SORT_LOCALE_STRING".to_string(), Value::Int(5));
         constants.insert("SORT_NATURAL".to_string(), Value::Int(6));
         constants.insert("SORT_FLAG_CASE".to_string(), Value::Int(8));
@@ -232,6 +234,11 @@ impl Vm {
             return self.call_function(function, args);
         }
         if let Some(native) = phpcraft_stdlib::find(&lower) {
+            // array_multisort classifies each argument itself: arrays are
+            // passed by reference, sort flags may arrive as references too.
+            if lower == "array_multisort" {
+                return native(self, args);
+            }
             let by_ref = phpcraft_stdlib::by_ref_params(&lower);
             let args = args
                 .into_iter()

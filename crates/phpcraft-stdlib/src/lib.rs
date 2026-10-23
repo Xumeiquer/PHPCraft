@@ -96,6 +96,11 @@ static REGISTRY: &[(&str, NativeFn)] = &[
     ("arsort", arsort),
     ("ksort", ksort),
     ("krsort", krsort),
+    ("usort", usort),
+    ("uasort", uasort),
+    ("uksort", uksort),
+    ("shuffle", shuffle),
+    ("array_multisort", array_multisort),
     ("array_push", array_push),
     ("array_pop", array_pop),
     ("array_shift", array_shift),
@@ -181,8 +186,10 @@ pub fn names() -> impl Iterator<Item = &'static str> {
 /// argument before the call.
 pub fn by_ref_params(name: &str) -> &'static [usize] {
     match name.to_ascii_lowercase().as_str() {
-        "sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort" | "array_push" | "array_pop"
-        | "array_shift" | "array_unshift" => &[0],
+        "sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort" | "usort" | "uasort"
+        | "uksort" | "shuffle" | "array_push" | "array_pop" | "array_shift" | "array_unshift" => {
+            &[0]
+        }
         _ => &[],
     }
 }
@@ -2125,6 +2132,285 @@ fn krsort(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
         .collect();
     pairs.sort_by(|(a, _), (b, _)| compare_sort_values(&key_as_value(b), &key_as_value(a), flags));
     *cell.borrow_mut() = Value::array(PhpArray::from_pairs(pairs));
+    Ok(Value::Bool(true))
+}
+
+/// Stable merge sort whose comparator may call back into userland.
+fn stable_compare_sort<T, F>(items: &mut [T], mut compare: F) -> PhpResult<()>
+where
+    T: Clone,
+    F: FnMut(&T, &T) -> PhpResult<Ordering>,
+{
+    let len = items.len();
+    if len < 2 {
+        return Ok(());
+    }
+    let mut buffer = items.to_vec();
+    let mut width = 1usize;
+    while width < len {
+        let mut start = 0usize;
+        while start < len {
+            let mid = start.saturating_add(width).min(len);
+            let end = start.saturating_add(width.saturating_mul(2)).min(len);
+            let (mut left, mut right, mut out) = (start, mid, start);
+            while left < mid && right < end {
+                if compare(&items[left], &items[right])? == Ordering::Greater {
+                    buffer[out] = items[right].clone();
+                    right += 1;
+                } else {
+                    buffer[out] = items[left].clone();
+                    left += 1;
+                }
+                out += 1;
+            }
+            while left < mid {
+                buffer[out] = items[left].clone();
+                left += 1;
+                out += 1;
+            }
+            while right < end {
+                buffer[out] = items[right].clone();
+                right += 1;
+                out += 1;
+            }
+            start = end;
+        }
+        items.clone_from_slice(&buffer[..len]);
+        width = width.saturating_mul(2);
+    }
+    Ok(())
+}
+
+fn comparison_callback(
+    hooks: &mut dyn RuntimeHooks,
+    args: &[Value],
+    fname: &str,
+) -> PhpResult<Value> {
+    arity(fname, args, 2, Some(2))?;
+    let callback = args[1].clone();
+    if !hooks.is_callable(&callback) {
+        return Err(type_error_arg(fname, 1, "callback", "callable", &args[1]));
+    }
+    Ok(callback)
+}
+
+fn run_comparison(
+    hooks: &mut dyn RuntimeHooks,
+    callback: &Value,
+    left: &Value,
+    right: &Value,
+) -> PhpResult<Ordering> {
+    let result = hooks.call_value(callback, vec![left.clone(), right.clone()])?;
+    Ok(result.to_int_cast().cmp(&0))
+}
+
+fn usort(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    let callback = comparison_callback(hooks, &args, "usort")?;
+    let (cell, array) = ref_array(&args, 0, "usort", "array")?;
+    let mut values = array.values();
+    stable_compare_sort(&mut values, |a, b| run_comparison(hooks, &callback, a, b))?;
+    *cell.borrow_mut() = Value::array(PhpArray::from(values));
+    Ok(Value::Bool(true))
+}
+
+fn uasort(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    let callback = comparison_callback(hooks, &args, "uasort")?;
+    let (cell, array) = ref_array(&args, 0, "uasort", "array")?;
+    let mut pairs: Vec<(Key, Value)> = array
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    stable_compare_sort(&mut pairs, |(_, a), (_, b)| {
+        run_comparison(hooks, &callback, a, b)
+    })?;
+    *cell.borrow_mut() = Value::array(PhpArray::from_pairs(pairs));
+    Ok(Value::Bool(true))
+}
+
+fn uksort(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    let callback = comparison_callback(hooks, &args, "uksort")?;
+    let (cell, array) = ref_array(&args, 0, "uksort", "array")?;
+    let mut pairs: Vec<(Key, Value)> = array
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    stable_compare_sort(&mut pairs, |(a, _), (b, _)| {
+        run_comparison(hooks, &callback, &key_as_value(a), &key_as_value(b))
+    })?;
+    *cell.borrow_mut() = Value::array(PhpArray::from_pairs(pairs));
+    Ok(Value::Bool(true))
+}
+
+fn next_shuffle_word() -> u64 {
+    use std::cell::Cell;
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(0x9e37_79b9_7f4a_7c15)
+                | 1
+        );
+    }
+    STATE.with(|state| {
+        let mut word = state.get();
+        word ^= word << 13;
+        word ^= word >> 7;
+        word ^= word << 17;
+        state.set(word);
+        word
+    })
+}
+
+fn shuffle(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("shuffle", &args, 1, Some(1))?;
+    let (cell, array) = ref_array(&args, 0, "shuffle", "array")?;
+    let mut values = array.values();
+    for index in (1..values.len()).rev() {
+        let other = (next_shuffle_word() % (index as u64 + 1)) as usize;
+        values.swap(index, other);
+    }
+    *cell.borrow_mut() = Value::array(PhpArray::from(values));
+    Ok(Value::Bool(true))
+}
+
+fn array_multisort(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    if args.is_empty() {
+        return Err(PhpError::argument_count(
+            "array_multisort() expects at least 1 argument, 0 given",
+        ));
+    }
+
+    let mut arrays: Vec<(Rc<std::cell::RefCell<Value>>, PhpArray, bool, i64)> = Vec::new();
+    let mut descending = false;
+    let mut flags = 0i64;
+    let mut order_available = false;
+    let mut type_available = false;
+
+    for (index, arg) in args.iter().enumerate() {
+        match arg.deref() {
+            Value::Array(array) => {
+                let Value::Ref(cell) = arg else {
+                    return Err(PhpError::fatal(format!(
+                        "array_multisort(): Argument #{} ($array) cannot be passed by reference",
+                        index + 1
+                    )));
+                };
+                if let Some(last) = arrays.last_mut() {
+                    last.2 = descending;
+                    last.3 = flags;
+                }
+                arrays.push((cell.clone(), array.as_ref().clone(), false, 0));
+                descending = false;
+                flags = 0;
+                order_available = true;
+                type_available = true;
+            }
+            Value::Int(flag) => {
+                let base = flag & !8;
+                if matches!(base, 3 | 4) {
+                    if !order_available {
+                        return Err(PhpError::type_error(format!(
+                            "array_multisort(): Argument #{} must be an array or a sort flag that has not already been specified",
+                            index + 1
+                        )));
+                    }
+                    descending = base == 3;
+                    order_available = false;
+                } else if matches!(base, 0 | 1 | 2 | 5) {
+                    if !type_available {
+                        return Err(PhpError::type_error(format!(
+                            "array_multisort(): Argument #{} must be an array or a sort flag that has not already been specified",
+                            index + 1
+                        )));
+                    }
+                    flags = flag;
+                    type_available = false;
+                } else if base == 6 {
+                    return Err(PhpError::fatal(format!(
+                        "array_multisort(): sort flags {flag} are not supported"
+                    )));
+                } else {
+                    return Err(PhpError::value_error(format!(
+                        "array_multisort(): Argument #{} must be a valid sort flag",
+                        index + 1
+                    )));
+                }
+            }
+            _ => {
+                return Err(PhpError::type_error(format!(
+                    "array_multisort(): Argument #{} must be an array or a sort flag",
+                    index + 1
+                )))
+            }
+        }
+    }
+
+    let Some(last) = arrays.last_mut() else {
+        return Err(PhpError::type_error(
+            "array_multisort(): Argument #1 must be an array",
+        ));
+    };
+    last.2 = descending;
+    last.3 = flags;
+
+    let size = arrays[0].1.len();
+    if arrays.iter().any(|(_, array, _, _)| array.len() != size) {
+        return Err(PhpError::value_error(
+            "array_multisort(): Array sizes are inconsistent",
+        ));
+    }
+    if size == 0 {
+        return Ok(Value::Bool(true));
+    }
+
+    let entries: Vec<Vec<(Key, Value)>> = arrays
+        .iter()
+        .map(|(_, array, _, _)| {
+            array
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .collect();
+    let mut rows: Vec<(Vec<Key>, Vec<Value>)> = Vec::with_capacity(size);
+    for row in 0..size {
+        let mut keys = Vec::with_capacity(arrays.len());
+        let mut values = Vec::with_capacity(arrays.len());
+        for column in &entries {
+            keys.push(column[row].0.clone());
+            values.push(column[row].1.clone());
+        }
+        rows.push((keys, values));
+    }
+
+    rows.sort_by(|(_, left), (_, right)| {
+        for (column, (_, _, column_descending, column_flags)) in arrays.iter().enumerate() {
+            let mut ordering = compare_sort_values(&left[column], &right[column], *column_flags);
+            if *column_descending {
+                ordering = ordering.reverse();
+            }
+            if ordering != Ordering::Equal {
+                return ordering;
+            }
+        }
+        Ordering::Equal
+    });
+
+    for (column, (cell, _, _, _)) in arrays.iter().enumerate() {
+        let mut sorted = PhpArray::with_capacity(size);
+        for (keys, values) in &rows {
+            match &keys[column] {
+                Key::Str(_) => {
+                    sorted.insert(keys[column].clone(), values[column].clone());
+                }
+                Key::Int(_) => {
+                    sorted.push(values[column].clone());
+                }
+            }
+        }
+        *cell.borrow_mut() = Value::array(sorted);
+    }
     Ok(Value::Bool(true))
 }
 

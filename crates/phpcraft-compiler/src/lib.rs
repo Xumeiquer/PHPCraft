@@ -1844,8 +1844,12 @@ impl FnCompiler {
                 let signature = self.signatures.get(&name.to_ascii_lowercase()).cloned();
                 let short_name = name.rsplit('\\').next().unwrap_or(&name);
                 let builtin_by_ref = phpcraft_stdlib::by_ref_params(short_name);
+                // array_multisort decides at runtime which arguments are
+                // arrays (by reference) and which are sort flags (by value).
+                let builtin_all_by_ref = short_name.eq_ignore_ascii_case("array_multisort");
                 for (arg_index, arg) in args.iter().enumerate() {
-                    if argument_is_by_ref(signature.as_ref(), arg_index)
+                    if builtin_all_by_ref
+                        || argument_is_by_ref(signature.as_ref(), arg_index)
                         || (signature.is_none() && builtin_by_ref.contains(&arg_index))
                     {
                         self.expr_arg_ref(arg)?;

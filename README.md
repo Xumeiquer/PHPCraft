@@ -97,17 +97,20 @@ object properties, static properties, object/static-property dimensions,
 by-reference `foreach` and returns, by-reference variadics), by-reference
 parameters and closure captures, destructuring with `list()` and `[...]`
 (including nested, keyed, skipped and by-reference targets, and `foreach`
-targets), `unset`, closure captures and array builtins, first-class callable
-syntax (`strlen(...)`, `$object->method(...)`, `Class::method(...)`), callable
-arrays and callable strings (including `Class::method`), `is_callable()` and
-callbacks through `call_user_func()`/`array_map()`, `global`, `isset`/`empty`,
-casts, string/array/math/type builtins, and CLI behaviour matching `php`
-(stdout/stderr separation, exit status 255 on fatal errors).
+targets), `unset`, closure captures and array builtins (including by-reference
+`usort`/`uasort`/`uksort`, `shuffle` and `array_multisort`), first-class
+callable syntax (`strlen(...)`, `$object->method(...)`, `Class::method(...)`),
+callable arrays and callable strings (including `Class::method`),
+`is_callable()` and callbacks through `call_user_func()`/`array_map()`,
+`global`, `isset`/`empty`, casts, string/array/math/type builtins, and CLI
+behaviour matching `php` (stdout/stderr separation, exit status 255 on fatal
+errors).
 
 Not yet implemented: named arguments, alternative control syntax, and
-`finally` when `break`/`continue` leaves a `try` block. `sort()` supports
-`SORT_REGULAR`, `SORT_NUMERIC`, `SORT_STRING`, `SORT_LOCALE_STRING` and
-`SORT_FLAG_CASE`; `SORT_NATURAL` and unknown flags raise explicit errors.
+`finally` when `break`/`continue` leaves a `try` block. `sort()` and
+`array_multisort()` support `SORT_REGULAR`, `SORT_NUMERIC`, `SORT_STRING`,
+`SORT_LOCALE_STRING` and `SORT_FLAG_CASE`; `SORT_NATURAL` and unknown flags
+raise explicit errors.
 Array literals with by-reference elements (`[&$value]`) remain unsupported,
 though by-reference destructuring targets work. Unsupported constructs
 produce explicit parse or compile errors rather than silently misbehaving.

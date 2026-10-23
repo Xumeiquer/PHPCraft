@@ -136,6 +136,7 @@ fetch/assign instructions.
 | `in_array`, `array_search`, `array_sum`, `array_product` | same |
 | `array_reverse`, `array_slice`, `array_merge`, `array_fill` | same |
 | `array_combine`, `array_flip`, `array_map`, `range` | same |
+| `sort`, `rsort`, `asort`, `arsort`, `ksort`, `krsort`, `usort`, `uasort`, `uksort`, `shuffle`, `array_multisort` | same, by-reference where PHP declares it |
 | `abs`, `ceil`, `floor`, `round`, `sqrt`, `pow`, `intdiv`, `fmod` | same |
 | `max`, `min`, `pi` | same |
 | `gettype`, `get_debug_type`, `get_class`, `intval`, `floatval`, `strval`, `boolval` | same |
@@ -162,7 +163,8 @@ fetch/assign instructions.
 | `Zend/tests/closures/*.phpt` | `tests/php/15_closures.php` |
 | `Zend/tests/classes/*.phpt`, `Zend/tests/exceptions/*.phpt` | `tests/php/16_objects.php` |
 | `Zend/tests/ns/*.phpt`, `Zend/tests/use/*.phpt` | `tests/php/17_namespaces_includes.php`, `tests/php/18_namespace_blocks.php` |
-| `Zend/tests/ref/*.phpt`, `ext/standard/tests/array/sort*.phpt` | `tests/php/19_references.php`, `tests/php/20_references_advanced.php` |
+| `Zend/tests/ref/*.phpt` | `tests/php/19_references.php`, `tests/php/20_references_advanced.php` |
+| `ext/standard/tests/array/sort/*.phpt` | `tests/php/19_references.php`, `tests/php/20_references_advanced.php`, `tests/php/24_byref_sorts.php` |
 | `Zend/tests/list/*.phpt`, `Zend/tests/foreach_list.phpt` | `tests/php/23_destructuring.php` |
 
 `scripts/phpt-subset.sh` extracts `--FILE--` sections from a php-src checkout

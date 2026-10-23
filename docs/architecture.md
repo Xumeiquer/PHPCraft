@@ -82,7 +82,9 @@ enum Value {
   promote array-element/property arguments for by-reference parameters;
   by-value parameters copy the dereferenced value and by-reference parameters
   bind the cell itself. Native calls preserve cells only for the argument
-  positions listed in `phpcraft_stdlib::by_ref_params`. By-reference `foreach`
+  positions listed in `phpcraft_stdlib::by_ref_params`; `array_multisort()`
+  classifies its arguments at runtime, preserving arrays while accepting
+  scalar sort flags by value or through a reference. By-reference `foreach`
   converts the subject’s elements/properties with `PrepareRefs`, and returns
   preserve the cell only when the function carries `returns_ref`.
 
@@ -178,11 +180,13 @@ targets with skipped entries, nested/keyed targets, by-reference slots and
 `foreach` targets. References can be rooted in variable, object-property and
 static-property dimension chains (`&$object->items[0]`,
 `&Class::$items[0]`). The implemented by-reference builtins are `sort`,
-`rsort`, `asort`, `arsort`, `ksort`, `krsort`, `array_push`, `array_pop`,
-`array_shift` and `array_unshift`.
-`sort()` flags cover `SORT_REGULAR`, `SORT_NUMERIC`, `SORT_STRING`,
-`SORT_LOCALE_STRING` and `SORT_FLAG_CASE`; `SORT_NATURAL` and unknown flags
-raise explicit errors. Namespace support covers ordinary and braced declarations,
+`rsort`, `asort`, `arsort`, `ksort`, `krsort`, `usort`, `uasort`, `uksort`,
+`shuffle`, `array_multisort`, `array_push`, `array_pop`, `array_shift` and
+`array_unshift`. `sort()` and `array_multisort()` flags cover `SORT_REGULAR`,
+`SORT_NUMERIC`, `SORT_STRING`, `SORT_LOCALE_STRING` and `SORT_FLAG_CASE`;
+`SORT_NATURAL` and unknown flags raise explicit errors. Comparator sorts use a
+stable merge sort so callbacks can re-enter the VM without losing PHP's stable
+tie ordering. Namespace support covers ordinary and braced declarations,
 per-kind `use` imports and aliases; group `use`, namespaced `const`
 declarations and autoloading are not implemented. Includes search the calling
 script's directory and then the current directory; `include_path` is ignored

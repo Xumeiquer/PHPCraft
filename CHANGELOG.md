@@ -43,9 +43,11 @@ The reference behaviour is PHP 8.5.4.
   write-through assignment, references to array elements and object/static
   properties, by-reference `foreach`, by-reference returns, `unset()`, and the
   by-reference array builtins `sort`, `rsort`, `asort`, `arsort`, `ksort`,
-  `krsort`, `array_push`, `array_pop`, `array_shift` and `array_unshift`.
-  `sort()` flags include regular, numeric, string, locale-string and
-  case-insensitive string comparison.
+  `krsort`, `usort`, `uasort`, `uksort`, `shuffle`, `array_multisort`,
+  `array_push`, `array_pop`, `array_shift` and `array_unshift`.
+  `sort()` and `array_multisort()` flags include regular, numeric, string,
+  locale-string and case-insensitive string comparison. Comparator-based
+  sorts are stable, including ties in `array_multisort()`.
 - Destructuring: `list(...)` and `[...]` assignment targets, skipped entries,
   nested and keyed targets, by-reference slots, and destructuring in
   `foreach` (including keyed and nested targets).
@@ -87,6 +89,8 @@ The reference behaviour is PHP 8.5.4.
 - Differential coverage for the new stdlib batch.
 - Differential coverage for closures, arrow functions, dynamic calls and
   closure callbacks.
+- Differential coverage for comparator sorts, callable forms, `shuffle()` and
+  `array_multisort()`.
 
 ### Fixed
 
@@ -121,13 +125,11 @@ The reference behaviour is PHP 8.5.4.
 ### Tested
 
 - 58 Rust unit/integration tests.
-- 23 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
+- 24 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
   status.
 
 ### Planned
 
-- The remaining by-reference builtins (`shuffle`, comparator-based sorts and
-  `array_multisort`).
 - Group `use` declarations, `include_path`, class autoloading and namespaced
   constant declarations.
 - `break`/`continue` leaving a `try` block currently bypasses its `finally`
