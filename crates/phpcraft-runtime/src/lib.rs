@@ -63,6 +63,16 @@ pub trait RuntimeHooks {
     /// Define a runtime constant (`define()`).
     fn define_constant(&mut self, name: &str, value: Value);
 
+    /// Current `include_path`, using the platform path separator.
+    fn get_include_path(&mut self) -> String {
+        String::new()
+    }
+
+    /// Replace `include_path` and return the previous value.
+    fn set_include_path(&mut self, path: String) -> String {
+        path
+    }
+
     /// Convert a value for a `string` parameter or other string context.
     /// Returns `None` when the value cannot be converted (for example an
     /// object without `__toString`, or an array); callers then report the

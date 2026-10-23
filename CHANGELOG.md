@@ -37,7 +37,10 @@ The reference behaviour is PHP 8.5.4.
 - Magic constants `__FILE__`, `__DIR__`, `__NAMESPACE__`, `__CLASS__`,
   `__METHOD__`, `__FUNCTION__` and `__LINE__`.
 - `include`, `include_once`, `require` and `require_once`, including return
-  values, shared globals, included definitions and once-per-file tracking.
+  values, shared globals, included definitions, once-per-file tracking and
+  PHP's `true` result for an already-included file. Includes honour
+  `include_path`; `get_include_path()`, `set_include_path()` and
+  `PATH_SEPARATOR` are available.
 - References: `$a = &$b`, by-reference parameters for functions, methods and
   closures, by-reference variadics, by-reference closure captures,
   write-through assignment, references to array elements and object/static
@@ -125,12 +128,12 @@ The reference behaviour is PHP 8.5.4.
 ### Tested
 
 - 59 Rust unit/integration tests.
-- 25 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
+- 26 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
   status.
 
 ### Planned
 
-- `include_path`, class autoloading and namespaced constant declarations.
+- Class autoloading and namespaced constant declarations.
 - `break`/`continue` leaving a `try` block currently bypasses its `finally`
   body (return and throw paths are covered).
 

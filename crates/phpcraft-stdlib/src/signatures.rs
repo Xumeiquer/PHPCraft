@@ -185,6 +185,8 @@ pub fn parameters(name: &str) -> &'static [(&'static str, bool)] {
         ],
         "defined" => &[("constant_name", false)],
         "constant" => &[("name", false)],
+        "get_include_path" => &[],
+        "set_include_path" => &[("include_path", false)],
         _ => &[],
     }
 }

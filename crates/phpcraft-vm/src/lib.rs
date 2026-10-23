@@ -113,6 +113,7 @@ pub struct Vm {
     file: String,
     next_object_id: u64,
     included_files: HashSet<String>,
+    include_path: String,
 }
 
 impl Default for Vm {
@@ -158,6 +159,14 @@ impl Vm {
         constants.insert("SORT_FLAG_CASE".to_string(), Value::Int(8));
         constants.insert("COUNT_NORMAL".to_string(), Value::Int(0));
         constants.insert("COUNT_RECURSIVE".to_string(), Value::Int(1));
+        constants.insert(
+            "PATH_SEPARATOR".to_string(),
+            Value::str(if cfg!(windows) {
+                b";".to_vec()
+            } else {
+                b":".to_vec()
+            }),
+        );
 
         Self {
             functions: HashMap::new(),
@@ -171,6 +180,7 @@ impl Vm {
             file: String::new(),
             next_object_id: 1,
             included_files: HashSet::new(),
+            include_path: ".".to_string(),
         }
     }
 
@@ -265,7 +275,7 @@ impl Vm {
             .display()
             .to_string();
         if once && self.included_files.contains(&key) {
-            return Ok(Value::Int(1));
+            return Ok(Value::Bool(true));
         }
         let source = match std::fs::read(&path) {
             Ok(source) => source,
@@ -318,6 +328,30 @@ impl Vm {
         {
             return path;
         }
+
+        // Explicit `./` and `../` paths are resolved from the current working
+        // directory and bypass include_path, as PHP does.
+        if raw.starts_with("./")
+            || raw.starts_with("../")
+            || raw.starts_with(".\\")
+            || raw.starts_with("..\\")
+        {
+            return path;
+        }
+
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        for entry in self.include_path.split(separator) {
+            let directory = if entry.is_empty() {
+                PathBuf::from(".")
+            } else {
+                PathBuf::from(entry)
+            };
+            let candidate = directory.join(&path);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+
         if let Some(parent) = Path::new(&self.file).parent() {
             let candidate = parent.join(&path);
             if candidate.exists() {
@@ -3046,6 +3080,14 @@ impl RuntimeHooks for Vm {
 
     fn define_constant(&mut self, name: &str, value: Value) {
         self.define_constant(name, value);
+    }
+
+    fn get_include_path(&mut self) -> String {
+        self.include_path.clone()
+    }
+
+    fn set_include_path(&mut self, path: String) -> String {
+        std::mem::replace(&mut self.include_path, path)
     }
 
     fn object_to_string(&mut self, value: &Value) -> Option<PhpResult<Vec<u8>>> {

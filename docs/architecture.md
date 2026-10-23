@@ -188,9 +188,11 @@ static-property dimension chains (`&$object->items[0]`,
 stable merge sort so callbacks can re-enter the VM without losing PHP's stable
 tie ordering. Namespace support covers ordinary and braced declarations,
 per-kind and group `use` imports and aliases; namespaced `const` declarations
-and autoloading are not implemented. Includes search the calling script's
-directory and then the current directory; `include_path` is ignored and an
-include written inside a function still executes in the global scope.
+and autoloading are not implemented. Includes resolve through `include_path`
+(default `.`), then the calling script's directory, then the current
+directory; `get_include_path()`, `set_include_path()` and `PATH_SEPARATOR`
+are supported. An include written inside a function still executes in the
+global scope.
 Visibility is enforced for properties and methods using the declaring class
 stored on objects; protected access follows the inheritance chain. Objects
 also remember their declaring class per property so a subclass cannot read a

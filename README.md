@@ -92,7 +92,8 @@ and objects (inheritance, static members, cloning and object identity),
 exceptions with `try`/`catch`/`finally` (including finally on return and
 rethrow paths), private/protected visibility enforcement, `__toString()`
 coercion, namespaces and `use` imports (including group imports), magic
-constants, `include`/`require` forms, references (variables, array elements,
+constants, `include`/`require` forms with `include_path` support, references
+(variables, array elements,
 object properties, static properties, object/static-property dimensions,
 by-reference `foreach` and returns, by-reference variadics), by-reference
 parameters and closure captures, destructuring with `list()` and `[...]`

@@ -163,10 +163,12 @@ static REGISTRY: &[(&str, NativeFn)] = &[
     // output
     ("var_dump", var_dump),
     ("print_r", print_r),
-    // constants
+    // constants and configuration
     ("define", define),
     ("defined", defined),
     ("constant", constant_value),
+    ("get_include_path", get_include_path),
+    ("set_include_path", set_include_path),
 ];
 
 pub fn find(name: &str) -> Option<NativeFn> {
@@ -3523,6 +3525,18 @@ fn constant_value(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<
     _hooks
         .constant(&name)
         .ok_or_else(|| PhpError::fatal(format!("Undefined constant \"{name}\"")))
+}
+
+fn get_include_path(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("get_include_path", &args, 0, Some(0))?;
+    Ok(Value::str(_hooks.get_include_path().into_bytes()))
+}
+
+fn set_include_path(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("set_include_path", &args, 1, Some(1))?;
+    let path = as_string(_hooks, &args, 0, "set_include_path", "include_path")?;
+    let path = String::from_utf8_lossy(&path).into_owned();
+    Ok(Value::str(_hooks.set_include_path(path).into_bytes()))
 }
 
 #[cfg(test)]
