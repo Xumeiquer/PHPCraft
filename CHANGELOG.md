@@ -20,6 +20,15 @@ The reference behaviour is PHP 8.5.4.
   `LogicException`), exception accessors and PHP-like uncaught diagnostics.
 - Runtime errors raised by builtins are catchable as their corresponding
   `Error` subclasses.
+- Visibility is enforced for instance and static properties and for methods:
+  `private` members are only visible to the declaring class, `protected`
+  members work across the inheritance chain, and access failures raise the
+  same `Error` messages as PHP.
+- `__toString()` is honoured by string-typed builtins and by untyped string
+  contexts such as `strval()`, `implode()`, `str_replace()` and `sprintf("%s")`.
+- `finally` now runs on every exit path, including `return` from a `try` or
+  `catch`, exceptions thrown inside a `catch`, and uncaught exceptions leaving
+  a `try` block.
 - Namespaces: `namespace Name;`, braced namespace blocks (including the global
   `namespace { ... }` form), `use` imports for classes, functions and
   constants, aliases, qualified and fully-qualified names, and the
@@ -106,7 +115,7 @@ The reference behaviour is PHP 8.5.4.
 ### Tested
 
 - 57 Rust unit/integration tests.
-- 21 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
+- 22 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
   status.
 
 ### Planned
@@ -116,8 +125,8 @@ The reference behaviour is PHP 8.5.4.
   comparator-based sorts and `array_multisort`).
 - Group `use` declarations, `include_path`, class autoloading and namespaced
   constant declarations.
-- Visibility enforcement, `__toString()` in every stdlib coercion path, and
-  `finally` on `return`/`throw` paths.
+- `break`/`continue` leaving a `try` block currently bypasses its `finally`
+  body (return and throw paths are covered).
 
 ## [0.1.0] - 2026-10-22
 

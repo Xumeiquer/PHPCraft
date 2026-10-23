@@ -106,6 +106,9 @@ pub struct PhpObject {
     /// Declared visibility by property name (`public` for dynamic properties
     /// and for names absent from this map).
     pub property_visibility: HashMap<String, String>,
+    /// Declaring class by property name, used to enforce `private`/`protected`.
+    /// Dynamic properties have no entry and are public.
+    pub property_owner: HashMap<String, String>,
     pub exception: Option<ExceptionData>,
 }
 
@@ -116,6 +119,7 @@ impl PhpObject {
             id,
             properties: PhpArray::new(),
             property_visibility: HashMap::new(),
+            property_owner: HashMap::new(),
             exception: None,
         }
     }

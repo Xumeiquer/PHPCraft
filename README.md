@@ -89,8 +89,10 @@ nowdoc, ordered arrays with PHP key coercion and copy-on-write, arithmetic and
 comparison semantics, `if`/`while`/`do`/`for`/`foreach`/`switch`, `match`
 expressions, functions, closures and arrow functions, dynamic calls, classes
 and objects (inheritance, static members, cloning and object identity),
-exceptions with `try`/`catch`/`finally`, namespaces and `use` imports, magic
-constants, `include`/`require` forms, references (variables, array elements,
+exceptions with `try`/`catch`/`finally` (including finally on return and
+rethrow paths), private/protected visibility enforcement, `__toString()`
+coercion, namespaces and `use` imports, magic constants, `include`/`require`
+forms, references (variables, array elements,
 object properties, static properties, by-reference `foreach` and returns,
 by-reference variadics), by-reference parameters and closure captures,
 `unset`, closure captures and array builtins, first-class callable syntax
@@ -102,7 +104,8 @@ string/array/math/type builtins, and CLI behaviour matching `php`
 
 Not yet implemented: references rooted inside object/static-property
 dimensions (for example taking `&$object->items[0]`), reference destructuring
-in `list()`, named arguments and alternative control syntax. `sort()` supports `SORT_REGULAR`, `SORT_NUMERIC`,
+in `list()`, named arguments, alternative control syntax, and `finally` when
+`break`/`continue` leaves a `try` block. `sort()` supports `SORT_REGULAR`, `SORT_NUMERIC`,
 `SORT_STRING`, `SORT_LOCALE_STRING` and `SORT_FLAG_CASE`; `SORT_NATURAL` and
 unknown flags raise explicit errors. Unsupported constructs produce explicit
 parse or compile errors rather than silently misbehaving.

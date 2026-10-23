@@ -180,6 +180,16 @@ struct LoopCtx {
     continues: Vec<usize>,
 }
 
+/// A `finally` body that is active while compiling the statements it protects.
+#[derive(Clone)]
+struct ActiveFinally {
+    body: Vec<Stmt>,
+    /// Exception handlers active outside the `try` that owns this `finally`.
+    /// A `return` pops handlers down to this depth before running the body so
+    /// an exception thrown by `finally` is still seen by outer `try` blocks.
+    outer_handler_depth: usize,
+}
+
 struct FnCompiler {
     name: String,
     display_name: Option<String>,
@@ -204,6 +214,11 @@ struct FnCompiler {
     function_uses: HashMap<String, String>,
     const_uses: HashMap<String, String>,
     signatures: HashMap<String, RefSignature>,
+    /// `finally` bodies enclosing the code currently being compiled. A
+    /// `return` has to run these before leaving the function.
+    active_finally: Vec<ActiveFinally>,
+    /// Number of exception handlers active at the current compile point.
+    handler_depth: usize,
     file: String,
 }
 
@@ -233,6 +248,8 @@ impl FnCompiler {
             function_uses: HashMap::new(),
             const_uses: HashMap::new(),
             signatures: HashMap::new(),
+            active_finally: Vec::new(),
+            handler_depth: 0,
             file: file.to_string(),
         }
     }
@@ -262,6 +279,8 @@ impl FnCompiler {
             function_uses: HashMap::new(),
             const_uses: HashMap::new(),
             signatures: HashMap::new(),
+            active_finally: Vec::new(),
+            handler_depth: 0,
             file: file.to_string(),
         }
     }
@@ -291,6 +310,8 @@ impl FnCompiler {
             function_uses: HashMap::new(),
             const_uses: HashMap::new(),
             signatures: HashMap::new(),
+            active_finally: Vec::new(),
+            handler_depth: 0,
             file: file.to_string(),
         }
     }
@@ -942,13 +963,16 @@ impl FnCompiler {
                 match value {
                     Some(expr) if self.returns_ref => {
                         self.load_ref_source(expr)?;
+                        self.compile_finally_before_return()?;
                         self.emit(Op::Return);
                     }
                     Some(expr) => {
                         self.expr(expr)?;
+                        self.compile_finally_before_return()?;
                         self.emit(Op::Return);
                     }
                     None => {
+                        self.compile_finally_before_return()?;
                         self.emit(Op::ReturnNull);
                     }
                 }
@@ -1320,8 +1344,20 @@ impl FnCompiler {
             catch_ip: 0,
             catch_slot,
         });
+        let outer_handler_depth = self.handler_depth;
+        self.handler_depth += 1;
+        if let Some(finally) = finally {
+            self.active_finally.push(ActiveFinally {
+                body: finally.to_vec(),
+                outer_handler_depth,
+            });
+        }
         self.compile_stmts(body)?;
+        if finally.is_some() {
+            self.active_finally.pop();
+        }
         self.emit(Op::TryEnd);
+        self.handler_depth -= 1;
         let try_done = self.emit(Op::Jump(0));
         let catch_label = self.ops.len();
         if let Op::TryStart { catch_ip, .. } = &mut self.ops[start] {
@@ -1329,6 +1365,16 @@ impl FnCompiler {
         }
 
         let mut caught_jumps = Vec::new();
+        // `finally` has to run when a catch body throws, so every matching
+        // handler gets an exception handler of its own that targets the
+        // finally block.
+        let mut catch_handlers = Vec::new();
+        if let Some(finally) = finally {
+            self.active_finally.push(ActiveFinally {
+                body: finally.to_vec(),
+                outer_handler_depth,
+            });
+        }
         for catch in catches {
             let mut hit_jumps = Vec::new();
             for class in &catch.classes {
@@ -1348,13 +1394,34 @@ impl FnCompiler {
             // Clear the pending exception before running a matching handler.
             self.emit(Op::Null);
             self.emit(Op::StoreTmp(catch_slot));
+            if finally.is_some() {
+                catch_handlers.push(self.emit(Op::TryStart {
+                    catch_ip: 0,
+                    catch_slot,
+                }));
+                self.handler_depth += 1;
+            }
             self.compile_stmts(&catch.body)?;
+            if finally.is_some() {
+                self.emit(Op::TryEnd);
+                self.handler_depth -= 1;
+            }
             caught_jumps.push(self.emit(Op::Jump(0)));
             let next_label = self.ops.len();
             self.patch(next_catch, next_label);
         }
+        if finally.is_some() {
+            self.active_finally.pop();
+        }
+        let mut rethrow_jump = None;
         if !catches.is_empty() {
-            self.emit(Op::Rethrow { slot: catch_slot });
+            if finally.is_some() {
+                // The unmatched exception is still in `catch_slot`; let the
+                // finally block run before rethrowing it.
+                rethrow_jump = Some(self.emit(Op::Jump(0)));
+            } else {
+                self.emit(Op::Rethrow { slot: catch_slot });
+            }
         }
 
         let finally_label = self.ops.len();
@@ -1372,6 +1439,39 @@ impl FnCompiler {
         for jump in caught_jumps {
             self.patch(jump, after);
         }
+        if let Some(jump) = rethrow_jump {
+            self.patch(jump, finally_label);
+        }
+        for handler in catch_handlers {
+            if let Op::TryStart { catch_ip, .. } = &mut self.ops[handler] {
+                *catch_ip = finally_label;
+            }
+        }
+        Ok(())
+    }
+
+    /// Emit the `finally` bodies surrounding a `return`. PHP evaluates the
+    /// return value first, then runs every enclosing finally block (innermost
+    /// first) before actually leaving the function.
+    fn compile_finally_before_return(&mut self) -> Result<(), CompileError> {
+        let blocks = self.active_finally.clone();
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let handler_depth = self.handler_depth;
+        for index in (0..blocks.len()).rev() {
+            let target = blocks[index].outer_handler_depth;
+            while self.handler_depth > target {
+                self.emit(Op::TryEnd);
+                self.handler_depth -= 1;
+            }
+            let body = blocks[index].body.clone();
+            let outer = blocks[..index].to_vec();
+            let saved = std::mem::replace(&mut self.active_finally, outer);
+            self.compile_stmts(&body)?;
+            self.active_finally = saved;
+        }
+        self.handler_depth = handler_depth;
         Ok(())
     }
 

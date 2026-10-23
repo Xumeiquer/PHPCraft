@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use phpcraft_ast::{BinOp, CastKind, UnOp};
+use phpcraft_ast::{BinOp, CastKind, UnOp, Visibility};
 use phpcraft_bytecode::{Chunk, ClassDef, CompiledProgram, DimMode, Function, Op};
 use phpcraft_runtime::{
     compare, key_from_value, loose_eq, strict_eq, ErrorKind, ExceptionData, Key, Numeric, PhpArray,
@@ -334,7 +334,13 @@ impl Vm {
                 "Object of class Closure could not be converted to string",
             )),
             Value::Object(_) => {
-                let string = self.call_method_value(value.clone(), "__toString", Vec::new())?;
+                let scope = value.object_class();
+                let string = self.call_method_value(
+                    value.clone(),
+                    "__toString",
+                    Vec::new(),
+                    scope.as_deref(),
+                )?;
                 if matches!(string, Value::Object(_) | Value::Closure(_)) {
                     return Err(PhpError::fatal("__toString() must return a string value"));
                 }
@@ -494,7 +500,7 @@ impl Vm {
             Value::Object(object) => {
                 let class = object.borrow().class_name.clone();
                 if self.find_method(&class, "__invoke").is_some() {
-                    self.call_method_value(Value::Object(object), "__invoke", args)
+                    self.call_method_value(Value::Object(object), "__invoke", args, None)
                 } else {
                     Err(PhpError::fatal(format!(
                         "Object of class {} is not callable",
@@ -570,7 +576,12 @@ impl Vm {
     }
 
     /// Build the Closure returned by `$object->method(...)`.
-    fn make_method_callable(&mut self, object: Value, method: &str) -> PhpResult<Value> {
+    fn make_method_callable(
+        &mut self,
+        object: Value,
+        method: &str,
+        scope: Option<&str>,
+    ) -> PhpResult<Value> {
         let object = object.deref();
         let class = object.object_class().ok_or_else(|| {
             PhpError::fatal(format!(
@@ -579,12 +590,14 @@ impl Vm {
                 object.debug_type_name()
             ))
         })?;
-        let Some((function, owner, is_static)) = self.find_method(&class, method) else {
+        let Some((function, owner, is_static, visibility)) = self.find_method(&class, method)
+        else {
             return Err(PhpError::fatal(format!(
                 "Call to undefined method {}::{}()",
                 class, method
             )));
         };
+        self.method_access(&owner, visibility, method, scope)?;
         let display = function.name.clone();
         let parameters = function
             .params
@@ -610,16 +623,23 @@ impl Vm {
     }
 
     /// Build the Closure returned by `Class::method(...)`.
-    fn make_static_callable(&mut self, class: &str, method: &str) -> PhpResult<Value> {
+    fn make_static_callable(
+        &mut self,
+        class: &str,
+        method: &str,
+        scope: Option<&str>,
+    ) -> PhpResult<Value> {
         let canonical = self
             .canonical_class_name(class)
             .ok_or_else(|| PhpError::fatal(format!("Class \"{class}\" not found")))?;
-        let Some((function, owner, is_static)) = self.find_method(&canonical, method) else {
+        let Some((function, owner, is_static, visibility)) = self.find_method(&canonical, method)
+        else {
             return Err(PhpError::fatal(format!(
                 "Call to undefined method {}::{}()",
                 canonical, method
             )));
         };
+        self.method_access(&owner, visibility, method, scope)?;
         if !is_static {
             return Err(PhpError::fatal(format!(
                 "Non-static method {} cannot be called statically",
@@ -650,7 +670,7 @@ impl Vm {
     }
 
     /// Build a Closure from the callable value used in `$callable(...)`.
-    fn callable_from_value(&mut self, value: Value) -> PhpResult<Value> {
+    fn callable_from_value(&mut self, value: Value, scope: Option<&str>) -> PhpResult<Value> {
         match value.deref() {
             Value::Closure(closure) => {
                 let Some(info) = &closure.callable else {
@@ -671,15 +691,15 @@ impl Vm {
             Value::Str(name) => {
                 let name = String::from_utf8_lossy(name.as_bytes()).into_owned();
                 match name.rsplit_once("::") {
-                    Some((class, method)) => self.make_static_callable(class, method),
+                    Some((class, method)) => self.make_static_callable(class, method, scope),
                     None => self.make_function_callable(&name, false),
                 }
             }
-            Value::Array(array) => self.make_array_callable(&array),
+            Value::Array(array) => self.make_array_callable(&array, scope),
             Value::Object(object) => {
                 let class = object.borrow().class_name.clone();
                 if self.find_method(&class, "__invoke").is_some() {
-                    self.make_method_callable(Value::Object(object), "__invoke")
+                    self.make_method_callable(Value::Object(object), "__invoke", scope)
                 } else {
                     Err(PhpError::fatal(format!(
                         "Object of class {} is not callable",
@@ -695,17 +715,17 @@ impl Vm {
     }
 
     /// Resolve a callable array (`[$object, "method"]` / `["Class", "method"]`).
-    fn make_array_callable(&mut self, array: &PhpArray) -> PhpResult<Value> {
+    fn make_array_callable(&mut self, array: &PhpArray, scope: Option<&str>) -> PhpResult<Value> {
         let (first, second) = self.callable_array_parts(array)?;
         match first.deref() {
             Value::Object(object) => {
                 let method = callable_method_name(&second)?;
-                self.make_method_callable(Value::Object(object), &method)
+                self.make_method_callable(Value::Object(object), &method, scope)
             }
             Value::Str(class) => {
                 let class = String::from_utf8_lossy(class.as_bytes()).into_owned();
                 let method = callable_method_name(&second)?;
-                self.make_static_callable(&class, &method)
+                self.make_static_callable(&class, &method, scope)
             }
             _ => Err(PhpError::fatal(
                 "First array member is not a valid class name or object",
@@ -718,7 +738,7 @@ impl Vm {
         match first.deref() {
             Value::Object(object) => {
                 let method = callable_method_name(&second)?;
-                self.call_method_value(Value::Object(object), &method, args)
+                self.call_method_value(Value::Object(object), &method, args, None)
             }
             Value::Str(class) => {
                 let class = String::from_utf8_lossy(class.as_bytes()).into_owned();
@@ -757,12 +777,14 @@ impl Vm {
         let canonical = self
             .canonical_class_name(class)
             .ok_or_else(|| PhpError::fatal(format!("Class \"{class}\" not found")))?;
-        let Some((function, owner, is_static)) = self.find_method(&canonical, method) else {
+        let Some((function, owner, is_static, visibility)) = self.find_method(&canonical, method)
+        else {
             return Err(PhpError::fatal(format!(
                 "Call to undefined method {}::{}()",
                 canonical, method
             )));
         };
+        self.method_access(&owner, visibility, method, None)?;
         if !is_static {
             return Err(PhpError::fatal(format!(
                 "Non-static method {} cannot be called statically",
@@ -778,7 +800,7 @@ impl Vm {
             Some((class, method)) => self
                 .canonical_class_name(class)
                 .and_then(|canonical| self.find_method(&canonical, method))
-                .is_some_and(|(_, _, is_static)| is_static),
+                .is_some_and(|(_, _, is_static, _)| is_static),
             None => self.function_exists(name),
         }
     }
@@ -805,7 +827,7 @@ impl Vm {
                 let class = String::from_utf8_lossy(class.as_bytes()).into_owned();
                 self.canonical_class_name(&class)
                     .and_then(|canonical| self.find_method(&canonical, &method))
-                    .is_some_and(|(_, _, is_static)| is_static)
+                    .is_some_and(|(_, _, is_static, _)| is_static)
             }
             _ => false,
         }
@@ -962,21 +984,107 @@ impl Vm {
             .any(|name| name.eq_ignore_ascii_case(target.as_str()))
     }
 
-    fn find_method(&self, class: &str, method: &str) -> Option<(Rc<Function>, String, bool)> {
+    /// Whether `scope` may access a member declared in `owner`. Private
+    /// members are only visible to the declaring class; protected members are
+    /// visible anywhere in the same inheritance chain (including a parent
+    /// accessing a child-declared member, as PHP allows).
+    fn access_allowed(&self, owner: &str, visibility: Visibility, scope: Option<&str>) -> bool {
+        let Some(scope) = scope else {
+            return visibility == Visibility::Public;
+        };
+        if scope.eq_ignore_ascii_case(owner) {
+            return true;
+        }
+        match visibility {
+            Visibility::Public => true,
+            Visibility::Private => false,
+            Visibility::Protected => {
+                self.class_chain(scope)
+                    .iter()
+                    .any(|class| class.eq_ignore_ascii_case(owner))
+                    || self
+                        .class_chain(owner)
+                        .iter()
+                        .any(|class| class.eq_ignore_ascii_case(scope))
+            }
+        }
+    }
+
+    fn property_access(
+        &self,
+        owner: &str,
+        visibility: &str,
+        name: &str,
+        scope: Option<&str>,
+    ) -> PhpResult<()> {
+        let visibility = match visibility {
+            "private" => Visibility::Private,
+            "protected" => Visibility::Protected,
+            _ => Visibility::Public,
+        };
+        if self.access_allowed(owner, visibility, scope) {
+            Ok(())
+        } else {
+            Err(PhpError::fatal(format!(
+                "Cannot access {} property {}::${}",
+                visibility.as_str(),
+                owner,
+                name
+            )))
+        }
+    }
+
+    fn method_access(
+        &self,
+        owner: &str,
+        visibility: Visibility,
+        method: &str,
+        scope: Option<&str>,
+    ) -> PhpResult<()> {
+        if self.access_allowed(owner, visibility, scope) {
+            return Ok(());
+        }
+        let from = scope
+            .map(|scope| format!("scope {scope}"))
+            .unwrap_or_else(|| "global scope".to_string());
+        Err(PhpError::fatal(format!(
+            "Call to {} method {}::{}() from {}",
+            visibility.as_str(),
+            owner,
+            method,
+            from
+        )))
+    }
+
+    fn find_method(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> Option<(Rc<Function>, String, bool, Visibility)> {
         for owner in self.class_chain(class) {
             let Some(def) = self.classes.get(&owner.to_ascii_lowercase()) else {
                 continue;
             };
             if let Some(method) = def.method(method) {
                 if let Some(function) = self.functions.get(&method.function.to_ascii_lowercase()) {
-                    return Some((function.clone(), def.name.clone(), method.static_));
+                    return Some((
+                        function.clone(),
+                        def.name.clone(),
+                        method.static_,
+                        method.visibility,
+                    ));
                 }
             }
         }
         None
     }
 
-    fn new_object(&mut self, class: &str, args: Vec<Value>) -> PhpResult<Value> {
+    fn new_object(
+        &mut self,
+        class: &str,
+        args: Vec<Value>,
+        scope: Option<&str>,
+    ) -> PhpResult<Value> {
         let canonical = self.canonical_class_name(class).ok_or_else(|| {
             PhpError::fatal(format!(
                 "Class \"{}\" not found",
@@ -997,13 +1105,19 @@ impl Vm {
         self.next_object_id += 1;
         let mut object = PhpObject::new(canonical.clone(), id);
         object.properties = properties;
-        for owner in self.class_chain(&canonical) {
+        // Walk parents first so a child redeclaration wins.
+        let mut chain = self.class_chain(&canonical);
+        chain.reverse();
+        for owner in chain {
             if let Some(def) = self.classes.get(&owner.to_ascii_lowercase()) {
                 for property in def.properties.iter().filter(|property| !property.static_) {
                     object.property_visibility.insert(
                         property.name.clone(),
                         property.visibility.as_str().to_string(),
                     );
+                    object
+                        .property_owner
+                        .insert(property.name.clone(), def.name.clone());
                 }
             }
         }
@@ -1018,7 +1132,9 @@ impl Vm {
             });
         }
         let value = Value::object(object);
-        if let Some((function, owner, _)) = self.find_method(&canonical, "__construct") {
+        if let Some((function, owner, _, visibility)) = self.find_method(&canonical, "__construct")
+        {
+            self.method_access(&owner, visibility, "__construct", scope)?;
             self.call_function_with_context(
                 function,
                 &[],
@@ -1111,6 +1227,7 @@ impl Vm {
         object: Value,
         method: &str,
         args: Vec<Value>,
+        scope: Option<&str>,
     ) -> PhpResult<Value> {
         let class = object.object_class().ok_or_else(|| {
             PhpError::fatal(format!(
@@ -1119,7 +1236,8 @@ impl Vm {
                 object.debug_type_name()
             ))
         })?;
-        if let Some((function, owner, _)) = self.find_method(&class, method) {
+        if let Some((function, owner, _, visibility)) = self.find_method(&class, method) {
+            self.method_access(&owner, visibility, method, scope)?;
             return self.call_function_with_context(
                 function,
                 &[],
@@ -1152,7 +1270,9 @@ impl Vm {
             .copied()
             .unwrap_or(false)
             .then(|| frame.get(0).clone());
-        if let Some((function, owner, is_static)) = self.find_method(&resolved, method) {
+        if let Some((function, owner, is_static, visibility)) = self.find_method(&resolved, method)
+        {
+            self.method_access(&owner, visibility, method, frame.class_name.as_deref())?;
             return self.call_function_with_context(
                 function,
                 &[],
@@ -1181,8 +1301,110 @@ impl Vm {
         )))
     }
 
-    fn load_property(&mut self, object: Value, name: &str, warn: bool) -> PhpResult<Value> {
+    /// PHP stores private properties under a mangled name, so a subclass
+    /// object does not find its parent's private property at all (it becomes
+    /// an undefined dynamic property) unless the access happens in the
+    /// declaring class.
+    fn property_is_hidden(&self, object: &PhpObject, name: &str, scope: Option<&str>) -> bool {
+        if object.property_visibility.get(name).map(String::as_str) != Some("private") {
+            return false;
+        }
+        let owner = object
+            .property_owner
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(&object.class_name);
+        !scope.is_some_and(|scope| scope.eq_ignore_ascii_case(owner))
+            && !object.class_name.eq_ignore_ascii_case(owner)
+    }
+
+    fn object_property_access(
+        &self,
+        object: &PhpObject,
+        name: &str,
+        scope: Option<&str>,
+    ) -> PhpResult<()> {
+        if self.property_is_hidden(object, name, scope) {
+            return Ok(());
+        }
+        if let Some(visibility) = object.property_visibility.get(name) {
+            let owner = object
+                .property_owner
+                .get(name)
+                .map(String::as_str)
+                .unwrap_or(&object.class_name);
+            self.property_access(owner, visibility, name, scope)?;
+        }
+        Ok(())
+    }
+
+    fn static_property_access(
+        &self,
+        class: &str,
+        name: &str,
+        scope: Option<&str>,
+    ) -> PhpResult<()> {
+        let Some(owner) = self.static_property_owner(class, name) else {
+            return Ok(());
+        };
+        let Some(def) = self.classes.get(&owner.to_ascii_lowercase()) else {
+            return Ok(());
+        };
+        if let Some(property) = def
+            .properties
+            .iter()
+            .find(|property| property.static_ && property.name.eq_ignore_ascii_case(name))
+        {
+            self.property_access(&def.name, property.visibility.as_str(), name, scope)?;
+        }
+        Ok(())
+    }
+
+    fn load_property(
+        &mut self,
+        object: Value,
+        name: &str,
+        warn: bool,
+        scope: Option<&str>,
+    ) -> PhpResult<Value> {
         if let Value::Object(object) = object {
+            if !warn {
+                // `isset()`/`empty()`/`??` do not raise visibility errors;
+                // inaccessible properties simply read as unset.
+                let borrowed = object.borrow();
+                if self.property_is_hidden(&borrowed, name, scope) {
+                    return Ok(Value::Null);
+                }
+                if let Some(visibility) = borrowed.property_visibility.get(name) {
+                    let owner = borrowed
+                        .property_owner
+                        .get(name)
+                        .map(String::as_str)
+                        .unwrap_or(&borrowed.class_name);
+                    if self
+                        .property_access(owner, visibility, name, scope)
+                        .is_err()
+                    {
+                        return Ok(Value::Null);
+                    }
+                }
+                return Ok(borrowed
+                    .properties
+                    .get_str(name)
+                    .map(Value::deref)
+                    .unwrap_or(Value::Null));
+            }
+            {
+                let borrowed = object.borrow();
+                if self.property_is_hidden(&borrowed, name, scope) {
+                    self.warn(format!(
+                        "Undefined property: {}::${}",
+                        borrowed.class_name, name
+                    ));
+                    return Ok(Value::Null);
+                }
+            }
+            self.object_property_access(&object.borrow(), name, scope)?;
             let value = object.borrow().properties.get_str(name).map(Value::deref);
             if value.is_none() && warn {
                 let class = object.borrow().class_name.clone();
@@ -1200,9 +1422,16 @@ impl Vm {
         Ok(Value::Null)
     }
 
-    fn assign_property(&mut self, object: Value, name: &str, value: Value) -> PhpResult<()> {
+    fn assign_property(
+        &mut self,
+        object: Value,
+        name: &str,
+        value: Value,
+        scope: Option<&str>,
+    ) -> PhpResult<()> {
         match object.deref() {
             Value::Object(object) => {
+                self.object_property_access(&object.borrow(), name, scope)?;
                 let mut object = object.borrow_mut();
                 if let Some(Value::Ref(cell)) = object.properties.get_str(name) {
                     *cell.borrow_mut() = value.deref();
@@ -1228,7 +1457,18 @@ impl Vm {
         })
     }
 
-    fn load_static_property(&mut self, class: &str, name: &str, warn: bool) -> PhpResult<Value> {
+    fn load_static_property(
+        &mut self,
+        class: &str,
+        name: &str,
+        warn: bool,
+        scope: Option<&str>,
+    ) -> PhpResult<Value> {
+        if warn {
+            self.static_property_access(class, name, scope)?;
+        } else if self.static_property_access(class, name, scope).is_err() {
+            return Ok(Value::Null);
+        }
         if let Some(owner) = self.static_property_owner(class, name) {
             if let Some(properties) = self.static_properties.get(&owner.to_ascii_lowercase()) {
                 return Ok(properties
@@ -1243,7 +1483,14 @@ impl Vm {
         Ok(Value::Null)
     }
 
-    fn assign_static_property(&mut self, class: &str, name: &str, value: Value) -> PhpResult<()> {
+    fn assign_static_property(
+        &mut self,
+        class: &str,
+        name: &str,
+        value: Value,
+        scope: Option<&str>,
+    ) -> PhpResult<()> {
+        self.static_property_access(class, name, scope)?;
         let owner = self
             .static_property_owner(class, name)
             .unwrap_or_else(|| Self::normalize_class(class));
@@ -1829,19 +2076,28 @@ impl Vm {
                     Op::MakeMethodCallable { method } => {
                         let object = stack.pop().unwrap_or(Value::Null);
                         let method = String::from_utf8_lossy(chunk.const_str(*method)).into_owned();
-                        let callable = self.make_method_callable(object, &method)?;
+                        let callable = self.make_method_callable(
+                            object,
+                            &method,
+                            frame.class_name.as_deref(),
+                        )?;
                         stack.push(callable);
                     }
                     Op::MakeStaticCallable { class, method } => {
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let method = String::from_utf8_lossy(chunk.const_str(*method)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
-                        let callable = self.make_static_callable(&class, &method)?;
+                        let callable = self.make_static_callable(
+                            &class,
+                            &method,
+                            frame.class_name.as_deref(),
+                        )?;
                         stack.push(callable);
                     }
                     Op::CallableFromValue => {
                         let value = stack.pop().unwrap_or(Value::Null);
-                        let callable = self.callable_from_value(value)?;
+                        let callable =
+                            self.callable_from_value(value, frame.class_name.as_deref())?;
                         stack.push(callable);
                     }
                     Op::ThrowUnhandledMatch { subject } => {
@@ -1860,19 +2116,29 @@ impl Vm {
                         };
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
-                        let object = self.new_object(&class, args)?;
+                        let object = self.new_object(&class, args, frame.class_name.as_deref())?;
                         stack.push(object);
                     }
                     Op::LoadProperty { name, safe } => {
                         let object = stack.pop().unwrap_or(Value::Null);
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
-                        stack.push(self.load_property(object, &name, !*safe)?);
+                        stack.push(self.load_property(
+                            object,
+                            &name,
+                            !*safe,
+                            frame.class_name.as_deref(),
+                        )?);
                     }
                     Op::AssignProperty { name, keep } => {
                         let value = stack.pop().unwrap_or(Value::Null).deref();
                         let object = stack.pop().unwrap_or(Value::Null).deref();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
-                        self.assign_property(object, &name, value.clone())?;
+                        self.assign_property(
+                            object,
+                            &name,
+                            value.clone(),
+                            frame.class_name.as_deref(),
+                        )?;
                         if *keep {
                             stack.push(value);
                         }
@@ -1880,14 +2146,15 @@ impl Vm {
                     Op::MakePropertyRef { name } => {
                         let object = stack.pop().unwrap_or(Value::Null);
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
-                        let cell = self.make_property_ref(object, &name)?;
+                        let cell =
+                            self.make_property_ref(object, &name, frame.class_name.as_deref())?;
                         stack.push(cell);
                     }
                     Op::SetPropertyRef { name } => {
                         let object = stack.pop().unwrap_or(Value::Null);
                         let cell = stack.pop().unwrap_or(Value::Null);
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
-                        self.set_property_ref(object, &name, cell)?;
+                        self.set_property_ref(object, &name, cell, frame.class_name.as_deref())?;
                     }
                     Op::CallMethod { method, argc } => {
                         let argc = *argc as usize;
@@ -1898,7 +2165,12 @@ impl Vm {
                         };
                         let object = stack.pop().unwrap_or(Value::Null);
                         let method = String::from_utf8_lossy(chunk.const_str(*method)).into_owned();
-                        stack.push(self.call_method_value(object, &method, args)?);
+                        stack.push(self.call_method_value(
+                            object,
+                            &method,
+                            args,
+                            frame.class_name.as_deref(),
+                        )?);
                     }
                     Op::CallStaticMethod {
                         class,
@@ -1919,14 +2191,24 @@ impl Vm {
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
-                        stack.push(self.load_static_property(&class, &name, !*safe)?);
+                        stack.push(self.load_static_property(
+                            &class,
+                            &name,
+                            !*safe,
+                            frame.class_name.as_deref(),
+                        )?);
                     }
                     Op::AssignStaticProperty { class, name, keep } => {
                         let value = stack.pop().unwrap_or(Value::Null).deref();
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
-                        self.assign_static_property(&class, &name, value.clone())?;
+                        self.assign_static_property(
+                            &class,
+                            &name,
+                            value.clone(),
+                            frame.class_name.as_deref(),
+                        )?;
                         if *keep {
                             stack.push(value);
                         }
@@ -1935,14 +2217,23 @@ impl Vm {
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
-                        stack.push(self.make_static_property_ref(&class, &name));
+                        stack.push(self.make_static_property_ref(
+                            &class,
+                            &name,
+                            frame.class_name.as_deref(),
+                        )?);
                     }
                     Op::SetStaticPropertyRef { class, name } => {
                         let cell = stack.pop().unwrap_or(Value::Null);
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
-                        self.set_static_property_ref(&class, &name, cell)?;
+                        self.set_static_property_ref(
+                            &class,
+                            &name,
+                            cell,
+                            frame.class_name.as_deref(),
+                        )?;
                     }
                     Op::ClassConstant { class, name } => {
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
@@ -2064,6 +2355,11 @@ impl Vm {
                         let object = stack.pop().unwrap_or(Value::Null);
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         if let Value::Object(object) = object.deref() {
+                            self.object_property_access(
+                                &object.borrow(),
+                                &name,
+                                frame.class_name.as_deref(),
+                            )?;
                             object.borrow_mut().properties.remove(&Key::from_str(&name));
                         } else {
                             self.warn(format!(
@@ -2300,13 +2596,19 @@ impl Vm {
         Ok(())
     }
 
-    fn make_property_ref(&mut self, object: Value, name: &str) -> PhpResult<Value> {
+    fn make_property_ref(
+        &mut self,
+        object: Value,
+        name: &str,
+        scope: Option<&str>,
+    ) -> PhpResult<Value> {
         let Value::Object(object) = object.deref() else {
             return Err(PhpError::type_error(format!(
                 "Attempt to modify property \"{}\" on non-object",
                 name
             )));
         };
+        self.object_property_access(&object.borrow(), name, scope)?;
         let mut object = object.borrow_mut();
         let cell = match object.properties.get_str(name) {
             Some(Value::Ref(cell)) => cell.clone(),
@@ -2317,7 +2619,13 @@ impl Vm {
         Ok(Value::Ref(cell))
     }
 
-    fn set_property_ref(&mut self, object: Value, name: &str, cell: Value) -> PhpResult<()> {
+    fn set_property_ref(
+        &mut self,
+        object: Value,
+        name: &str,
+        cell: Value,
+        scope: Option<&str>,
+    ) -> PhpResult<()> {
         if cell.as_ref_cell().is_none() {
             return Err(PhpError::fatal(
                 "Only variables should be assigned by reference",
@@ -2329,11 +2637,18 @@ impl Vm {
                 name
             )));
         };
+        self.object_property_access(&object.borrow(), name, scope)?;
         object.borrow_mut().properties.insert_str(name, cell);
         Ok(())
     }
 
-    fn make_static_property_ref(&mut self, class: &str, name: &str) -> Value {
+    fn make_static_property_ref(
+        &mut self,
+        class: &str,
+        name: &str,
+        scope: Option<&str>,
+    ) -> PhpResult<Value> {
+        self.static_property_access(class, name, scope)?;
         let owner = self
             .static_property_owner(class, name)
             .unwrap_or_else(|| Self::normalize_class(class));
@@ -2347,15 +2662,22 @@ impl Vm {
             None => Rc::new(RefCell::new(Value::Null)),
         };
         properties.insert_str(name, Value::Ref(cell.clone()));
-        Value::Ref(cell)
+        Ok(Value::Ref(cell))
     }
 
-    fn set_static_property_ref(&mut self, class: &str, name: &str, cell: Value) -> PhpResult<()> {
+    fn set_static_property_ref(
+        &mut self,
+        class: &str,
+        name: &str,
+        cell: Value,
+        scope: Option<&str>,
+    ) -> PhpResult<()> {
         if cell.as_ref_cell().is_none() {
             return Err(PhpError::fatal(
                 "Only variables should be assigned by reference",
             ));
         }
+        self.static_property_access(class, name, scope)?;
         let owner = self
             .static_property_owner(class, name)
             .unwrap_or_else(|| Self::normalize_class(class));
@@ -2675,6 +2997,15 @@ impl RuntimeHooks for Vm {
 
     fn define_constant(&mut self, name: &str, value: Value) {
         self.define_constant(name, value);
+    }
+
+    fn object_to_string(&mut self, value: &Value) -> Option<PhpResult<Vec<u8>>> {
+        let Value::Object(object) = value else {
+            return None;
+        };
+        let class = object.borrow().class_name.clone();
+        self.find_method(&class, "__toString")?;
+        Some(self.output_bytes(value))
     }
 }
 

@@ -71,8 +71,8 @@ enum Value {
   lazily while preserving PHP's value semantics.
 * Objects use `Rc<RefCell<PhpObject>>`: assignment and argument passing share
   the same object, matching PHP's handle semantics. Property storage is an
-  ordered `PhpArray`; declared visibility is kept beside it for `var_dump()`
-  and `print_r()`.
+  ordered `PhpArray`; declared visibility and the declaring class are kept
+  beside it for access checks and for `var_dump()`/`print_r()`.
 * References are `Value::Ref(Rc<RefCell<Value>>)`. Reads dereference the cell,
   ordinary stores write through it, and `$a = &$b` rebinds both variables to
   the same cell. Array elements and object/static properties can also hold
@@ -184,7 +184,13 @@ per-kind `use` imports and aliases; group `use`, namespaced `const`
 declarations and autoloading are not implemented. Includes search the calling
 script's directory and then the current directory; `include_path` is ignored
 and an include written inside a function still executes in the global scope.
-Visibility is parsed and reported by `var_dump()`/`print_r()`, but
-private/protected access is not enforced yet. `return` and `throw` that escape
-a `catch`/`finally` block can still skip the `finally` body. Opcodes carry no
-source line information yet, so exceptions and runtime diagnostics use line 1.
+Visibility is enforced for properties and methods using the declaring class
+stored on objects; protected access follows the inheritance chain. Objects
+also remember their declaring class per property so a subclass cannot read a
+parent's private slot (PHP treats it as an undefined dynamic property).
+String-typed builtins and untyped string contexts call `__toString()`, while
+`Closure` and objects without it report the PHP conversion error. `finally`
+bodies run on normal completion, `return`, rethrow and exceptions escaping a
+`catch`; `break`/`continue` leaving a `try` block still bypasses `finally`.
+Opcodes carry no source line information yet, so exceptions and runtime
+diagnostics use line 1.

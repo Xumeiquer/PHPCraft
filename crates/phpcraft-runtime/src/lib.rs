@@ -62,4 +62,12 @@ pub trait RuntimeHooks {
 
     /// Define a runtime constant (`define()`).
     fn define_constant(&mut self, name: &str, value: Value);
+
+    /// Convert a value for a `string` parameter or other string context.
+    /// Returns `None` when the value cannot be converted (for example an
+    /// object without `__toString`, or an array); callers then report the
+    /// usual type error for their parameter.
+    fn object_to_string(&mut self, _value: &Value) -> Option<PhpResult<Vec<u8>>> {
+        None
+    }
 }

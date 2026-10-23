@@ -225,7 +225,13 @@ fn type_error_arg(fname: &str, index: usize, param: &str, expected: &str, got: &
     ))
 }
 
-fn as_string(args: &[Value], index: usize, fname: &str, param: &str) -> PhpResult<Vec<u8>> {
+fn as_string(
+    _hooks: &mut dyn RuntimeHooks,
+    args: &[Value],
+    index: usize,
+    fname: &str,
+    param: &str,
+) -> PhpResult<Vec<u8>> {
     match args.get(index) {
         None => Err(PhpError::argument_count(format!(
             "{fname}(): Argument #{} (${param}) not passed",
@@ -233,7 +239,31 @@ fn as_string(args: &[Value], index: usize, fname: &str, param: &str) -> PhpResul
         ))),
         Some(Value::Str(s)) => Ok(s.0.clone()),
         Some(Value::Array(_)) => Err(type_error_arg(fname, index, param, "string", &args[index])),
+        Some(value @ Value::Object(_)) => match _hooks.object_to_string(value) {
+            Some(result) => result,
+            None => Err(type_error_arg(fname, index, param, "string", &args[index])),
+        },
+        Some(Value::Closure(_)) => Err(type_error_arg(fname, index, param, "string", &args[index])),
         Some(other) => Ok(other.to_bytes()),
+    }
+}
+
+/// Convert a value used in an untyped string context (`strval`, `implode()`
+/// elements, `sprintf("%s")`, ...). Unlike a typed `string` parameter, an
+/// object without `__toString` is a conversion error rather than a TypeError.
+fn coerce_string(_hooks: &mut dyn RuntimeHooks, value: &Value) -> PhpResult<Vec<u8>> {
+    match value.deref() {
+        Value::Object(_) => match _hooks.object_to_string(value) {
+            Some(result) => result,
+            None => Err(PhpError::fatal(format!(
+                "Object of class {} could not be converted to string",
+                value.debug_type_name()
+            ))),
+        },
+        Value::Closure(_) => Err(PhpError::fatal(
+            "Object of class Closure could not be converted to string",
+        )),
+        other => Ok(other.to_bytes()),
     }
 }
 
@@ -362,13 +392,13 @@ fn key_to_value(key: &Key) -> Value {
 fn strlen(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("strlen", &args, 1, Some(1))?;
     Ok(Value::Int(
-        as_string(&args, 0, "strlen", "string")?.len() as i64
+        as_string(_hooks, &args, 0, "strlen", "string")?.len() as i64,
     ))
 }
 
 fn str_repeat(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("str_repeat", &args, 2, Some(2))?;
-    let string = as_string(&args, 0, "str_repeat", "string")?;
+    let string = as_string(_hooks, &args, 0, "str_repeat", "string")?;
     let times = as_int(&args, 1, "str_repeat", "times")?;
     if times < 0 {
         return Err(PhpError::value_error(
@@ -395,20 +425,20 @@ fn str_repeat(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Valu
 fn strtoupper(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("strtoupper", &args, 1, Some(1))?;
     Ok(string_value(
-        as_string(&args, 0, "strtoupper", "string")?.to_ascii_uppercase(),
+        as_string(_hooks, &args, 0, "strtoupper", "string")?.to_ascii_uppercase(),
     ))
 }
 
 fn strtolower(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("strtolower", &args, 1, Some(1))?;
     Ok(string_value(
-        as_string(&args, 0, "strtolower", "string")?.to_ascii_lowercase(),
+        as_string(_hooks, &args, 0, "strtolower", "string")?.to_ascii_lowercase(),
     ))
 }
 
 fn ucfirst(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("ucfirst", &args, 1, Some(1))?;
-    let mut bytes = as_string(&args, 0, "ucfirst", "string")?;
+    let mut bytes = as_string(_hooks, &args, 0, "ucfirst", "string")?;
     if let Some(first) = bytes.first_mut() {
         first.make_ascii_uppercase();
     }
@@ -417,18 +447,24 @@ fn ucfirst(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
 
 fn lcfirst(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("lcfirst", &args, 1, Some(1))?;
-    let mut bytes = as_string(&args, 0, "lcfirst", "string")?;
+    let mut bytes = as_string(_hooks, &args, 0, "lcfirst", "string")?;
     if let Some(first) = bytes.first_mut() {
         first.make_ascii_lowercase();
     }
     Ok(string_value(bytes))
 }
 
-fn trim_impl(args: &[Value], fname: &str, left: bool, right: bool) -> PhpResult<Value> {
+fn trim_impl(
+    _hooks: &mut dyn RuntimeHooks,
+    args: &[Value],
+    fname: &str,
+    left: bool,
+    right: bool,
+) -> PhpResult<Value> {
     arity(fname, args, 1, Some(2))?;
-    let bytes = as_string(args, 0, fname, "string")?;
+    let bytes = as_string(_hooks, args, 0, fname, "string")?;
     let chars = if args.len() > 1 {
-        as_string(args, 1, fname, "characters")?
+        as_string(_hooks, args, 1, fname, "characters")?
     } else {
         b" \t\n\r\0\x0b".to_vec()
     };
@@ -448,20 +484,20 @@ fn trim_impl(args: &[Value], fname: &str, left: bool, right: bool) -> PhpResult<
 }
 
 fn trim(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
-    trim_impl(&args, "trim", true, true)
+    trim_impl(_hooks, &args, "trim", true, true)
 }
 
 fn ltrim(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
-    trim_impl(&args, "ltrim", true, false)
+    trim_impl(_hooks, &args, "ltrim", true, false)
 }
 
 fn rtrim(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
-    trim_impl(&args, "rtrim", false, true)
+    trim_impl(_hooks, &args, "rtrim", false, true)
 }
 
 fn substr(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("substr", &args, 2, Some(3))?;
-    let bytes = as_string(&args, 0, "substr", "string")?;
+    let bytes = as_string(_hooks, &args, 0, "substr", "string")?;
     let offset = as_int(&args, 1, "substr", "offset")?;
     let length = if args.len() > 2 {
         Some(as_int(&args, 2, "substr", "length")?)
@@ -505,8 +541,8 @@ fn find_sub(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
 
 fn strpos(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("strpos", &args, 2, Some(3))?;
-    let haystack = as_string(&args, 0, "strpos", "haystack")?;
-    let needle = as_string(&args, 1, "strpos", "needle")?;
+    let haystack = as_string(_hooks, &args, 0, "strpos", "haystack")?;
+    let needle = as_string(_hooks, &args, 1, "strpos", "needle")?;
     let offset = if args.len() > 2 {
         as_int(&args, 2, "strpos", "offset")?
     } else {
@@ -525,8 +561,8 @@ fn strpos(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
 
 fn strrpos(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("strrpos", &args, 2, Some(3))?;
-    let haystack = as_string(&args, 0, "strrpos", "haystack")?;
-    let needle = as_string(&args, 1, "strrpos", "needle")?;
+    let haystack = as_string(_hooks, &args, 0, "strrpos", "haystack")?;
+    let needle = as_string(_hooks, &args, 1, "strrpos", "needle")?;
     let offset = if args.len() > 2 {
         as_int(&args, 2, "strrpos", "offset")?
     } else {
@@ -560,22 +596,22 @@ fn strrpos(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
 
 fn str_contains(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("str_contains", &args, 2, Some(2))?;
-    let haystack = as_string(&args, 0, "str_contains", "haystack")?;
-    let needle = as_string(&args, 1, "str_contains", "needle")?;
+    let haystack = as_string(_hooks, &args, 0, "str_contains", "haystack")?;
+    let needle = as_string(_hooks, &args, 1, "str_contains", "needle")?;
     Ok(Value::Bool(find_sub(&haystack, &needle, 0).is_some()))
 }
 
 fn str_starts_with(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("str_starts_with", &args, 2, Some(2))?;
-    let haystack = as_string(&args, 0, "str_starts_with", "haystack")?;
-    let needle = as_string(&args, 1, "str_starts_with", "needle")?;
+    let haystack = as_string(_hooks, &args, 0, "str_starts_with", "haystack")?;
+    let needle = as_string(_hooks, &args, 1, "str_starts_with", "needle")?;
     Ok(Value::Bool(haystack.starts_with(&needle)))
 }
 
 fn str_ends_with(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("str_ends_with", &args, 2, Some(2))?;
-    let haystack = as_string(&args, 0, "str_ends_with", "haystack")?;
-    let needle = as_string(&args, 1, "str_ends_with", "needle")?;
+    let haystack = as_string(_hooks, &args, 0, "str_ends_with", "haystack")?;
+    let needle = as_string(_hooks, &args, 1, "str_ends_with", "needle")?;
     Ok(Value::Bool(haystack.ends_with(&needle)))
 }
 
@@ -603,17 +639,17 @@ fn str_replace(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Val
         Value::Array(array) => array
             .values()
             .iter()
-            .map(|value| value.to_bytes())
-            .collect(),
-        other => vec![other.to_bytes()],
+            .map(|value| coerce_string(_hooks, value))
+            .collect::<PhpResult<_>>()?,
+        other => vec![coerce_string(_hooks, other)?],
     };
     let replacements: Vec<Vec<u8>> = match &args[1] {
         Value::Array(array) => array
             .values()
             .iter()
-            .map(|value| value.to_bytes())
-            .collect(),
-        other => vec![other.to_bytes()],
+            .map(|value| coerce_string(_hooks, value))
+            .collect::<PhpResult<_>>()?,
+        other => vec![coerce_string(_hooks, other)?],
     };
 
     let apply = |input: &[u8]| -> Vec<u8> {
@@ -629,11 +665,14 @@ fn str_replace(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Val
         Value::Array(array) => {
             let mut result = PhpArray::new();
             for (key, value) in array.iter() {
-                result.insert(key.clone(), string_value(apply(&value.to_bytes())));
+                result.insert(
+                    key.clone(),
+                    string_value(apply(&coerce_string(_hooks, value)?)),
+                );
             }
             Ok(Value::array(result))
         }
-        other => Ok(string_value(apply(&other.to_bytes()))),
+        other => Ok(string_value(apply(&coerce_string(_hooks, other)?))),
     }
 }
 
@@ -643,7 +682,7 @@ fn implode(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
         (Vec::new(), as_array(&args, 0, "implode", "array")?)
     } else {
         (
-            as_string(&args, 0, "implode", "separator")?,
+            as_string(_hooks, &args, 0, "implode", "separator")?,
             as_array(&args, 1, "implode", "array")?,
         )
     };
@@ -652,15 +691,15 @@ fn implode(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
         if i > 0 {
             out.extend_from_slice(&separator);
         }
-        out.extend_from_slice(&value.to_bytes());
+        out.extend_from_slice(&coerce_string(_hooks, value)?);
     }
     Ok(string_value(out))
 }
 
 fn explode(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("explode", &args, 2, Some(3))?;
-    let separator = as_string(&args, 0, "explode", "separator")?;
-    let string = as_string(&args, 1, "explode", "string")?;
+    let separator = as_string(_hooks, &args, 0, "explode", "separator")?;
+    let string = as_string(_hooks, &args, 1, "explode", "string")?;
     if separator.is_empty() {
         return Err(PhpError::value_error(
             "explode(): Argument #1 ($separator) cannot be empty",
@@ -717,15 +756,20 @@ fn explode(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
 
 fn sprintf(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("sprintf", &args, 1, None)?;
-    let format = as_string(&args, 0, "sprintf", "format")?;
-    Ok(string_value(format_args(&format, &args[1..], "sprintf")?))
+    let format = as_string(_hooks, &args, 0, "sprintf", "format")?;
+    Ok(string_value(format_args(
+        _hooks,
+        &format,
+        &args[1..],
+        "sprintf",
+    )?))
 }
 
-fn printf(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+fn printf(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("printf", &args, 1, None)?;
-    let format = as_string(&args, 0, "printf", "format")?;
-    let out = format_args(&format, &args[1..], "printf")?;
-    hooks.write(&out);
+    let format = as_string(_hooks, &args, 0, "printf", "format")?;
+    let out = format_args(_hooks, &format, &args[1..], "printf")?;
+    _hooks.write(&out);
     Ok(Value::Int(out.len() as i64))
 }
 
@@ -738,7 +782,12 @@ struct FormatSpec {
     precision: Option<usize>,
 }
 
-fn format_args(format: &[u8], args: &[Value], fname: &str) -> PhpResult<Vec<u8>> {
+fn format_args(
+    _hooks: &mut dyn RuntimeHooks,
+    format: &[u8],
+    args: &[Value],
+    fname: &str,
+) -> PhpResult<Vec<u8>> {
     let mut out = Vec::new();
     let mut i = 0;
     let mut arg_index = 0;
@@ -817,7 +866,7 @@ fn format_args(format: &[u8], args: &[Value], fname: &str) -> PhpResult<Vec<u8>>
 
         match conversion {
             b's' => {
-                let mut bytes = value.to_bytes();
+                let mut bytes = coerce_string(_hooks, value)?;
                 if let Some(precision) = spec.precision {
                     bytes.truncate(precision);
                 }
@@ -978,12 +1027,12 @@ fn number_format(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<V
     // represented by the runtime; reject absurd values before that point.
     ensure_allocation(decimals)?;
     let decimal_point = if args.len() > 2 {
-        as_string(&args, 2, "number_format", "decimal_separator")?
+        as_string(_hooks, &args, 2, "number_format", "decimal_separator")?
     } else {
         b".".to_vec()
     };
     let thousands_sep = if args.len() > 3 {
-        as_string(&args, 3, "number_format", "thousands_separator")?
+        as_string(_hooks, &args, 3, "number_format", "thousands_separator")?
     } else {
         b",".to_vec()
     };
@@ -1016,10 +1065,10 @@ fn number_format(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<V
 
 fn str_pad(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("str_pad", &args, 2, Some(4))?;
-    let mut input = as_string(&args, 0, "str_pad", "string")?;
+    let mut input = as_string(_hooks, &args, 0, "str_pad", "string")?;
     let length = as_int(&args, 1, "str_pad", "length")?;
     let pad_string = if args.len() > 2 {
-        as_string(&args, 2, "str_pad", "pad_string")?
+        as_string(_hooks, &args, 2, "str_pad", "pad_string")?
     } else {
         b" ".to_vec()
     };
@@ -1072,15 +1121,15 @@ fn str_pad(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
 
 fn strrev(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("strrev", &args, 1, Some(1))?;
-    let mut bytes = as_string(&args, 0, "strrev", "string")?;
+    let mut bytes = as_string(_hooks, &args, 0, "strrev", "string")?;
     bytes.reverse();
     Ok(string_value(bytes))
 }
 
 fn strcmp(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("strcmp", &args, 2, Some(2))?;
-    let a = as_string(&args, 0, "strcmp", "string1")?;
-    let b = as_string(&args, 1, "strcmp", "string2")?;
+    let a = as_string(_hooks, &args, 0, "strcmp", "string1")?;
+    let b = as_string(_hooks, &args, 1, "strcmp", "string2")?;
     Ok(Value::Int(match a.cmp(&b) {
         std::cmp::Ordering::Less => -1,
         std::cmp::Ordering::Equal => 0,
@@ -1090,8 +1139,8 @@ fn strcmp(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
 
 fn strstr(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("strstr", &args, 2, Some(3))?;
-    let haystack = as_string(&args, 0, "strstr", "haystack")?;
-    let needle = as_string(&args, 1, "strstr", "needle")?;
+    let haystack = as_string(_hooks, &args, 0, "strstr", "haystack")?;
+    let needle = as_string(_hooks, &args, 1, "strstr", "needle")?;
     if needle.is_empty() {
         return Ok(string_value(haystack));
     }
@@ -1105,8 +1154,8 @@ fn strstr(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
 
 fn strrchr(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("strrchr", &args, 2, Some(2))?;
-    let haystack = as_string(&args, 0, "strrchr", "haystack")?;
-    let needle = as_string(&args, 1, "strrchr", "needle")?;
+    let haystack = as_string(_hooks, &args, 0, "strrchr", "haystack")?;
+    let needle = as_string(_hooks, &args, 1, "strrchr", "needle")?;
     if needle.is_empty() {
         return Ok(Value::Bool(false));
     }
@@ -1124,8 +1173,8 @@ fn strrchr(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
 
 fn strpbrk(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("strpbrk", &args, 2, Some(2))?;
-    let haystack = as_string(&args, 0, "strpbrk", "string")?;
-    let characters = as_string(&args, 1, "strpbrk", "characters")?;
+    let haystack = as_string(_hooks, &args, 0, "strpbrk", "string")?;
+    let characters = as_string(_hooks, &args, 1, "strpbrk", "characters")?;
     if characters.is_empty() {
         return Err(PhpError::value_error(
             "strpbrk(): Argument #2 ($characters) must be a non-empty string",
@@ -1139,8 +1188,8 @@ fn strpbrk(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
 
 fn substr_count(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("substr_count", &args, 2, Some(4))?;
-    let haystack = as_string(&args, 0, "substr_count", "haystack")?;
-    let needle = as_string(&args, 1, "substr_count", "needle")?;
+    let haystack = as_string(_hooks, &args, 0, "substr_count", "haystack")?;
+    let needle = as_string(_hooks, &args, 1, "substr_count", "needle")?;
     if needle.is_empty() {
         return Err(PhpError::value_error(
             "substr_count(): Argument #2 ($needle) must not be empty",
@@ -1191,9 +1240,9 @@ fn substr_count(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Va
 
 fn ucwords(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("ucwords", &args, 1, Some(2))?;
-    let mut bytes = as_string(&args, 0, "ucwords", "string")?;
+    let mut bytes = as_string(_hooks, &args, 0, "ucwords", "string")?;
     let separators = if args.len() > 1 {
-        as_string(&args, 1, "ucwords", "separators")?
+        as_string(_hooks, &args, 1, "ucwords", "separators")?
     } else {
         b" \t\n\r\x0c\x0b".to_vec()
     };
@@ -1209,7 +1258,7 @@ fn ucwords(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> 
 
 fn nl2br(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("nl2br", &args, 1, Some(2))?;
-    let bytes = as_string(&args, 0, "nl2br", "string")?;
+    let bytes = as_string(_hooks, &args, 0, "nl2br", "string")?;
     let xhtml = if args.len() > 1 {
         args[1].to_bool()
     } else {
@@ -1245,7 +1294,7 @@ fn chr(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
 
 fn ord(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("ord", &args, 1, Some(1))?;
-    let bytes = as_string(&args, 0, "ord", "character")?;
+    let bytes = as_string(_hooks, &args, 0, "ord", "character")?;
     Ok(Value::Int(bytes.first().copied().unwrap_or(0) as i64))
 }
 
@@ -1280,13 +1329,13 @@ fn url_encode_bytes(bytes: &[u8], raw: bool) -> Vec<u8> {
 
 fn urlencode(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("urlencode", &args, 1, Some(1))?;
-    let bytes = as_string(&args, 0, "urlencode", "string")?;
+    let bytes = as_string(_hooks, &args, 0, "urlencode", "string")?;
     Ok(string_value(url_encode_bytes(&bytes, false)))
 }
 
 fn rawurlencode(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("rawurlencode", &args, 1, Some(1))?;
-    let bytes = as_string(&args, 0, "rawurlencode", "string")?;
+    let bytes = as_string(_hooks, &args, 0, "rawurlencode", "string")?;
     Ok(string_value(url_encode_bytes(&bytes, true)))
 }
 
@@ -1319,13 +1368,13 @@ fn url_decode_bytes(bytes: &[u8], raw: bool) -> Vec<u8> {
 
 fn urldecode(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("urldecode", &args, 1, Some(1))?;
-    let bytes = as_string(&args, 0, "urldecode", "string")?;
+    let bytes = as_string(_hooks, &args, 0, "urldecode", "string")?;
     Ok(string_value(url_decode_bytes(&bytes, false)))
 }
 
 fn rawurldecode(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("rawurldecode", &args, 1, Some(1))?;
-    let bytes = as_string(&args, 0, "rawurldecode", "string")?;
+    let bytes = as_string(_hooks, &args, 0, "rawurldecode", "string")?;
     Ok(string_value(url_decode_bytes(&bytes, true)))
 }
 
@@ -1884,12 +1933,12 @@ fn array_flip(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Valu
     Ok(Value::array(out))
 }
 
-fn array_map(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+fn array_map(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("array_map", &args, 2, Some(2))?;
     let array = as_array(&args, 1, "array_map", "array")?;
     let callback = match &args[0] {
         Value::Null => None,
-        value if hooks.is_callable(value) => Some(args[0].clone()),
+        value if _hooks.is_callable(value) => Some(args[0].clone()),
         other => {
             return Err(type_error_arg(
                 "array_map",
@@ -1904,7 +1953,7 @@ fn array_map(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value>
     for (key, value) in array.iter() {
         let mapped = match &callback {
             None => value.clone(),
-            Some(callable) => hooks.call_value(callable, vec![value.clone()])?,
+            Some(callable) => _hooks.call_value(callable, vec![value.clone()])?,
         };
         match key {
             Key::Str(_) => {
@@ -2669,12 +2718,7 @@ fn floatval(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value>
 
 fn strval(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("strval", &args, 1, Some(1))?;
-    if matches!(args[0], Value::Closure(_)) {
-        return Err(PhpError::fatal(
-            "Object of class Closure could not be converted to string",
-        ));
-    }
-    Ok(string_value(args[0].to_bytes()))
+    Ok(string_value(coerce_string(_hooks, &args[0])?))
 }
 
 fn boolval(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
@@ -2714,12 +2758,12 @@ fn is_scalar(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value
     Ok(Value::Bool(args[0].is_scalar()))
 }
 
-fn is_callable(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+fn is_callable(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("is_callable", &args, 1, Some(3))?;
-    Ok(Value::Bool(hooks.is_callable(&args[0])))
+    Ok(Value::Bool(_hooks.is_callable(&args[0])))
 }
 
-fn call_user_func(hooks: &mut dyn RuntimeHooks, mut args: Vec<Value>) -> PhpResult<Value> {
+fn call_user_func(_hooks: &mut dyn RuntimeHooks, mut args: Vec<Value>) -> PhpResult<Value> {
     arity("call_user_func", &args, 1, None)?;
     let callable = args.remove(0);
     // Dynamic calls cannot know the callee signature. Give each value a
@@ -2735,10 +2779,10 @@ fn call_user_func(hooks: &mut dyn RuntimeHooks, mut args: Vec<Value>) -> PhpResu
             }
         })
         .collect();
-    hooks.call_value(&callable, args)
+    _hooks.call_value(&callable, args)
 }
 
-fn call_user_func_array(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+fn call_user_func_array(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("call_user_func_array", &args, 2, Some(2))?;
     let array = as_array(&args, 1, "call_user_func_array", "args")?;
     let values = array
@@ -2751,14 +2795,14 @@ fn call_user_func_array(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpRe
             }
         })
         .collect();
-    hooks.call_value(&args[0], values)
+    _hooks.call_value(&args[0], values)
 }
 
-fn function_exists(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+fn function_exists(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("function_exists", &args, 1, Some(1))?;
-    let name = as_string(&args, 0, "function_exists", "function")?;
+    let name = as_string(_hooks, &args, 0, "function_exists", "function")?;
     Ok(Value::Bool(
-        hooks.function_exists(&String::from_utf8_lossy(&name)),
+        _hooks.function_exists(&String::from_utf8_lossy(&name)),
     ))
 }
 
@@ -2975,13 +3019,13 @@ fn dump_value(
     }
 }
 
-fn var_dump(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+fn var_dump(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     let mut out = Vec::new();
     for value in &args {
         let mut active = HashSet::new();
         dump_value(value, 0, false, &mut active, &mut out);
     }
-    hooks.write(&out);
+    _hooks.write(&out);
     Ok(Value::Null)
 }
 
@@ -3148,7 +3192,7 @@ fn print_closure(
     print_array_body(&properties, level, active, out);
 }
 
-fn print_r(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+fn print_r(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("print_r", &args, 1, Some(2))?;
     let mut out = Vec::new();
     let mut active = HashSet::new();
@@ -3164,31 +3208,31 @@ fn print_r(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     if args.get(1).is_some_and(Value::to_bool) {
         Ok(string_value(out))
     } else {
-        hooks.write(&out);
+        _hooks.write(&out);
         Ok(Value::Bool(true))
     }
 }
 
-fn define(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+fn define(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("define", &args, 2, Some(3))?;
-    let name = as_string(&args, 0, "define", "constant_name")?;
+    let name = as_string(_hooks, &args, 0, "define", "constant_name")?;
     let name = String::from_utf8_lossy(&name).into_owned();
-    hooks.define_constant(&name, args[1].clone());
+    _hooks.define_constant(&name, args[1].clone());
     Ok(Value::Bool(true))
 }
 
-fn defined(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+fn defined(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("defined", &args, 1, Some(1))?;
-    let name = as_string(&args, 0, "defined", "constant_name")?;
+    let name = as_string(_hooks, &args, 0, "defined", "constant_name")?;
     let name = String::from_utf8_lossy(&name).into_owned();
-    Ok(Value::Bool(hooks.constant(&name).is_some()))
+    Ok(Value::Bool(_hooks.constant(&name).is_some()))
 }
 
-fn constant_value(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+fn constant_value(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("constant", &args, 1, Some(1))?;
-    let name = as_string(&args, 0, "constant", "name")?;
+    let name = as_string(_hooks, &args, 0, "constant", "name")?;
     let name = String::from_utf8_lossy(&name).into_owned();
-    hooks
+    _hooks
         .constant(&name)
         .ok_or_else(|| PhpError::fatal(format!("Undefined constant \"{name}\"")))
 }
@@ -3221,9 +3265,9 @@ mod tests {
     #[test]
     #[allow(clippy::approx_constant)] // 3.14159 is test input, not an approximation of PI.
     fn sprintf_matches_php() {
-        let mut hooks = NullHooks { output: vec![] };
+        let mut _hooks = NullHooks { output: vec![] };
         let out = sprintf(
-            &mut hooks,
+            &mut _hooks,
             vec![
                 Value::str(b"%05.2f|%-6s|%+d|%x|%X|%o|%b|%c|%e|%E|%g|%u|%%".to_vec()),
                 Value::Float(3.14159),
@@ -3245,7 +3289,7 @@ mod tests {
             out.to_bytes(),
             b"03.14|ab    |+42|ff|FF|10|101|A|1.234568e+3|1.234568E+3|1234.57|18446744073709551615|%"
         );
-        assert!(hooks.output.is_empty());
+        assert!(_hooks.output.is_empty());
     }
 
     #[test]
@@ -3257,8 +3301,8 @@ mod tests {
         outer.insert_str("a", Value::array(inner));
         outer.insert_str("b", Value::Int(2));
 
-        let mut hooks = NullHooks { output: vec![] };
-        let out = print_r(&mut hooks, vec![Value::array(outer), Value::Bool(true)]).unwrap();
+        let mut _hooks = NullHooks { output: vec![] };
+        let out = print_r(&mut _hooks, vec![Value::array(outer), Value::Bool(true)]).unwrap();
         assert_eq!(
             String::from_utf8(out.to_bytes()).unwrap(),
             "Array\n(\n    [a] => Array\n        (\n            [0] => 1\n            [1] => 2\n        )\n\n    [b] => 2\n)\n"
@@ -3267,26 +3311,29 @@ mod tests {
 
     #[test]
     fn number_format_rounding_and_precision_limits() {
-        let mut hooks = NullHooks { output: vec![] };
+        let mut _hooks = NullHooks { output: vec![] };
         let formatted =
-            number_format(&mut hooks, vec![Value::Float(1.005), Value::Int(2)]).unwrap();
+            number_format(&mut _hooks, vec![Value::Float(1.005), Value::Int(2)]).unwrap();
         assert_eq!(formatted.to_bytes(), b"1.01");
 
-        let formatted = number_format(&mut hooks, vec![Value::Float(1.5), Value::Int(30)]).unwrap();
+        let formatted =
+            number_format(&mut _hooks, vec![Value::Float(1.5), Value::Int(30)]).unwrap();
         assert_eq!(formatted.to_bytes(), b"1.500000000000000000000000000000");
 
-        assert!(
-            number_format(&mut hooks, vec![Value::Float(1.5), Value::Int(200_000_000)]).is_err()
-        );
+        assert!(number_format(
+            &mut _hooks,
+            vec![Value::Float(1.5), Value::Int(200_000_000)]
+        )
+        .is_err());
         let formatted = sprintf(
-            &mut hooks,
+            &mut _hooks,
             vec![Value::str(b"%.100000f".to_vec()), Value::Float(1.5)],
         )
         .unwrap();
         // php_sprintf() truncates floating-point precision to 53 digits.
         assert_eq!(formatted.to_bytes().len(), 55);
         let formatted = sprintf(
-            &mut hooks,
+            &mut _hooks,
             vec![Value::str(b"%.100000e".to_vec()), Value::Float(1.5)],
         )
         .unwrap();
@@ -3295,15 +3342,15 @@ mod tests {
 
         // number_format() does not truncate; it emits the exact expansion.
         let formatted =
-            number_format(&mut hooks, vec![Value::Float(1.5), Value::Int(100_000)]).unwrap();
+            number_format(&mut _hooks, vec![Value::Float(1.5), Value::Int(100_000)]).unwrap();
         assert_eq!(formatted.to_bytes().len(), 100_002);
     }
 
     #[test]
     fn stdlib_batch_boundaries_fail_cleanly() {
-        let mut hooks = NullHooks { output: vec![] };
+        let mut _hooks = NullHooks { output: vec![] };
         assert!(array_pad(
-            &mut hooks,
+            &mut _hooks,
             vec![
                 Value::array(PhpArray::new()),
                 Value::Int(i64::MAX),
@@ -3312,7 +3359,7 @@ mod tests {
         )
         .is_err());
         assert!(array_pad(
-            &mut hooks,
+            &mut _hooks,
             vec![
                 Value::array(PhpArray::new()),
                 Value::Int(i64::MIN),
@@ -3321,23 +3368,23 @@ mod tests {
         )
         .is_err());
         assert!(array_chunk(
-            &mut hooks,
+            &mut _hooks,
             vec![Value::array(PhpArray::new()), Value::Int(0)]
         )
         .is_err());
         assert!(substr_count(
-            &mut hooks,
+            &mut _hooks,
             vec![Value::str(b"abc".to_vec()), Value::str(Vec::new())]
         )
         .is_err());
         assert!(strpbrk(
-            &mut hooks,
+            &mut _hooks,
             vec![Value::str(b"abc".to_vec()), Value::str(Vec::new())]
         )
         .is_err());
 
         let chunked = array_chunk(
-            &mut hooks,
+            &mut _hooks,
             vec![
                 Value::array(PhpArray::from_pairs(vec![
                     (Key::Int(0), Value::Int(1)),
@@ -3361,32 +3408,32 @@ mod tests {
 
     #[test]
     fn extreme_integer_arguments_fail_cleanly() {
-        let mut hooks = NullHooks { output: vec![] };
+        let mut _hooks = NullHooks { output: vec![] };
 
         // These used to panic or abort the Rust process.
         assert!(str_repeat(
-            &mut hooks,
+            &mut _hooks,
             vec![Value::str(b"a".to_vec()), Value::Int(i64::MAX)]
         )
         .is_err());
         assert!(str_pad(
-            &mut hooks,
+            &mut _hooks,
             vec![Value::str(b"a".to_vec()), Value::Int(i64::MAX)]
         )
         .is_err());
         assert!(array_fill(
-            &mut hooks,
+            &mut _hooks,
             vec![Value::Int(0), Value::Int(i64::MAX), Value::Int(1)]
         )
         .is_err());
         assert!(array_fill(
-            &mut hooks,
+            &mut _hooks,
             vec![Value::Int(i64::MAX), Value::Int(2), Value::Int(1)]
         )
         .is_err());
-        assert!(number_format(&mut hooks, vec![Value::Float(1.5), Value::Int(i64::MAX)]).is_err());
+        assert!(number_format(&mut _hooks, vec![Value::Float(1.5), Value::Int(i64::MAX)]).is_err());
         assert!(sprintf(
-            &mut hooks,
+            &mut _hooks,
             vec![
                 Value::str(b"%999999999999999999s".to_vec()),
                 Value::str(b"x".to_vec())
@@ -3396,7 +3443,7 @@ mod tests {
 
         // Negative limits and large positive lengths must saturate, not wrap.
         let parts = explode(
-            &mut hooks,
+            &mut _hooks,
             vec![
                 Value::str(b",".to_vec()),
                 Value::str(b"a,b".to_vec()),
@@ -3410,7 +3457,7 @@ mod tests {
         }
         assert_eq!(
             substr(
-                &mut hooks,
+                &mut _hooks,
                 vec![
                     Value::str(b"abc".to_vec()),
                     Value::Int(1),
@@ -3422,7 +3469,7 @@ mod tests {
             b"bc"
         );
         let slice = array_slice(
-            &mut hooks,
+            &mut _hooks,
             vec![
                 Value::array(PhpArray::from_pairs(vec![
                     (Key::Int(0), Value::Int(1)),
@@ -3442,9 +3489,9 @@ mod tests {
 
     #[test]
     fn range_handles_integer_boundaries() {
-        let mut hooks = NullHooks { output: vec![] };
+        let mut _hooks = NullHooks { output: vec![] };
         let ranged = range(
-            &mut hooks,
+            &mut _hooks,
             vec![Value::Int(i64::MAX - 2), Value::Int(i64::MAX)],
         )
         .unwrap();
@@ -3457,7 +3504,7 @@ mod tests {
             }
             other => panic!("expected array, got {other:?}"),
         }
-        assert!(range(&mut hooks, vec![Value::Int(0), Value::Int(i64::MAX)]).is_err());
+        assert!(range(&mut _hooks, vec![Value::Int(0), Value::Int(i64::MAX)]).is_err());
     }
 
     #[test]
@@ -3466,10 +3513,10 @@ mod tests {
         let mut array = PhpArray::new();
         array.push(Value::Ref(cell.clone()));
         *cell.borrow_mut() = Value::array(array.clone());
-        let mut hooks = NullHooks { output: vec![] };
-        var_dump(&mut hooks, vec![Value::Ref(cell)]).unwrap();
+        let mut _hooks = NullHooks { output: vec![] };
+        var_dump(&mut _hooks, vec![Value::Ref(cell)]).unwrap();
         assert_eq!(
-            String::from_utf8(hooks.output).unwrap(),
+            String::from_utf8(_hooks.output).unwrap(),
             "array(1) {\n  [0]=>\n  *RECURSION*\n}\n"
         );
     }
@@ -3479,10 +3526,10 @@ mod tests {
         let mut array = PhpArray::new();
         array.push(Value::Int(1));
         array.insert_str("a", Value::str(b"foo".to_vec()));
-        let mut hooks = NullHooks { output: vec![] };
-        var_dump(&mut hooks, vec![Value::array(array)]).unwrap();
+        let mut _hooks = NullHooks { output: vec![] };
+        var_dump(&mut _hooks, vec![Value::array(array)]).unwrap();
         assert_eq!(
-            String::from_utf8(hooks.output).unwrap(),
+            String::from_utf8(_hooks.output).unwrap(),
             "array(2) {\n  [0]=>\n  int(1)\n  [\"a\"]=>\n  string(3) \"foo\"\n}\n"
         );
     }
