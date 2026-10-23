@@ -104,7 +104,7 @@ fetch/assign instructions.
 | `IS_ARRAY` (`HashTable`) | `Value::Array(Rc<PhpArray>)` |
 | `IS_OBJECT` (`Closure`) | `Value::Closure(Rc<PhpClosure>)` |
 | `IS_OBJECT` (`zend_object`) | `Value::Object(Rc<RefCell<PhpObject>>)` |
-| `ZVAL_DEREF`, reference zvals | not implemented |
+| `ZVAL_DEREF`, reference zvals | `Value::Ref(Rc<RefCell<Value>>)`, `Value::deref` |
 | `IS_RESOURCE` | not implemented |
 
 | Behaviour | php-src location | PHPCraft |
