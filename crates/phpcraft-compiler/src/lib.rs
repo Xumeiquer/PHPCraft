@@ -1404,6 +1404,51 @@ impl FnCompiler {
         Ok(())
     }
 
+    /// Lower the `(...)` first-class callable forms to a Closure value. The
+    /// inner expression is the matching call node with no arguments.
+    fn compile_first_class_callable(&mut self, inner: &Expr) -> Result<(), CompileError> {
+        match inner {
+            Expr::Call { name, args } if args.is_empty() => {
+                let (name, fallback) = self.resolve_function_call(name);
+                let index = self.const_str(name.as_bytes());
+                self.emit(Op::MakeFunctionCallable {
+                    name: index,
+                    fallback,
+                });
+            }
+            Expr::MethodCall {
+                object,
+                method,
+                args,
+            } if args.is_empty() => {
+                self.expr(object)?;
+                let index = self.const_str(method.as_bytes());
+                self.emit(Op::MakeMethodCallable { method: index });
+            }
+            Expr::StaticCall {
+                class,
+                method,
+                args,
+            } if args.is_empty() => {
+                let class_name = self.qualify_class(class);
+                let class = self.const_str(class_name.as_bytes());
+                let method = self.const_str(method.as_bytes());
+                self.emit(Op::MakeStaticCallable { class, method });
+            }
+            Expr::DynamicCall { callee, args } if args.is_empty() => {
+                self.expr(callee)?;
+                self.emit(Op::CallableFromValue);
+            }
+            _ => {
+                return Err(CompileError::new(
+                    "Cannot create Closure for this expression",
+                    self.line,
+                ))
+            }
+        }
+        Ok(())
+    }
+
     fn compile_closure(&mut self, decl: &ClosureDecl) -> Result<(), CompileError> {
         let captures: Vec<(String, bool)> = if decl.is_arrow() {
             let params: HashSet<String> = decl.params.iter().map(|p| p.name.clone()).collect();
@@ -1664,6 +1709,7 @@ impl FnCompiler {
                     argc: args.len() as u32,
                 });
             }
+            Expr::FirstClassCallable(inner) => self.compile_first_class_callable(inner)?,
             Expr::New { class, args } => {
                 let class_name = self.qualify_class(class);
                 let signature = self
@@ -2098,6 +2144,7 @@ fn collect_free_vars(
                 collect_free_vars(arg, params, out, seen);
             }
         }
+        Expr::FirstClassCallable(inner) => collect_free_vars(inner, params, out, seen),
         Expr::New { args, .. } | Expr::StaticCall { args, .. } => {
             for arg in args {
                 collect_free_vars(arg, params, out, seen);

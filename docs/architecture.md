@@ -117,7 +117,16 @@ Anonymous functions compile to ordinary `Function` bodies with synthetic
 names. `MakeClosure` captures values into a `PhpClosure`; the body's
 `capture_slots` bind those values when the closure is invoked. Arrow functions
 collect free variables at compile time and use the same runtime path. Dynamic
-calls use `CallValue`, which dispatches closures and callable strings.
+calls use `CallValue`, which dispatches closures, callable strings, callable
+arrays and objects with `__invoke()`.
+
+First-class callable syntax lowers to `MakeFunctionCallable`,
+`MakeMethodCallable`, `MakeStaticCallable` and `CallableFromValue`. The
+resulting `PhpClosure` carries a `CallableInfo` record with the PHP-visible
+function name, the bound receiver (`$this`), and the declaring and called
+classes, so invocation reuses the ordinary method-call path. Builtin parameter
+metadata for `var_dump()`/`print_r()` comes from the generated
+`phpcraft-stdlib/src/signatures.rs` table.
 
 ## Control flow
 
@@ -162,8 +171,10 @@ writing), and `vendor/php-src` tracks branch `PHP-8.5`.
 
 Deliberately unimplemented (they produce explicit errors): attributes,
 interfaces, traits, enums, references rooted inside object/static-property
-dimensions, reference destructuring in `list()`, first-class callable syntax,
-named arguments and alternative control syntax. The implemented
+dimensions, reference destructuring in `list()`, named arguments and
+alternative control syntax. First-class callable syntax and callable arrays
+are implemented; `Closure::fromCallable()`/`Closure::bind()` are not. The
+implemented
 by-reference builtins are `sort`, `rsort`, `asort`, `arsort`, `ksort`,
 `krsort`, `array_push`, `array_pop`, `array_shift` and `array_unshift`.
 `sort()` flags cover `SORT_REGULAR`, `SORT_NUMERIC`, `SORT_STRING`,

@@ -1086,10 +1086,17 @@ impl Parser {
                 continue;
             }
             if self.eat(&Tok::LParen) {
-                let args = self.parse_call_args()?;
-                lhs = Expr::DynamicCall {
-                    callee: Box::new(lhs),
-                    args,
+                lhs = match self.parse_call_args()? {
+                    CallArguments::List(args) => Expr::DynamicCall {
+                        callee: Box::new(lhs),
+                        args,
+                    },
+                    CallArguments::FirstClass => {
+                        Expr::FirstClassCallable(Box::new(Expr::DynamicCall {
+                            callee: Box::new(lhs),
+                            args: Vec::new(),
+                        }))
+                    }
                 };
                 continue;
             }
@@ -1108,11 +1115,19 @@ impl Parser {
                     }
                 };
                 lhs = if self.eat(&Tok::LParen) {
-                    let args = self.parse_call_args()?;
-                    Expr::MethodCall {
-                        object: Box::new(lhs),
-                        method: name,
-                        args,
+                    match self.parse_call_args()? {
+                        CallArguments::List(args) => Expr::MethodCall {
+                            object: Box::new(lhs),
+                            method: name,
+                            args,
+                        },
+                        CallArguments::FirstClass => {
+                            Expr::FirstClassCallable(Box::new(Expr::MethodCall {
+                                object: Box::new(lhs),
+                                method: name,
+                                args: Vec::new(),
+                            }))
+                        }
                     }
                 } else {
                     Expr::Property {
@@ -1134,11 +1149,19 @@ impl Parser {
                 }
                 let name = self.expect_ident()?;
                 lhs = if self.eat(&Tok::LParen) {
-                    let args = self.parse_call_args()?;
-                    Expr::StaticCall {
-                        class,
-                        method: name,
-                        args,
+                    match self.parse_call_args()? {
+                        CallArguments::List(args) => Expr::StaticCall {
+                            class,
+                            method: name,
+                            args,
+                        },
+                        CallArguments::FirstClass => {
+                            Expr::FirstClassCallable(Box::new(Expr::StaticCall {
+                                class,
+                                method: name,
+                                args: Vec::new(),
+                            }))
+                        }
                     }
                 } else {
                     Expr::ClassConst { class, name }
@@ -1428,7 +1451,14 @@ impl Parser {
                         }
                         let class = self.parse_qualified_name()?;
                         let args = if self.eat(&Tok::LParen) {
-                            self.parse_call_args()?
+                            match self.parse_call_args()? {
+                                CallArguments::List(args) => args,
+                                CallArguments::FirstClass => {
+                                    return Err(
+                                        self.error("Cannot create Closure for new expression")
+                                    )
+                                }
+                            }
                         } else {
                             Vec::new()
                         };
@@ -1476,8 +1506,7 @@ impl Parser {
                             name.push_str(&self.expect_ident()?);
                         }
                         if self.eat(&Tok::LParen) {
-                            let args = self.parse_call_args()?;
-                            Ok(Expr::Call { name, args })
+                            self.finish_function_call(name)
                         } else {
                             Ok(Expr::Name(name))
                         }
@@ -1490,8 +1519,7 @@ impl Parser {
                             name.push_str(&self.expect_ident()?);
                         }
                         if self.eat(&Tok::LParen) {
-                            let args = self.parse_call_args()?;
-                            Ok(Expr::Call { name, args })
+                            self.finish_function_call(name)
                         } else {
                             Ok(Expr::Name(name))
                         }
@@ -1501,8 +1529,7 @@ impl Parser {
             Tok::Backslash => {
                 let name = self.parse_qualified_name()?;
                 if self.eat(&Tok::LParen) {
-                    let args = self.parse_call_args()?;
-                    Ok(Expr::Call { name, args })
+                    self.finish_function_call(name)
                 } else {
                     Ok(Expr::Name(name))
                 }
@@ -1605,10 +1632,28 @@ impl Parser {
         Ok(Expr::Array(items))
     }
 
-    fn parse_call_args(&mut self) -> Result<Vec<Expr>, ParseError> {
+    /// Finish a named-function call after its `(` was consumed. `(...)` is
+    /// first-class callable syntax rather than an empty argument list.
+    fn finish_function_call(&mut self, name: String) -> Result<Expr, ParseError> {
+        Ok(match self.parse_call_args()? {
+            CallArguments::List(args) => Expr::Call { name, args },
+            CallArguments::FirstClass => Expr::FirstClassCallable(Box::new(Expr::Call {
+                name,
+                args: Vec::new(),
+            })),
+        })
+    }
+
+    fn parse_call_args(&mut self) -> Result<CallArguments, ParseError> {
         let mut args = Vec::new();
         if self.eat(&Tok::RParen) {
-            return Ok(args);
+            return Ok(CallArguments::List(args));
+        }
+        // `(...)` is the PHP 8.1 first-class callable syntax.
+        if self.peek() == &Tok::Ellipsis && self.peek_at(1) == &Tok::RParen {
+            self.advance();
+            self.advance();
+            return Ok(CallArguments::FirstClass);
         }
         loop {
             if self.eat(&Tok::RParen) {
@@ -1631,8 +1676,15 @@ impl Parser {
             self.expect(&Tok::RParen)?;
             break;
         }
-        Ok(args)
+        Ok(CallArguments::List(args))
     }
+}
+
+/// Arguments of a call: either an ordinary list or the `(...)` marker that
+/// creates a first-class callable.
+enum CallArguments {
+    List(Vec<Expr>),
+    FirstClass,
 }
 
 fn assignment_op(tok: &Tok) -> Option<Option<BinOp>> {
@@ -1780,6 +1832,43 @@ mod tests {
             &program.stmts[2],
             Stmt::Expr(Expr::DynamicCall { .. })
         ));
+    }
+
+    #[test]
+    fn parses_first_class_callables() {
+        let program = parse_file(
+            br#"<?php
+                $a = strlen(...);
+                $b = $object->method(...);
+                $c = Foo::bar(...);
+                $d = $callable(...);
+            "#,
+        )
+        .unwrap();
+        let values: Vec<&Expr> = program
+            .stmts
+            .iter()
+            .map(|stmt| match stmt {
+                Stmt::Expr(Expr::Assign { value, .. }) => value.as_ref(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        for value in &values {
+            assert!(matches!(value, Expr::FirstClassCallable(_)));
+        }
+        match values[1] {
+            Expr::FirstClassCallable(inner) => {
+                assert!(matches!(inner.as_ref(), Expr::MethodCall { args, .. } if args.is_empty()))
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match values[2] {
+            Expr::FirstClassCallable(inner) => {
+                assert!(matches!(inner.as_ref(), Expr::StaticCall { args, .. } if args.is_empty()))
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(parse_file(br#"<?php $f = new Foo(...);"#).is_err());
     }
 
     #[test]

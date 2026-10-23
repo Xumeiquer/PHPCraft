@@ -301,6 +301,10 @@ pub enum Expr {
         callee: Box<Expr>,
         args: Vec<Expr>,
     },
+    /// First-class callable syntax: `strlen(...)`, `$object->method(...)`,
+    /// `Class::method(...)` or `$callable(...)`. The inner expression is the
+    /// corresponding call with an empty argument list.
+    FirstClassCallable(Box<Expr>),
     /// `new Class(...)`.
     New {
         class: String,

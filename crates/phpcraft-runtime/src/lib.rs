@@ -13,7 +13,8 @@ pub use array::{Key, PhpArray};
 pub use error::{ErrorKind, PhpError, PhpResult};
 pub use value::{
     compare, float_to_fixed, float_to_general, float_to_repr, float_to_string, key_from_value,
-    loose_eq, strict_eq, ExceptionData, Numeric, PhpClosure, PhpObject, PhpStr, ToNumber, Value,
+    loose_eq, strict_eq, CallableInfo, ExceptionData, Numeric, PhpClosure, PhpObject, PhpStr,
+    ToNumber, Value,
 };
 
 /// Services the standard library needs from the engine while a script runs.
@@ -44,6 +45,17 @@ pub trait RuntimeHooks {
 
     /// Whether a function (builtin or userland) exists.
     fn function_exists(&mut self, name: &str) -> bool;
+
+    /// Whether a value can be invoked. The default implementation covers the
+    /// subset lightweight test hooks understand; the VM also recognizes
+    /// callable arrays, `Class::method` strings and objects with `__invoke`.
+    fn is_callable(&mut self, value: &Value) -> bool {
+        match value {
+            Value::Closure(_) => true,
+            Value::Str(name) => self.function_exists(&String::from_utf8_lossy(name.as_bytes())),
+            _ => false,
+        }
+    }
 
     /// Look up a runtime constant (`PHP_EOL`, user `define()`d values, ...).
     fn constant(&mut self, name: &str) -> Option<Value>;

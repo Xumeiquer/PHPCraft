@@ -449,24 +449,365 @@ impl Vm {
         }
     }
 
-    /// Invoke a callable value: a closure or a function name.
+    /// Invoke a callable value: a closure, function name, `Class::method`
+    /// string, callable array or object with `__invoke`.
     pub fn invoke(&mut self, callable: Value, args: Vec<Value>) -> PhpResult<Value> {
-        match callable {
+        match callable.deref() {
             Value::Closure(closure) => {
                 let lower = closure.function.to_ascii_lowercase();
-                let function = self.functions.get(&lower).cloned().ok_or_else(|| {
-                    PhpError::fatal(format!("Closure function {} not found", closure.function))
-                })?;
-                self.call_function_with_captures(function, &closure.captures, args)
+                if let Some(function) = self.functions.get(&lower).cloned() {
+                    let (this, scope, called) = match &closure.callable {
+                        Some(info) => (
+                            info.this.clone(),
+                            info.scope.clone(),
+                            info.called_class.clone(),
+                        ),
+                        None => (None, None, None),
+                    };
+                    return self.call_function_with_context(
+                        function,
+                        &closure.captures,
+                        this,
+                        scope,
+                        called,
+                        args,
+                    );
+                }
+                // First-class callables may target a builtin function, which
+                // has no entry in the userland function table.
+                if closure.callable.is_some() && phpcraft_stdlib::find(&lower).is_some() {
+                    return self.call_named(&closure.function, args);
+                }
+                Err(PhpError::fatal(format!(
+                    "Closure function {} not found",
+                    closure.function
+                )))
             }
             Value::Str(name) => {
                 let name = String::from_utf8_lossy(name.as_bytes()).into_owned();
-                self.call_named(&name, args)
+                match name.rsplit_once("::") {
+                    Some((class, method)) => self.call_static_callable(class, method, args),
+                    None => self.call_named(&name, args),
+                }
+            }
+            Value::Array(array) => self.invoke_callable_array(&array, args),
+            Value::Object(object) => {
+                let class = object.borrow().class_name.clone();
+                if self.find_method(&class, "__invoke").is_some() {
+                    self.call_method_value(Value::Object(object), "__invoke", args)
+                } else {
+                    Err(PhpError::fatal(format!(
+                        "Object of class {} is not callable",
+                        class
+                    )))
+                }
             }
             other => Err(PhpError::fatal(format!(
                 "Value of type {} is not callable",
                 other.debug_type_name()
             ))),
+        }
+    }
+
+    fn next_closure_id(&mut self) -> u64 {
+        let id = self.next_object_id;
+        self.next_object_id += 1;
+        id
+    }
+
+    fn function_parameters(&self, name: &str) -> Vec<(String, bool)> {
+        self.functions
+            .get(&name.to_ascii_lowercase())
+            .map(|function| {
+                function
+                    .params
+                    .iter()
+                    .map(|param| {
+                        (
+                            param.name.clone(),
+                            param.default.is_some() || param.variadic,
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Build the Closure returned by `function_name(...)`.
+    fn make_function_callable(&mut self, name: &str, fallback: bool) -> PhpResult<Value> {
+        let mut resolved = name.to_string();
+        let mut exists = self.function_exists(&resolved);
+        if !exists && fallback {
+            if let Some((_, short)) = resolved.rsplit_once('\\') {
+                if self.function_exists(short) {
+                    resolved = short.to_string();
+                    exists = true;
+                }
+            }
+        }
+        if !exists {
+            return Err(PhpError::fatal(format!(
+                "Call to undefined function {resolved}()"
+            )));
+        }
+        let display = self
+            .functions
+            .get(&resolved.to_ascii_lowercase())
+            .map(|function| function.name.clone())
+            .unwrap_or_else(|| resolved.to_ascii_lowercase());
+        let parameters = if self.functions.contains_key(&resolved.to_ascii_lowercase()) {
+            self.function_parameters(&resolved)
+        } else {
+            phpcraft_stdlib::parameters(&resolved.to_ascii_lowercase())
+                .iter()
+                .map(|(name, optional)| ((*name).to_string(), *optional))
+                .collect()
+        };
+        let id = self.next_closure_id();
+        Ok(Value::first_class_callable(
+            resolved, display, None, None, None, id, parameters,
+        ))
+    }
+
+    /// Build the Closure returned by `$object->method(...)`.
+    fn make_method_callable(&mut self, object: Value, method: &str) -> PhpResult<Value> {
+        let object = object.deref();
+        let class = object.object_class().ok_or_else(|| {
+            PhpError::fatal(format!(
+                "Call to a member function {}() on {}",
+                method,
+                object.debug_type_name()
+            ))
+        })?;
+        let Some((function, owner, is_static)) = self.find_method(&class, method) else {
+            return Err(PhpError::fatal(format!(
+                "Call to undefined method {}::{}()",
+                class, method
+            )));
+        };
+        let display = function.name.clone();
+        let parameters = function
+            .params
+            .iter()
+            .map(|param| {
+                (
+                    param.name.clone(),
+                    param.default.is_some() || param.variadic,
+                )
+            })
+            .collect();
+        let this = if is_static { None } else { Some(object) };
+        let id = self.next_closure_id();
+        Ok(Value::first_class_callable(
+            display.clone(),
+            display,
+            this,
+            Some(owner),
+            Some(class),
+            id,
+            parameters,
+        ))
+    }
+
+    /// Build the Closure returned by `Class::method(...)`.
+    fn make_static_callable(&mut self, class: &str, method: &str) -> PhpResult<Value> {
+        let canonical = self
+            .canonical_class_name(class)
+            .ok_or_else(|| PhpError::fatal(format!("Class \"{class}\" not found")))?;
+        let Some((function, owner, is_static)) = self.find_method(&canonical, method) else {
+            return Err(PhpError::fatal(format!(
+                "Call to undefined method {}::{}()",
+                canonical, method
+            )));
+        };
+        if !is_static {
+            return Err(PhpError::fatal(format!(
+                "Non-static method {} cannot be called statically",
+                function.name
+            )));
+        }
+        let display = function.name.clone();
+        let parameters = function
+            .params
+            .iter()
+            .map(|param| {
+                (
+                    param.name.clone(),
+                    param.default.is_some() || param.variadic,
+                )
+            })
+            .collect();
+        let id = self.next_closure_id();
+        Ok(Value::first_class_callable(
+            display.clone(),
+            display,
+            None,
+            Some(owner),
+            Some(canonical),
+            id,
+            parameters,
+        ))
+    }
+
+    /// Build a Closure from the callable value used in `$callable(...)`.
+    fn callable_from_value(&mut self, value: Value) -> PhpResult<Value> {
+        match value.deref() {
+            Value::Closure(closure) => {
+                let Some(info) = &closure.callable else {
+                    // `$closure(...)` returns the same closure object.
+                    return Ok(Value::Closure(closure));
+                };
+                let id = self.next_closure_id();
+                Ok(Value::first_class_callable(
+                    closure.function.clone(),
+                    info.function.clone(),
+                    info.this.clone(),
+                    info.scope.clone(),
+                    info.called_class.clone(),
+                    id,
+                    closure.parameters.clone(),
+                ))
+            }
+            Value::Str(name) => {
+                let name = String::from_utf8_lossy(name.as_bytes()).into_owned();
+                match name.rsplit_once("::") {
+                    Some((class, method)) => self.make_static_callable(class, method),
+                    None => self.make_function_callable(&name, false),
+                }
+            }
+            Value::Array(array) => self.make_array_callable(&array),
+            Value::Object(object) => {
+                let class = object.borrow().class_name.clone();
+                if self.find_method(&class, "__invoke").is_some() {
+                    self.make_method_callable(Value::Object(object), "__invoke")
+                } else {
+                    Err(PhpError::fatal(format!(
+                        "Object of class {} is not callable",
+                        class
+                    )))
+                }
+            }
+            other => Err(PhpError::fatal(format!(
+                "Value of type {} is not callable",
+                other.debug_type_name()
+            ))),
+        }
+    }
+
+    /// Resolve a callable array (`[$object, "method"]` / `["Class", "method"]`).
+    fn make_array_callable(&mut self, array: &PhpArray) -> PhpResult<Value> {
+        let (first, second) = self.callable_array_parts(array)?;
+        match first.deref() {
+            Value::Object(object) => {
+                let method = callable_method_name(&second)?;
+                self.make_method_callable(Value::Object(object), &method)
+            }
+            Value::Str(class) => {
+                let class = String::from_utf8_lossy(class.as_bytes()).into_owned();
+                let method = callable_method_name(&second)?;
+                self.make_static_callable(&class, &method)
+            }
+            _ => Err(PhpError::fatal(
+                "First array member is not a valid class name or object",
+            )),
+        }
+    }
+
+    fn invoke_callable_array(&mut self, array: &PhpArray, args: Vec<Value>) -> PhpResult<Value> {
+        let (first, second) = self.callable_array_parts(array)?;
+        match first.deref() {
+            Value::Object(object) => {
+                let method = callable_method_name(&second)?;
+                self.call_method_value(Value::Object(object), &method, args)
+            }
+            Value::Str(class) => {
+                let class = String::from_utf8_lossy(class.as_bytes()).into_owned();
+                let method = callable_method_name(&second)?;
+                self.call_static_callable(&class, &method, args)
+            }
+            _ => Err(PhpError::fatal(
+                "First array member is not a valid class name or object",
+            )),
+        }
+    }
+
+    fn callable_array_parts(&self, array: &PhpArray) -> PhpResult<(Value, Value)> {
+        if array.len() != 2 {
+            return Err(PhpError::fatal(
+                "Array callback must have exactly two elements",
+            ));
+        }
+        let first = array
+            .get_int(0)
+            .cloned()
+            .ok_or_else(|| PhpError::fatal("Array callback must have exactly two elements"))?;
+        let second = array
+            .get_int(1)
+            .cloned()
+            .ok_or_else(|| PhpError::fatal("Array callback must have exactly two elements"))?;
+        Ok((first, second))
+    }
+
+    fn call_static_callable(
+        &mut self,
+        class: &str,
+        method: &str,
+        args: Vec<Value>,
+    ) -> PhpResult<Value> {
+        let canonical = self
+            .canonical_class_name(class)
+            .ok_or_else(|| PhpError::fatal(format!("Class \"{class}\" not found")))?;
+        let Some((function, owner, is_static)) = self.find_method(&canonical, method) else {
+            return Err(PhpError::fatal(format!(
+                "Call to undefined method {}::{}()",
+                canonical, method
+            )));
+        };
+        if !is_static {
+            return Err(PhpError::fatal(format!(
+                "Non-static method {} cannot be called statically",
+                function.name
+            )));
+        }
+        self.call_function_with_context(function, &[], None, Some(owner), Some(canonical), args)
+    }
+
+    /// Static-method/string callable test used by `is_callable()`.
+    fn callable_name_exists(&mut self, name: &str) -> bool {
+        match name.rsplit_once("::") {
+            Some((class, method)) => self
+                .canonical_class_name(class)
+                .and_then(|canonical| self.find_method(&canonical, method))
+                .is_some_and(|(_, _, is_static)| is_static),
+            None => self.function_exists(name),
+        }
+    }
+
+    fn array_is_callable(&mut self, array: &PhpArray) -> bool {
+        if array.len() != 2 {
+            return false;
+        }
+        let (Some(first), Some(second)) = (array.get_int(0), array.get_int(1)) else {
+            return false;
+        };
+        let first = first.deref();
+        let second = second.deref();
+        let Value::Str(method) = second else {
+            return false;
+        };
+        let method = String::from_utf8_lossy(method.as_bytes()).into_owned();
+        match first {
+            Value::Object(object) => {
+                let class = object.borrow().class_name.clone();
+                self.find_method(&class, &method).is_some()
+            }
+            Value::Str(class) => {
+                let class = String::from_utf8_lossy(class.as_bytes()).into_owned();
+                self.canonical_class_name(&class)
+                    .and_then(|canonical| self.find_method(&canonical, &method))
+                    .is_some_and(|(_, _, is_static)| is_static)
+            }
+            _ => false,
         }
     }
 
@@ -1480,6 +1821,29 @@ impl Vm {
                             captures,
                         ));
                     }
+                    Op::MakeFunctionCallable { name, fallback } => {
+                        let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        let callable = self.make_function_callable(&name, *fallback)?;
+                        stack.push(callable);
+                    }
+                    Op::MakeMethodCallable { method } => {
+                        let object = stack.pop().unwrap_or(Value::Null);
+                        let method = String::from_utf8_lossy(chunk.const_str(*method)).into_owned();
+                        let callable = self.make_method_callable(object, &method)?;
+                        stack.push(callable);
+                    }
+                    Op::MakeStaticCallable { class, method } => {
+                        let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
+                        let method = String::from_utf8_lossy(chunk.const_str(*method)).into_owned();
+                        let class = self.resolve_class_marker(&class, frame)?;
+                        let callable = self.make_static_callable(&class, &method)?;
+                        stack.push(callable);
+                    }
+                    Op::CallableFromValue => {
+                        let value = stack.pop().unwrap_or(Value::Null);
+                        let callable = self.callable_from_value(value)?;
+                        stack.push(callable);
+                    }
                     Op::ThrowUnhandledMatch { subject } => {
                         let value = frame.get(*subject);
                         return Err(PhpError::new(
@@ -2289,12 +2653,36 @@ impl RuntimeHooks for Vm {
         self.functions.contains_key(&lower) || phpcraft_stdlib::find(&lower).is_some()
     }
 
+    fn is_callable(&mut self, value: &Value) -> bool {
+        match value.deref() {
+            Value::Closure(_) => true,
+            Value::Str(name) => {
+                let name = String::from_utf8_lossy(name.as_bytes()).into_owned();
+                self.callable_name_exists(&name)
+            }
+            Value::Array(array) => self.array_is_callable(&array),
+            Value::Object(object) => {
+                let class = object.borrow().class_name.clone();
+                self.find_method(&class, "__invoke").is_some()
+            }
+            _ => false,
+        }
+    }
+
     fn constant(&mut self, name: &str) -> Option<Value> {
         self.constants.get(name).cloned()
     }
 
     fn define_constant(&mut self, name: &str, value: Value) {
         self.define_constant(name, value);
+    }
+}
+
+/// Method name from a callable array's second element.
+fn callable_method_name(value: &Value) -> PhpResult<String> {
+    match value.deref() {
+        Value::Str(name) => Ok(String::from_utf8_lossy(name.as_bytes()).into_owned()),
+        _ => Err(PhpError::fatal("Second array member is not a valid method")),
     }
 }
 
@@ -2470,6 +2858,28 @@ mod tests {
             echo count($a), "|", count($b), "|", implode(",", $b);
         "#);
         assert_eq!(out, "3|5|1,2,3,4,5");
+    }
+
+    #[test]
+    fn first_class_callables_and_callable_arrays() {
+        let (out, _) = run(r#"<?php
+            function add($a, $b = 2) { return $a + $b; }
+            class Greeter {
+                public $prefix;
+                function __construct($prefix) { $this->prefix = $prefix; }
+                function greet($name) { return $this->prefix . $name; }
+                static function up($text) { return strtoupper($text); }
+            }
+            $greeter = new Greeter("hi ");
+            $add = add(...);
+            $greet = $greeter->greet(...);
+            $up = Greeter::up(...);
+            $callable = [$greeter, "greet"];
+            echo $add(1), "|", $greet("x"), "|", $up("ok"), "|", $callable("y"), "|";
+            echo array_map($callable, ["z"])[0], "|";
+            var_dump(is_callable($callable), is_callable([Greeter::class, "greet"]));
+        "#);
+        assert_eq!(out, "3|hi x|OK|hi y|hi z|bool(true)\nbool(false)\n");
     }
 
     #[test]

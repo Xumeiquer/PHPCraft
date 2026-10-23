@@ -131,6 +131,23 @@ pub enum Op {
         name: u32,
         argc: u32,
     },
+    /// Build a Closure for a named function or builtin (`strlen(...)`).
+    /// `fallback` mirrors [`Op::Call`]'s namespaced-to-global resolution.
+    MakeFunctionCallable {
+        name: u32,
+        fallback: bool,
+    },
+    /// Pop an object and build a Closure bound to one of its methods.
+    MakeMethodCallable {
+        method: u32,
+    },
+    /// Build a Closure for `Class::method(...)`.
+    MakeStaticCallable {
+        class: u32,
+        method: u32,
+    },
+    /// Wrap the callable value on the stack into a Closure (`$callable(...)`).
+    CallableFromValue,
 
     /// Abort with `UnhandledMatchError` after no match arm was selected.
     ThrowUnhandledMatch {

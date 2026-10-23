@@ -15,8 +15,8 @@ gitignored.
 | `Zend/zend_compile.c`, `Zend/zend_compile.h` | `crates/phpcraft-compiler/src/lib.rs` | AST lowering, jump patching, function hoisting, namespace/import resolution, magic constants, constant folding for parameter defaults. |
 | `Zend/zend_opcode.c`, `Zend/zend_vm_opcodes.h` | `crates/phpcraft-bytecode/src/lib.rs` | `Op`, `Chunk`, `Function`, `CompiledProgram`. Stack machine instead of Zend's register slots. |
 | `Zend/zend_vm_def.h`, `Zend/zend_vm_execute.h` | `crates/phpcraft-vm/src/lib.rs` | Dispatch loop, frames, variable fetch/store, iterators. |
-| `Zend/zend_execute.c` | `crates/phpcraft-vm/src/lib.rs` | Function calls, `global` binding, reference cells and by-reference parameter binding, return values, nesting guard, runtime includes. |
-| `Zend/zend_closures.c` | `crates/phpcraft-runtime/src/value.rs`, `crates/phpcraft-vm/src/lib.rs` | `PhpClosure`, capture binding and invocation. |
+| `Zend/zend_execute.c` | `crates/phpcraft-vm/src/lib.rs` | Function calls, callable resolution (arrays, strings, `__invoke`), `global` binding, reference cells and by-reference parameter binding, return values, nesting guard, runtime includes. |
+| `Zend/zend_closures.c` | `crates/phpcraft-runtime/src/value.rs`, `crates/phpcraft-vm/src/lib.rs` | `PhpClosure`, capture binding, first-class callable metadata (`CallableInfo`) and invocation. |
 | `Zend/zend_objects.c`, `Zend/zend_object_handlers.c` | `crates/phpcraft-runtime/src/value.rs`, `crates/phpcraft-vm/src/lib.rs` | `PhpObject`, class registry, property storage, method dispatch and inheritance. |
 | `Zend/zend_exceptions.c` | `crates/phpcraft-runtime/src/error.rs`, `crates/phpcraft-vm/src/lib.rs` | `ExceptionData`, built-in exception hierarchy, `throw` and catch matching. |
 | `Zend/zend_types.h` | `crates/phpcraft-runtime/src/value.rs` | `Value` corresponds to `zval`; `PhpStr` to `zend_string`. |
@@ -74,6 +74,7 @@ fetch/assign instructions.
 | `CallValue` | `ZEND_INIT_DYNAMIC_CALL`, `ZEND_DO_FCALL` |
 | `Include` | `ZEND_INCLUDE_OR_EVAL` |
 | `MakeClosure` | `ZEND_DECLARE_LAMBDA_FUNCTION`, `ZEND_BIND_LEXICAL` |
+| `MakeFunctionCallable`, `MakeMethodCallable`, `MakeStaticCallable`, `CallableFromValue` | `ZEND_INIT_FCALL`/`ZEND_INIT_METHOD_CALL`/`ZEND_INIT_STATIC_METHOD_CALL` with `ZEND_CALLABLE_CONVERT` |
 | `NewObject` | `ZEND_NEW`, `ZEND_DO_FCALL` (constructor) |
 | `LoadProperty`, `AssignProperty`, `MakePropertyRef`, `SetPropertyRef`, `UnsetProperty` | `ZEND_FETCH_OBJ_R`, `ZEND_ASSIGN_OBJ`, `ZEND_ASSIGN_OBJ_REF`, `ZEND_UNSET_OBJ` |
 | `CallMethod`, `CallStaticMethod` | `ZEND_INIT_METHOD_CALL`, `ZEND_INIT_STATIC_METHOD_CALL`, `ZEND_DO_FCALL` |

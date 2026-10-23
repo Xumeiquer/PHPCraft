@@ -93,14 +93,16 @@ exceptions with `try`/`catch`/`finally`, namespaces and `use` imports, magic
 constants, `include`/`require` forms, references (variables, array elements,
 object properties, static properties, by-reference `foreach` and returns,
 by-reference variadics), by-reference parameters and closure captures,
-`unset`, closure captures and array builtins, `global`, `isset`/`empty`, casts,
+`unset`, closure captures and array builtins, first-class callable syntax
+(`strlen(...)`, `$object->method(...)`, `Class::method(...)`), callable arrays
+and callable strings (including `Class::method`), `is_callable()` and callbacks
+through `call_user_func()`/`array_map()`, `global`, `isset`/`empty`, casts,
 string/array/math/type builtins, and CLI behaviour matching `php`
 (stdout/stderr separation, exit status 255 on fatal errors).
 
 Not yet implemented: references rooted inside object/static-property
 dimensions (for example taking `&$object->items[0]`), reference destructuring
-in `list()`, first-class callable syntax, named arguments and alternative
-control syntax. `sort()` supports `SORT_REGULAR`, `SORT_NUMERIC`,
+in `list()`, named arguments and alternative control syntax. `sort()` supports `SORT_REGULAR`, `SORT_NUMERIC`,
 `SORT_STRING`, `SORT_LOCALE_STRING` and `SORT_FLAG_CASE`; `SORT_NATURAL` and
 unknown flags raise explicit errors. Unsupported constructs produce explicit
 parse or compile errors rather than silently misbehaving.

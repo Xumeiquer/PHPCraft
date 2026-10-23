@@ -11,6 +11,10 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+mod signatures;
+
+pub use signatures::parameters;
+
 use phpcraft_runtime::value::parse_numeric;
 use phpcraft_runtime::{
     compare, float_to_fixed, float_to_general, float_to_repr, key_from_value, loose_eq, strict_eq,
@@ -1885,7 +1889,7 @@ fn array_map(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value>
     let array = as_array(&args, 1, "array_map", "array")?;
     let callback = match &args[0] {
         Value::Null => None,
-        Value::Str(_) | Value::Closure(_) => Some(args[0].clone()),
+        value if hooks.is_callable(value) => Some(args[0].clone()),
         other => {
             return Err(type_error_arg(
                 "array_map",
@@ -2712,12 +2716,7 @@ fn is_scalar(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value
 
 fn is_callable(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
     arity("is_callable", &args, 1, Some(3))?;
-    let result = match &args[0] {
-        Value::Str(name) => hooks.function_exists(&String::from_utf8_lossy(name.as_bytes())),
-        Value::Closure(_) => true,
-        _ => false,
-    };
-    Ok(Value::Bool(result))
+    Ok(Value::Bool(hooks.is_callable(&args[0])))
 }
 
 fn call_user_func(hooks: &mut dyn RuntimeHooks, mut args: Vec<Value>) -> PhpResult<Value> {
@@ -2861,6 +2860,47 @@ fn dump_value(
                     }
                 }
                 dump_value(item, depth + 1, true, active, out);
+            }
+            out.extend(std::iter::repeat_n(b' ', depth * 2));
+            out.extend_from_slice(b"}\n");
+        }
+        Value::Closure(closure) if closure.callable.is_some() => {
+            let info = closure.callable.as_ref().expect("checked above");
+            let properties =
+                1 + usize::from(info.this.is_some()) + usize::from(!closure.parameters.is_empty());
+            out.extend_from_slice(
+                format!("object(Closure)#{} ({properties}) {{\n", closure.id).as_bytes(),
+            );
+            let property_indent = (depth + 1) * 2;
+            out.extend(std::iter::repeat_n(b' ', property_indent));
+            out.extend_from_slice(b"[\"function\"]=>\n");
+            dump_value(
+                &Value::from_str_lit(&info.function),
+                depth + 1,
+                false,
+                active,
+                out,
+            );
+            if let Some(this) = &info.this {
+                out.extend(std::iter::repeat_n(b' ', property_indent));
+                out.extend_from_slice(b"[\"this\"]=>\n");
+                dump_value(this, depth + 1, false, active, out);
+            }
+            if !closure.parameters.is_empty() {
+                out.extend(std::iter::repeat_n(b' ', property_indent));
+                out.extend_from_slice(b"[\"parameter\"]=>\n");
+                let mut parameters = PhpArray::new();
+                for (name, optional) in &closure.parameters {
+                    parameters.insert(
+                        Key::from_str(&format!("${name}")),
+                        Value::from_str_lit(if *optional {
+                            "<optional>"
+                        } else {
+                            "<required>"
+                        }),
+                    );
+                }
+                dump_value(&Value::array(parameters), depth + 1, false, active, out);
             }
             out.extend(std::iter::repeat_n(b' ', depth * 2));
             out.extend_from_slice(b"}\n");
@@ -3074,15 +3114,22 @@ fn print_closure(
 ) {
     out.extend_from_slice(b"Closure Object\n");
     let mut properties = PhpArray::new();
-    properties.insert_str("name", Value::from_str_lit(&closure.name));
-    properties.insert_str("file", Value::from_str_lit(&closure.file));
-    properties.insert_str("line", Value::Int(i64::from(closure.line)));
-    if !closure.captures.is_empty() {
-        let mut captures = PhpArray::new();
-        for (name, value) in closure.capture_names.iter().zip(closure.captures.iter()) {
-            captures.insert(Key::from_str(name), value.clone());
+    if let Some(info) = &closure.callable {
+        properties.insert_str("function", Value::from_str_lit(&info.function));
+        if let Some(this) = &info.this {
+            properties.insert_str("this", this.clone());
         }
-        properties.insert_str("static", Value::array(captures));
+    } else {
+        properties.insert_str("name", Value::from_str_lit(&closure.name));
+        properties.insert_str("file", Value::from_str_lit(&closure.file));
+        properties.insert_str("line", Value::Int(i64::from(closure.line)));
+        if !closure.captures.is_empty() {
+            let mut captures = PhpArray::new();
+            for (name, value) in closure.capture_names.iter().zip(closure.captures.iter()) {
+                captures.insert(Key::from_str(name), value.clone());
+            }
+            properties.insert_str("static", Value::array(captures));
+        }
     }
     if !closure.parameters.is_empty() {
         let mut parameters = PhpArray::new();

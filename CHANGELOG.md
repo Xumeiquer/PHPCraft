@@ -37,6 +37,14 @@ The reference behaviour is PHP 8.5.4.
   `krsort`, `array_push`, `array_pop`, `array_shift` and `array_unshift`.
   `sort()` flags include regular, numeric, string, locale-string and
   case-insensitive string comparison.
+- First-class callables: `strlen(...)`, `$object->method(...)`,
+  `Class::method(...)` and `$callable(...)`, including bound `$this`, static
+  scope, namespaced function resolution and PHP-compatible `var_dump()`/
+  `print_r()` metadata (function name, bound object and reflected parameters).
+- Callable arrays (`[$object, "method"]`, `["Class", "method"]`), callable
+  strings (including `Class::method`) and objects with `__invoke()` work with
+  direct invocation, `is_callable()`, `call_user_func()`,
+  `call_user_func_array()` and `array_map()`.
 - Differential coverage for classes, inheritance, static members, object
   identity, cloning, exception handling, namespaces, includes and references.
 - Closures and arrow functions: `function (...) use (...)` captures, implicit
@@ -97,8 +105,8 @@ The reference behaviour is PHP 8.5.4.
 
 ### Tested
 
-- 55 Rust unit/integration tests.
-- 20 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
+- 57 Rust unit/integration tests.
+- 21 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
   status.
 
 ### Planned
@@ -106,7 +114,6 @@ The reference behaviour is PHP 8.5.4.
 - References rooted in object/static-property dimensions, reference
   destructuring, and the remaining by-reference builtins (`shuffle`,
   comparator-based sorts and `array_multisort`).
-- First-class callable syntax (`strlen(...)`) and callable arrays.
 - Group `use` declarations, `include_path`, class autoloading and namespaced
   constant declarations.
 - Visibility enforcement, `__toString()` in every stdlib coercion path, and

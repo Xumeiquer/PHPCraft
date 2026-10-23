@@ -41,6 +41,20 @@ impl fmt::Debug for PhpStr {
     }
 }
 
+/// Metadata for a Closure produced by first-class callable syntax
+/// (`strlen(...)`, `$object->method(...)`, `Class::method(...)`).
+#[derive(Clone)]
+pub struct CallableInfo {
+    /// PHP-visible function name shown by `var_dump` (`strlen`, `A::method`).
+    pub function: String,
+    /// Bound receiver for instance-method callables.
+    pub this: Option<Value>,
+    /// Declaring class scope (`self` inside the method).
+    pub scope: Option<String>,
+    /// Runtime class (`static` inside the method).
+    pub called_class: Option<String>,
+}
+
 /// A userland closure value. The VM resolves `function` to the compiled body;
 /// `captures` holds the by-value `use (...)` or arrow-function imports.
 #[derive(Clone)]
@@ -57,6 +71,8 @@ pub struct PhpClosure {
     /// `(name, optional)` for the closure's declared parameters.
     pub parameters: Vec<(String, bool)>,
     pub captures: Vec<Value>,
+    /// `Some` for first-class callable syntax; regular closures keep `None`.
+    pub callable: Option<CallableInfo>,
 }
 
 impl fmt::Debug for PhpClosure {
@@ -191,6 +207,37 @@ impl Value {
             capture_names,
             parameters,
             captures,
+            callable: None,
+        }))
+    }
+
+    /// Build a Closure for first-class callable syntax. `function` is the
+    /// lookup key and `display` is the name PHP exposes via `var_dump`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn first_class_callable(
+        function: String,
+        display: String,
+        this: Option<Value>,
+        scope: Option<String>,
+        called_class: Option<String>,
+        id: u64,
+        parameters: Vec<(String, bool)>,
+    ) -> Self {
+        Value::Closure(Rc::new(PhpClosure {
+            function,
+            name: display.clone(),
+            file: String::new(),
+            line: 0,
+            id,
+            capture_names: Vec::new(),
+            parameters,
+            captures: Vec::new(),
+            callable: Some(CallableInfo {
+                function: display,
+                this,
+                scope,
+                called_class,
+            }),
         }))
     }
 
