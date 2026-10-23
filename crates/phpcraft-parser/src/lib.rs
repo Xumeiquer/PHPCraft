@@ -511,9 +511,6 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         let subject = self.parse_expr()?;
         self.expect_keyword("as")?;
-        if self.check_keyword("list") {
-            return Err(self.unsupported("list() destructuring in foreach"));
-        }
         let first_by_ref = self.eat(&Tok::BitAnd);
         let first = self.parse_expr()?;
         let (key, value, by_ref) = if self.eat(&Tok::DoubleArrow) {
@@ -521,10 +518,10 @@ impl Parser {
                 return Err(self.error("foreach key cannot be a reference"));
             }
             let by_ref = self.eat(&Tok::BitAnd);
-            let value = self.parse_expr()?;
+            let value = Self::destructure_value(self.parse_expr()?);
             (Some(first), value, by_ref)
         } else {
-            (None, first, first_by_ref)
+            (None, Self::destructure_value(first), first_by_ref)
         };
         if let Some(key) = &key {
             if !is_valid_target(key) {
@@ -1189,6 +1186,12 @@ impl Parser {
                     break;
                 }
                 self.advance();
+                lhs = match lhs {
+                    Expr::Array(items) => {
+                        Expr::Destructure(Self::array_items_into_destructure(items))
+                    }
+                    other => other,
+                };
                 if !is_valid_target(&lhs) {
                     return Err(self.error("left-hand side of assignment is not writable"));
                 }
@@ -1405,7 +1408,7 @@ impl Parser {
                     "array" if self.peek_at(1) == &Tok::LParen => {
                         self.advance();
                         self.advance();
-                        self.parse_array_items(&Tok::RParen)
+                        Ok(Expr::Array(self.parse_array_items(&Tok::RParen)?))
                     }
                     "isset" if self.peek_at(1) == &Tok::LParen => {
                         self.advance();
@@ -1430,7 +1433,12 @@ impl Parser {
                         self.expect(&Tok::RParen)?;
                         Ok(Expr::Empty(Box::new(expr)))
                     }
-                    "list" => Err(self.unsupported("list() destructuring")),
+                    "list" if self.peek_at(1) == &Tok::LParen => {
+                        self.advance();
+                        self.advance();
+                        let items = self.parse_array_items(&Tok::RParen)?;
+                        Ok(Expr::Destructure(Self::array_items_into_destructure(items)))
+                    }
                     "include" | "include_once" | "require" | "require_once" => {
                         let keyword = match self.peek().clone() {
                             Tok::Ident(name) => name.to_ascii_lowercase(),
@@ -1591,10 +1599,14 @@ impl Parser {
 
     fn parse_array_literal(&mut self, close: &Tok) -> Result<Expr, ParseError> {
         self.advance(); // '[' or '('
-        self.parse_array_items(close)
+        Ok(Expr::Array(self.parse_array_items(close)?))
     }
 
-    fn parse_array_items(&mut self, close: &Tok) -> Result<Expr, ParseError> {
+    /// Parse the comma-separated contents shared by array literals and
+    /// destructuring targets. Empty entries and `&` are represented in the
+    /// AST so a following `=` (or `foreach`) can turn the literal into a
+    /// destructuring target; `compile_array` rejects them in value position.
+    fn parse_array_items(&mut self, close: &Tok) -> Result<Vec<ArrayItem>, ParseError> {
         let mut items = Vec::new();
         loop {
             if std::mem::discriminant(self.peek()) == std::mem::discriminant(close) {
@@ -1607,20 +1619,35 @@ impl Parser {
             if matches!(self.peek(), Tok::Ellipsis) {
                 return Err(self.unsupported("array spread (...$array)"));
             }
-            if matches!(self.peek(), Tok::BitAnd) {
-                return Err(self.unsupported("array items by reference (&$value)"));
+            if self.eat(&Tok::Comma) {
+                items.push(ArrayItem {
+                    key: None,
+                    value: None,
+                    by_ref: false,
+                });
+                continue;
             }
+            let by_ref = self.eat(&Tok::BitAnd);
             let first = self.parse_expr()?;
             if self.eat(&Tok::DoubleArrow) {
+                if by_ref {
+                    return Err(self.error("syntax error, unexpected token \"=>\""));
+                }
+                if matches!(self.peek(), Tok::Comma | Tok::RParen | Tok::RBracket) {
+                    return Err(self.error("syntax error, unexpected token \",\""));
+                }
+                let by_ref = self.eat(&Tok::BitAnd);
                 let value = self.parse_expr()?;
                 items.push(ArrayItem {
                     key: Some(first),
-                    value,
+                    value: Some(value),
+                    by_ref,
                 });
             } else {
                 items.push(ArrayItem {
                     key: None,
-                    value: first,
+                    value: Some(first),
+                    by_ref,
                 });
             }
             if self.eat(&Tok::Comma) {
@@ -1629,7 +1656,37 @@ impl Parser {
             self.expect(close)?;
             break;
         }
-        Ok(Expr::Array(items))
+        Ok(items)
+    }
+
+    /// Turn an array literal used as an assignment/foreach target into a
+    /// destructuring node. An array literal nested inside another
+    /// destructuring target is converted by `array_items_into_destructure`.
+    fn destructure_value(expr: Expr) -> Expr {
+        match expr {
+            Expr::Array(items) => Expr::Destructure(Self::array_items_into_destructure(items)),
+            other => other,
+        }
+    }
+
+    /// Convert any array literals nested directly inside a destructuring
+    /// target into destructuring nodes. Deeper array literals (for example an
+    /// expression used as an index) are left untouched.
+    fn array_items_into_destructure(items: Vec<ArrayItem>) -> Vec<ArrayItem> {
+        items
+            .into_iter()
+            .map(|mut item| {
+                if let Some(value) = item.value.take() {
+                    item.value = Some(match value {
+                        Expr::Array(inner) => {
+                            Expr::Destructure(Self::array_items_into_destructure(inner))
+                        }
+                        other => other,
+                    });
+                }
+                item
+            })
+            .collect()
     }
 
     /// Finish a named-function call after its `(` was consumed. `(...)` is
@@ -1713,6 +1770,11 @@ fn is_valid_target(expr: &Expr) -> bool {
         Expr::Var(_) => true,
         Expr::Property { .. } | Expr::StaticProperty { .. } => true,
         Expr::Index { base, .. } => is_valid_target(base),
+        Expr::Destructure(items) => items.iter().all(|item| match &item.value {
+            None => true,
+            Some(Expr::Destructure(_)) => !item.by_ref,
+            Some(target) => is_valid_target(target),
+        }),
         _ => false,
     }
 }
@@ -1869,6 +1931,57 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(parse_file(br#"<?php $f = new Foo(...);"#).is_err());
+    }
+
+    #[test]
+    fn parses_destructuring_targets() {
+        let program = parse_file(
+            br#"<?php
+                [$a, [, $b], [$d, [$e]]] = $source;
+                list('k' => &$c, 'j' => list($f, $g)) = $source;
+                foreach ($rows as $key => [&$h, list($i, $j)]) {}
+            "#,
+        )
+        .unwrap();
+        match &program.stmts[0] {
+            Stmt::Expr(Expr::Assign { target, .. }) => match target.as_ref() {
+                Expr::Destructure(items) => {
+                    assert_eq!(items.len(), 3);
+                    assert!(matches!(
+                        items[0].value,
+                        Some(Expr::Var(ref name)) if name == "a"
+                    ));
+                    assert!(matches!(
+                        items[1].value,
+                        Some(Expr::Destructure(ref inner))
+                            if inner.len() == 2
+                                && inner[0].value.is_none()
+                                && matches!(inner[1].value, Some(Expr::Var(_)))
+                    ));
+                    assert!(matches!(items[2].value, Some(Expr::Destructure(_))));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+        match &program.stmts[1] {
+            Stmt::Expr(Expr::Assign { target, .. }) => match target.as_ref() {
+                Expr::Destructure(items) => {
+                    assert!(items[0].by_ref);
+                    assert!(matches!(items[0].key, Some(Expr::Str(_))));
+                    assert!(matches!(items[1].value, Some(Expr::Destructure(_))));
+                }
+                other => panic!("unexpected {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
+        match &program.stmts[2] {
+            Stmt::Foreach { key, value, .. } => {
+                assert!(matches!(key, Some(Expr::Var(_))));
+                assert!(matches!(value, Expr::Destructure(_)));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

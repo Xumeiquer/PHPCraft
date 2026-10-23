@@ -190,6 +190,20 @@ struct ActiveFinally {
     outer_handler_depth: usize,
 }
 
+#[derive(Clone, Copy)]
+enum DestructureKey {
+    Int(i64),
+    Tmp(u32),
+}
+
+#[derive(Clone, Copy)]
+enum DestructureRoot<'a> {
+    /// A private copy of the right-hand side.
+    Tmp(u32),
+    /// An iterated element addressed as `subject[iteration_key]`.
+    Subject(&'a Expr, u32),
+}
+
 struct FnCompiler {
     name: String,
     display_name: Option<String>,
@@ -580,13 +594,13 @@ impl FnCompiler {
                 self.load_var_ref(name);
             }
             Expr::Index { .. } => {
-                let (root, dims) = Self::lvalue_chain(source).ok_or_else(|| {
+                let (root, dims) = Self::lvalue_root(source).ok_or_else(|| {
                     CompileError::new(
-                        "references to array elements currently require a variable root",
+                        "references to array elements require a variable or property root",
                         self.line,
                     )
                 })?;
-                self.load_var(&root);
+                self.expr(root)?;
                 let mut modes = Vec::with_capacity(dims.len());
                 for dim in dims {
                     match dim {
@@ -603,7 +617,7 @@ impl FnCompiler {
                     }
                 }
                 self.emit(Op::MakeDimRef { modes });
-                self.store_var(&root, false);
+                self.store_target(root, false)?;
             }
             Expr::Property { object, name } => {
                 self.expr(object)?;
@@ -640,13 +654,13 @@ impl FnCompiler {
                 self.store_var_ref(name);
             }
             Expr::Index { .. } => {
-                let (root, dims) = Self::lvalue_chain(target).ok_or_else(|| {
+                let (root, dims) = Self::lvalue_root(target).ok_or_else(|| {
                     CompileError::new(
-                        "reference assignment targets currently require a variable root",
+                        "reference assignment targets require a variable or property root",
                         self.line,
                     )
                 })?;
-                self.load_var(&root);
+                self.expr(root)?;
                 let mut modes = Vec::with_capacity(dims.len());
                 for dim in dims {
                     match dim {
@@ -658,7 +672,7 @@ impl FnCompiler {
                     }
                 }
                 self.emit(Op::SetDimRef { modes });
-                self.store_var(&root, false);
+                self.store_target(root, false)?;
             }
             Expr::Property { object, name } => {
                 self.expr(object)?;
@@ -748,11 +762,15 @@ impl FnCompiler {
         }
     }
 
-    fn lvalue_chain(expr: &Expr) -> Option<(String, Vec<Option<&Expr>>)> {
+    /// Split an lvalue into its root (variable, property or static property)
+    /// and the dimension path applied to it.
+    fn lvalue_root(expr: &Expr) -> Option<(&Expr, Vec<Option<&Expr>>)> {
         match expr {
-            Expr::Var(name) => Some((name.clone(), Vec::new())),
+            Expr::Var(_) | Expr::Property { .. } | Expr::StaticProperty { .. } => {
+                Some((expr, Vec::new()))
+            }
             Expr::Index { base, index } => {
-                let (root, mut dims) = Self::lvalue_chain(base)?;
+                let (root, mut dims) = Self::lvalue_root(base)?;
                 dims.push(index.as_deref());
                 Some((root, dims))
             }
@@ -787,15 +805,15 @@ impl FnCompiler {
                 Ok(())
             }
             Expr::Index { .. } => {
-                let (root, dims) = Self::lvalue_chain(target).ok_or_else(|| {
+                let (root, dims) = Self::lvalue_root(target).ok_or_else(|| {
                     CompileError::new(
-                        "nested property/dimension assignment is not supported yet",
+                        "nested property/dimension assignment requires a variable or property root",
                         self.line,
                     )
                 })?;
                 let value_tmp = self.temp();
                 self.emit(Op::StoreTmp(value_tmp));
-                self.load_var(&root);
+                self.expr(root)?;
                 let mut modes = Vec::with_capacity(dims.len());
                 for dim in dims {
                     match dim {
@@ -808,7 +826,7 @@ impl FnCompiler {
                 }
                 self.emit(Op::LoadTmp(value_tmp));
                 self.emit(Op::AssignDim { modes });
-                self.store_var(&root, false);
+                self.store_target(root, false)?;
                 if keep {
                     self.emit(Op::LoadTmp(value_tmp));
                 }
@@ -1097,8 +1115,18 @@ impl FnCompiler {
         by_ref: bool,
         body: &[Stmt],
     ) -> Result<(), CompileError> {
+        let destructure_refs = match value {
+            Expr::Destructure(items) => Self::destructure_has_refs(items),
+            _ => false,
+        };
+        // For a repeatable subject expression we can address the iterated
+        // element (`$subject[$key]`) and install references inside it. This
+        // keeps top-level elements plain values, matching PHP. Other subject
+        // expressions fall back to a prepared copy.
+        let subject_root = destructure_refs && Self::is_destructure_source(subject);
+        let iterator_by_ref = by_ref || (destructure_refs && !subject_root);
         self.expr(subject)?;
-        if by_ref {
+        if iterator_by_ref {
             self.emit(Op::PrepareRefs);
             self.emit(Op::Dup);
             self.store_target(subject, false)?;
@@ -1107,13 +1135,17 @@ impl FnCompiler {
         self.emit(Op::IterInit { iter });
 
         let value_tmp = self.temp();
-        let key_tmp = key.map(|_| self.temp());
+        let key_tmp = if key.is_some() || subject_root {
+            Some(self.temp())
+        } else {
+            None
+        };
         let loop_start = self.ops.len();
         let next = self.emit(Op::IterNext {
             iter,
             key: key_tmp,
             value: value_tmp,
-            by_ref,
+            by_ref: iterator_by_ref,
             end: 0,
         });
 
@@ -1122,7 +1154,29 @@ impl FnCompiler {
             self.emit(Op::LoadTmp(key_slot));
             self.store_target(key_target, false)?;
         }
-        if by_ref {
+        if let Expr::Destructure(items) = value {
+            Self::validate_destructure(items, self.line)?;
+            if subject_root {
+                let key_slot = key_tmp.expect("destructuring iteration key");
+                self.compile_destructure_bind(
+                    DestructureRoot::Subject(subject, key_slot),
+                    &mut Vec::new(),
+                    items,
+                )?;
+            } else {
+                let root = self.temp();
+                self.emit(Op::LoadTmp(value_tmp));
+                self.emit(Op::StoreTmp(root));
+                self.compile_destructure_bind(DestructureRoot::Tmp(root), &mut Vec::new(), items)?;
+                if destructure_refs {
+                    // `value_tmp` still holds the reference to the iterated
+                    // element; copy the updated nested array back through it.
+                    self.emit(Op::LoadTmp(value_tmp));
+                    self.emit(Op::LoadTmp(root));
+                    self.emit(Op::StoreRefCell);
+                }
+            }
+        } else if by_ref {
             let Expr::Var(name) = value else {
                 return Err(CompileError::new(
                     "by-reference foreach value must be a variable",
@@ -1166,13 +1220,13 @@ impl FnCompiler {
                     }
                 }
                 Expr::Index { .. } => {
-                    let (root, dims) = Self::lvalue_chain(target).ok_or_else(|| {
+                    let (root, dims) = Self::lvalue_root(target).ok_or_else(|| {
                         CompileError::new(
-                            "unset() targets currently require a variable root",
+                            "unset() targets require a variable or property root",
                             self.line,
                         )
                     })?;
-                    self.load_var(&root);
+                    self.expr(root)?;
                     let mut modes = Vec::with_capacity(dims.len());
                     for dim in dims {
                         match dim {
@@ -1184,7 +1238,7 @@ impl FnCompiler {
                         }
                     }
                     self.emit(Op::UnsetDim { modes });
-                    self.store_var(&root, false);
+                    self.store_target(root, false)?;
                 }
                 Expr::Property { object, name } => {
                     self.expr(object)?;
@@ -1751,6 +1805,12 @@ impl FnCompiler {
                 }
             }
             Expr::Array(items) => self.compile_array(items)?,
+            Expr::Destructure(_) => {
+                return Err(CompileError::new(
+                    "destructuring is only supported as an assignment or foreach target",
+                    self.line,
+                ))
+            }
             Expr::Assign { target, op, value } => self.compile_assign(target, op, value)?,
             Expr::Binary { op, lhs, rhs } => self.compile_binary(*op, lhs, rhs)?,
             Expr::Unary { op, expr } => {
@@ -1945,10 +2005,22 @@ impl FnCompiler {
         let tmp = self.temp();
         self.emit(Op::StoreTmp(tmp));
         for item in items {
+            let Some(value) = &item.value else {
+                return Err(CompileError::new(
+                    "Cannot use empty array entries in an array literal",
+                    self.line,
+                ));
+            };
+            if item.by_ref {
+                return Err(CompileError::new(
+                    "array items by reference are not supported yet",
+                    self.line,
+                ));
+            }
             if let Some(key) = &item.key {
                 self.expr(key)?;
             }
-            self.expr(&item.value)?;
+            self.expr(value)?;
             self.emit(Op::ArraySet {
                 tmp,
                 has_key: item.key.is_some(),
@@ -2017,6 +2089,15 @@ impl FnCompiler {
         op: &Option<BinOp>,
         value: &Expr,
     ) -> Result<(), CompileError> {
+        if let Expr::Destructure(items) = target {
+            if op.is_some() {
+                return Err(CompileError::new(
+                    "destructuring targets only support the `=` operator",
+                    self.line,
+                ));
+            }
+            return self.compile_destructure_assign(items, value);
+        }
         match op {
             None => {
                 if let Expr::Reference(source) = value {
@@ -2045,6 +2126,160 @@ impl FnCompiler {
             }
         }
         Ok(())
+    }
+
+    fn compile_destructure_assign(
+        &mut self,
+        items: &[ArrayItem],
+        value: &Expr,
+    ) -> Result<(), CompileError> {
+        Self::validate_destructure(items, self.line)?;
+        self.expr(value)?;
+        let root = self.temp();
+        self.emit(Op::StoreTmp(root));
+        self.compile_destructure_bind(DestructureRoot::Tmp(root), &mut Vec::new(), items)?;
+
+        // PHP binds references into the source array itself. We bound them
+        // into a private copy, so write that copy back when the source is an
+        // lvalue whose store path the compiler supports.
+        if Self::destructure_has_refs(items) && Self::is_destructure_source(value) {
+            self.emit(Op::LoadTmp(root));
+            self.store_target(value, false)?;
+        }
+        self.emit(Op::LoadTmp(root));
+        Ok(())
+    }
+
+    fn compile_destructure_bind(
+        &mut self,
+        root: DestructureRoot<'_>,
+        path: &mut Vec<DestructureKey>,
+        items: &[ArrayItem],
+    ) -> Result<(), CompileError> {
+        let mut next_index: i64 = 0;
+        for item in items {
+            let key = match &item.key {
+                Some(expr) => {
+                    self.expr(expr)?;
+                    let slot = self.temp();
+                    self.emit(Op::StoreTmp(slot));
+                    DestructureKey::Tmp(slot)
+                }
+                None => {
+                    let key = next_index;
+                    next_index += 1;
+                    DestructureKey::Int(key)
+                }
+            };
+            path.push(key);
+            match &item.value {
+                None => {}
+                Some(Expr::Destructure(inner)) => {
+                    self.compile_destructure_bind(root, path, inner)?;
+                }
+                Some(target) if item.by_ref => {
+                    self.load_destructure_root(root)?;
+                    for key in path.iter() {
+                        self.push_destructure_key(*key);
+                    }
+                    let dimensions = match root {
+                        DestructureRoot::Tmp(_) => path.len(),
+                        DestructureRoot::Subject(_, _) => path.len() + 1,
+                    };
+                    self.emit(Op::MakeDimRef {
+                        modes: vec![DimMode::Key; dimensions],
+                    });
+                    match root {
+                        DestructureRoot::Tmp(slot) => {
+                            self.emit(Op::StoreTmp(slot));
+                        }
+                        DestructureRoot::Subject(subject, _) => {
+                            self.store_target(subject, false)?;
+                        }
+                    }
+                    self.store_ref_target(target)?;
+                }
+                Some(target) => {
+                    self.load_destructure_root(root)?;
+                    if matches!(root, DestructureRoot::Subject(_, _)) {
+                        // `subject[iteration_key]`
+                        self.emit(Op::IndexDestructure);
+                    }
+                    for key in path.iter() {
+                        self.push_destructure_key(*key);
+                        self.emit(Op::IndexDestructure);
+                    }
+                    self.store_target(target, false)?;
+                }
+            }
+            path.pop();
+        }
+        Ok(())
+    }
+
+    fn load_destructure_root(&mut self, root: DestructureRoot<'_>) -> Result<(), CompileError> {
+        match root {
+            DestructureRoot::Tmp(slot) => {
+                self.emit(Op::LoadTmp(slot));
+            }
+            DestructureRoot::Subject(subject, key) => {
+                self.expr(subject)?;
+                self.emit(Op::LoadTmp(key));
+            }
+        }
+        Ok(())
+    }
+
+    fn push_destructure_key(&mut self, key: DestructureKey) {
+        match key {
+            DestructureKey::Int(value) => {
+                self.emit(Op::Int(value));
+            }
+            DestructureKey::Tmp(slot) => {
+                self.emit(Op::LoadTmp(slot));
+            }
+        }
+    }
+
+    fn destructure_has_refs(items: &[ArrayItem]) -> bool {
+        items.iter().any(|item| {
+            item.by_ref
+                || matches!(
+                    &item.value,
+                    Some(Expr::Destructure(inner)) if Self::destructure_has_refs(inner)
+                )
+        })
+    }
+
+    fn validate_destructure(items: &[ArrayItem], line: u32) -> Result<(), CompileError> {
+        let keyed = items.iter().any(|item| item.key.is_some());
+        let unkeyed = items.iter().any(|item| item.key.is_none());
+        if keyed && unkeyed {
+            return Err(CompileError::new(
+                "Cannot mix keyed and unkeyed array entries in assignments",
+                line,
+            ));
+        }
+        for item in items {
+            if let Some(Expr::Destructure(inner)) = &item.value {
+                if item.by_ref {
+                    return Err(CompileError::new(
+                        "Cannot assign reference to non referenceable value",
+                        line,
+                    ));
+                }
+                Self::validate_destructure(inner, line)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_destructure_source(expr: &Expr) -> bool {
+        match expr {
+            Expr::Var(_) | Expr::Property { .. } | Expr::StaticProperty { .. } => true,
+            Expr::Index { .. } => Self::lvalue_root(expr).is_some(),
+            _ => false,
+        }
     }
 
     fn compile_incdec(
@@ -2208,7 +2443,19 @@ fn collect_free_vars(
                 if let Some(key) = &item.key {
                     collect_free_vars(key, params, out, seen);
                 }
-                collect_free_vars(&item.value, params, out, seen);
+                if let Some(value) = &item.value {
+                    collect_free_vars(value, params, out, seen);
+                }
+            }
+        }
+        Expr::Destructure(items) => {
+            for item in items {
+                if let Some(key) = &item.key {
+                    collect_free_vars(key, params, out, seen);
+                }
+                if let Some(value) = &item.value {
+                    collect_free_vars(value, params, out, seen);
+                }
             }
         }
         Expr::Assign { target, value, .. } => {
@@ -2326,7 +2573,19 @@ fn const_expr(expr: &Expr, line: u32) -> Result<Value, CompileError> {
         Expr::Array(items) => {
             let mut array = PhpArray::new();
             for item in items {
-                let value = const_expr(&item.value, line)?;
+                let Some(value_expr) = &item.value else {
+                    return Err(CompileError::new(
+                        "Cannot use empty array entries in an array literal",
+                        line,
+                    ));
+                };
+                if item.by_ref {
+                    return Err(CompileError::new(
+                        "array items by reference are not supported yet",
+                        line,
+                    ));
+                }
+                let value = const_expr(value_expr, line)?;
                 match &item.key {
                     Some(key) => {
                         let key_value = const_expr(key, line)?;

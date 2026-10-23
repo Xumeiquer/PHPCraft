@@ -42,6 +42,8 @@ pub enum Op {
     StoreVarKeep(u32),
     /// Store a reference cell into a slot, rebinding rather than writing through.
     StoreVarRef(u32),
+    /// Pop a value and a reference cell and write the value through the cell.
+    StoreRefCell,
 
     LoadGlobal(u32),
     LoadGlobalSafe(u32),
@@ -90,6 +92,9 @@ pub enum Op {
     Index,
     /// Same, but yields `null` silently.
     IndexSafe,
+    /// Destructuring fetch: arrays behave like `Index`, `null` is silent,
+    /// and other non-array values warn and yield `null` (objects are fatal).
+    IndexDestructure,
 
     /// Pop `array`, the keys and `value`; push the modified array.
     AssignDim {

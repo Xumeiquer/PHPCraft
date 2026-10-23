@@ -170,13 +170,16 @@ writing), and `vendor/php-src` tracks branch `PHP-8.5`.
 ## Current limits
 
 Deliberately unimplemented (they produce explicit errors): attributes,
-interfaces, traits, enums, references rooted inside object/static-property
-dimensions, reference destructuring in `list()`, named arguments and
-alternative control syntax. First-class callable syntax and callable arrays
-are implemented; `Closure::fromCallable()`/`Closure::bind()` are not. The
-implemented
-by-reference builtins are `sort`, `rsort`, `asort`, `arsort`, `ksort`,
-`krsort`, `array_push`, `array_pop`, `array_shift` and `array_unshift`.
+interfaces, traits, enums, named arguments, alternative control syntax and
+array literals with by-reference elements (`[&$value]`). First-class callable
+syntax and callable arrays are implemented; `Closure::fromCallable()`/
+`Closure::bind()` are not. Destructuring supports `list(...)` and `[...]`
+targets with skipped entries, nested/keyed targets, by-reference slots and
+`foreach` targets. References can be rooted in variable, object-property and
+static-property dimension chains (`&$object->items[0]`,
+`&Class::$items[0]`). The implemented by-reference builtins are `sort`,
+`rsort`, `asort`, `arsort`, `ksort`, `krsort`, `array_push`, `array_pop`,
+`array_shift` and `array_unshift`.
 `sort()` flags cover `SORT_REGULAR`, `SORT_NUMERIC`, `SORT_STRING`,
 `SORT_LOCALE_STRING` and `SORT_FLAG_CASE`; `SORT_NATURAL` and unknown flags
 raise explicit errors. Namespace support covers ordinary and braced declarations,

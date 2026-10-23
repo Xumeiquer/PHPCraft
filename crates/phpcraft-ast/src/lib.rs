@@ -217,7 +217,11 @@ impl ClosureDecl {
 #[derive(Clone, Debug)]
 pub struct ArrayItem {
     pub key: Option<Expr>,
-    pub value: Expr,
+    /// `None` is an empty slot in a destructuring target (`[, $b]`).
+    pub value: Option<Expr>,
+    /// `&$value` inside a destructuring target. PHP also has by-reference
+    /// array literals, but they remain unsupported.
+    pub by_ref: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -260,6 +264,8 @@ pub enum Expr {
     /// A bare name used as a constant (`PHP_EOL`, `true` is parsed separately).
     Name(String),
     Array(Vec<ArrayItem>),
+    /// `list(...)` or `[...]` used as an assignment/foreach target.
+    Destructure(Vec<ArrayItem>),
     Assign {
         target: Box<Expr>,
         /// `None` for `=`, otherwise the compound operator (`+=`).

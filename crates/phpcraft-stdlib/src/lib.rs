@@ -2823,7 +2823,9 @@ fn dump_value(
     active: &mut HashSet<usize>,
     out: &mut Vec<u8>,
 ) {
-    let is_ref = mark_ref && matches!(value, Value::Ref(_));
+    // Zend hides the `&` marker when the reference has no other owners; the
+    // array/object slot itself does not count as an observer.
+    let is_ref = mark_ref && matches!(value, Value::Ref(cell) if Rc::strong_count(cell) > 1);
     let deref = value.deref();
     let value = &deref;
     let container = dump_container_id(value);

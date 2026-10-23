@@ -46,6 +46,12 @@ The reference behaviour is PHP 8.5.4.
   `krsort`, `array_push`, `array_pop`, `array_shift` and `array_unshift`.
   `sort()` flags include regular, numeric, string, locale-string and
   case-insensitive string comparison.
+- Destructuring: `list(...)` and `[...]` assignment targets, skipped entries,
+  nested and keyed targets, by-reference slots, and destructuring in
+  `foreach` (including keyed and nested targets).
+- References rooted in object and static-property dimensions, such as
+  `&$object->items[0]` and `&Class::$items[0]`, including dimension
+  assignment, `unset()` and destructuring targets.
 - First-class callables: `strlen(...)`, `$object->method(...)`,
   `Class::method(...)` and `$callable(...)`, including bound `$this`, static
   scope, namespaced function resolution and PHP-compatible `var_dump()`/
@@ -114,15 +120,14 @@ The reference behaviour is PHP 8.5.4.
 
 ### Tested
 
-- 57 Rust unit/integration tests.
-- 22 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
+- 58 Rust unit/integration tests.
+- 23 differential scripts, all byte-identical to PHP 8.5.4 stdout and exit
   status.
 
 ### Planned
 
-- References rooted in object/static-property dimensions, reference
-  destructuring, and the remaining by-reference builtins (`shuffle`,
-  comparator-based sorts and `array_multisort`).
+- The remaining by-reference builtins (`shuffle`, comparator-based sorts and
+  `array_multisort`).
 - Group `use` declarations, `include_path`, class autoloading and namespaced
   constant declarations.
 - `break`/`continue` leaving a `try` block currently bypasses its `finally`

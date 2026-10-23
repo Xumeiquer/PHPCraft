@@ -1689,6 +1689,18 @@ impl Vm {
                         }
                         frame.set(*slot, value);
                     }
+                    Op::StoreRefCell => {
+                        let value = stack.pop().unwrap_or(Value::Null);
+                        let cell = stack.pop().unwrap_or(Value::Null);
+                        match cell.as_ref_cell() {
+                            Some(cell) => *cell.borrow_mut() = value.deref(),
+                            None => {
+                                return Err(PhpError::fatal(
+                                    "Only variables should be assigned by reference",
+                                ))
+                            }
+                        }
+                    }
                     Op::LoadGlobal(index) => {
                         let name = String::from_utf8_lossy(chunk.const_str(*index)).into_owned();
                         let key = Key::from_str(&name);
@@ -1865,14 +1877,20 @@ impl Vm {
                     }
                     Op::Index => {
                         let key_value = stack.pop().unwrap_or(Value::Null);
-                        let base = stack.pop().unwrap_or(Value::Null);
+                        let base = stack.pop().unwrap_or(Value::Null).deref();
                         let value = self.index_value(base, &key_value, true)?;
                         stack.push(value);
                     }
                     Op::IndexSafe => {
                         let key_value = stack.pop().unwrap_or(Value::Null);
-                        let base = stack.pop().unwrap_or(Value::Null);
+                        let base = stack.pop().unwrap_or(Value::Null).deref();
                         let value = self.index_value(base, &key_value, false)?;
+                        stack.push(value);
+                    }
+                    Op::IndexDestructure => {
+                        let key_value = stack.pop().unwrap_or(Value::Null);
+                        let base = stack.pop().unwrap_or(Value::Null).deref();
+                        let value = self.index_destructure_value(base, &key_value)?;
                         stack.push(value);
                     }
                     Op::AssignDim { modes } => {
@@ -2466,6 +2484,30 @@ impl Vm {
                         other.debug_type_name()
                     ));
                 }
+                Ok(Value::Null)
+            }
+        }
+    }
+
+    fn index_destructure_value(&mut self, base: Value, key_value: &Value) -> PhpResult<Value> {
+        match base {
+            Value::Array(array) => {
+                let key = key_from_value(key_value)?;
+                match array.get(&key) {
+                    Some(value) => Ok(value.clone()),
+                    None => {
+                        self.warn(format!("Undefined array key {}", display_key(&key)));
+                        Ok(Value::Null)
+                    }
+                }
+            }
+            Value::Null => Ok(Value::Null),
+            Value::Object(object) => Err(PhpError::fatal(format!(
+                "Cannot use object of type {} as array",
+                object.borrow().class_name
+            ))),
+            other => {
+                self.warn(format!("Cannot use {} as array", other.debug_type_name()));
                 Ok(Value::Null)
             }
         }

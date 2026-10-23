@@ -51,7 +51,7 @@ fetch/assign instructions.
 | `LoadVarSafe` | `ZEND_FETCH_IS` / `ZEND_ISSET_ISEMPTY_CV` |
 | `StoreVar` | `ZEND_ASSIGN` |
 | `StoreVarKeep` | `ZEND_ASSIGN` + `ZEND_QM_ASSIGN` (assignment value) |
-| `LoadVarRef`, `StoreVarRef` | `ZEND_ASSIGN_REF`, `ZEND_FETCH_R`/`ZEND_SEND_VAR_EX` on references |
+| `LoadVarRef`, `StoreVarRef`, `StoreRefCell` | `ZEND_ASSIGN_REF`, `ZEND_FETCH_R`/`ZEND_SEND_VAR_EX` on references, `ZVAL_DEREF` write-through |
 | `LoadGlobal`, `StoreGlobal`, `LoadGlobalRef`, `StoreGlobalRef` | `ZEND_BIND_GLOBAL`, then CV access / `ZEND_ASSIGN_REF` |
 | `LoadTmp`, `StoreTmp` | `ZEND_QM_ASSIGN` / temporary slots (`TMP_VAR`) |
 | `Binary` | `ZEND_ADD`, `SUB`, `MUL`, `DIV`, `MOD`, `POW`, `CONCAT`, `SL`, `SR`, `BW_AND`, `BW_OR`, `BW_XOR`, `IS_EQUAL`, `IS_NOT_EQUAL`, `IS_IDENTICAL`, `IS_NOT_IDENTICAL`, `IS_SMALLER`, `IS_SMALLER_OR_EQUAL`, `IS_GREATER`, `IS_GREATER_OR_EQUAL`, `SPACESHIP`, `BOOL_XOR` |
@@ -68,6 +68,7 @@ fetch/assign instructions.
 | `ArraySet` | `ZEND_ADD_ARRAY_ELEMENT`, `ZEND_INIT_ARRAY` |
 | `Index` | `ZEND_FETCH_DIM_R` |
 | `IndexSafe` | `ZEND_FETCH_DIM_IS` |
+| `IndexDestructure` | `ZEND_FETCH_LIST_R` / destructuring dimension fetch |
 | `AssignDim` | `ZEND_ASSIGN_DIM`, `ZEND_ASSIGN_DIM_OP` |
 | `MakeDimRef`, `SetDimRef`, `UnsetDim` | `ZEND_FETCH_DIM_W`, `ZEND_ASSIGN_DIM_REF`, `ZEND_UNSET_DIM` |
 | `Call` | `ZEND_INIT_FCALL`, `ZEND_SEND_VAL`, `ZEND_DO_FCALL` |
@@ -162,6 +163,7 @@ fetch/assign instructions.
 | `Zend/tests/classes/*.phpt`, `Zend/tests/exceptions/*.phpt` | `tests/php/16_objects.php` |
 | `Zend/tests/ns/*.phpt`, `Zend/tests/use/*.phpt` | `tests/php/17_namespaces_includes.php`, `tests/php/18_namespace_blocks.php` |
 | `Zend/tests/ref/*.phpt`, `ext/standard/tests/array/sort*.phpt` | `tests/php/19_references.php`, `tests/php/20_references_advanced.php` |
+| `Zend/tests/list/*.phpt`, `Zend/tests/foreach_list.phpt` | `tests/php/23_destructuring.php` |
 
 `scripts/phpt-subset.sh` extracts `--FILE--` sections from a php-src checkout
 and skips tests that need extensions, INI settings, request data or special
