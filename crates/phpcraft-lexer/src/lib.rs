@@ -236,10 +236,8 @@ impl<'a> Lexer<'a> {
                 }
                 Some(b'#') => {
                     if self.peek_at(1) == Some(b'[') {
-                        return Err(LexError::new(
-                            "attributes (#[...]) are not supported yet",
-                            self.line,
-                        ));
+                        self.skip_attribute()?;
+                        continue;
                     }
                     self.skip_line_comment();
                 }
@@ -279,6 +277,71 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// Skip an attribute group (`#[...]`). Attributes are parsed as metadata
+    /// by PHP; the interpreter currently has no reflection API, so the syntax
+    /// is accepted and ignored.
+    fn skip_attribute(&mut self) -> Result<(), LexError> {
+        let start_line = self.line;
+        self.advance(2); // `#[`
+        let mut depth = 1usize;
+        while let Some(c) = self.peek() {
+            match c {
+                b'\'' => {
+                    self.bump();
+                    while let Some(ch) = self.bump() {
+                        if ch == b'\\' {
+                            self.bump();
+                        } else if ch == b'\'' {
+                            break;
+                        }
+                    }
+                }
+                b'"' => {
+                    self.bump();
+                    while let Some(ch) = self.bump() {
+                        if ch == b'\\' {
+                            self.bump();
+                        } else if ch == b'"' {
+                            break;
+                        }
+                    }
+                }
+                b'[' => {
+                    depth += 1;
+                    self.bump();
+                }
+                b']' => {
+                    depth -= 1;
+                    self.bump();
+                    if depth == 0 {
+                        return Ok(());
+                    }
+                }
+                b'/' if self.peek_at(1) == Some(b'/') => self.skip_line_comment(),
+                b'/' if self.peek_at(1) == Some(b'*') => {
+                    let comment_line = self.line;
+                    self.advance(2);
+                    let mut closed = false;
+                    while self.pos < self.src.len() {
+                        if self.peek() == Some(b'*') && self.peek_at(1) == Some(b'/') {
+                            self.advance(2);
+                            closed = true;
+                            break;
+                        }
+                        self.bump();
+                    }
+                    if !closed {
+                        return Err(LexError::new("unterminated comment", comment_line));
+                    }
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+        Err(LexError::new("unterminated attribute", start_line))
+    }
+
     fn lex_ident(&mut self) -> Tok {
         let start = self.pos;
         while self.peek().is_some_and(is_ident_char) {
@@ -300,10 +363,7 @@ impl<'a> Lexer<'a> {
                 let name = String::from_utf8_lossy(&self.src[start..self.pos]).into_owned();
                 Ok(Tok::Var(name))
             }
-            Some(b'{') => Err(LexError::new(
-                "variable variables (${...}) are not supported",
-                line,
-            )),
+            Some(b'$' | b'{') => Ok(Tok::Dollar),
             _ => Err(LexError::new("unexpected character \"$\"", line)),
         }
     }

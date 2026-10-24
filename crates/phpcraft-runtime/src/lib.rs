@@ -46,6 +46,39 @@ pub trait RuntimeHooks {
     /// Whether a function (builtin or userland) exists.
     fn function_exists(&mut self, name: &str) -> bool;
 
+    /// Register an `spl_autoload_register()` callback. Returns `false` when
+    /// the callback was already registered.
+    fn register_autoloader(&mut self, _callable: Value, _prepend: bool) -> PhpResult<bool> {
+        Ok(false)
+    }
+
+    /// Remove a previously registered autoloader.
+    fn unregister_autoloader(&mut self, _callable: &Value) -> bool {
+        false
+    }
+
+    /// The currently registered autoload callbacks, in call order.
+    fn autoload_functions(&mut self) -> Vec<Value> {
+        Vec::new()
+    }
+
+    /// Invoke the autoload stack for `class`.
+    fn autoload_call(&mut self, _class: &str) -> PhpResult<()> {
+        Ok(())
+    }
+
+    /// `class_exists()`/`interface_exists()`/`trait_exists()`/`enum_exists()`.
+    fn class_exists(&mut self, _class: &str, _autoload: bool) -> PhpResult<bool> {
+        Ok(false)
+    }
+
+    /// Like [`RuntimeHooks::class_exists`], but only returns true when the
+    /// declaration is of the requested kind (`class`, `interface`, `trait` or
+    /// `enum`).
+    fn type_exists(&mut self, class: &str, autoload: bool, _kind: &str) -> PhpResult<bool> {
+        self.class_exists(class, autoload)
+    }
+
     /// Whether a value can be invoked. The default implementation covers the
     /// subset lightweight test hooks understand; the VM also recognizes
     /// callable arrays, `Class::method` strings and objects with `__invoke`.

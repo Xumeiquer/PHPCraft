@@ -11,11 +11,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use phpcraft_ast::{
-    ArrayItem, BinOp, CatchClause, ClassDecl, ClosureBody, ClosureDecl, Expr, FunctionDecl,
-    InterpPart, MatchArm, Param, Program, Stmt, UnOp, UseKind,
+    ArrayItem, BinOp, CatchClause, ClassDecl, ClassKind, ClosureBody, ClosureDecl, Expr,
+    FunctionDecl, InterpPart, MatchArm, Param, Program, Stmt, UnOp, UseKind,
 };
 use phpcraft_bytecode::{
-    Chunk, ClassDef, ClassMethod, ClassProperty, CompiledProgram, DimMode, Function, Op, ParamSlot,
+    ArgMode, Chunk, ClassDef, ClassMethod, ClassProperty, CompiledProgram, DimMode, Function, Op,
+    ParamSlot,
 };
 use phpcraft_runtime::{key_from_value, PhpArray, Value};
 
@@ -174,10 +175,24 @@ pub fn compile(program: &Program, file: &str) -> Result<CompiledProgram, Compile
     })
 }
 
-#[derive(Default)]
 struct LoopCtx {
     breaks: Vec<usize>,
     continues: Vec<usize>,
+    /// Number of active `finally` bodies when the loop/switch was entered.
+    finally_depth: usize,
+    /// Exception-handler depth at the loop/switch label.
+    handler_depth: usize,
+}
+
+impl LoopCtx {
+    fn new(finally_depth: usize, handler_depth: usize) -> Self {
+        Self {
+            breaks: Vec::new(),
+            continues: Vec::new(),
+            finally_depth,
+            handler_depth,
+        }
+    }
 }
 
 /// A `finally` body that is active while compiling the statements it protects.
@@ -194,6 +209,14 @@ struct ActiveFinally {
 enum DestructureKey {
     Int(i64),
     Tmp(u32),
+}
+
+/// How the compiler evaluates an ordinary positional argument.
+#[derive(Clone, Copy)]
+enum ArgPass {
+    Value,
+    Ref,
+    Auto,
 }
 
 #[derive(Clone, Copy)]
@@ -221,6 +244,11 @@ struct FnCompiler {
     capture_names: Vec<String>,
     capture_refs: Vec<bool>,
     returns_ref: bool,
+    static_slots: Vec<(String, u32, Value)>,
+    /// Hidden array collecting `yield`ed values in a generator function.
+    generator_slot: Option<u32>,
+    labels: HashMap<String, usize>,
+    goto_jumps: Vec<(String, usize, u32)>,
     functions: Vec<Function>,
     classes: Vec<ClassDef>,
     namespace: String,
@@ -255,6 +283,10 @@ impl FnCompiler {
             capture_names: Vec::new(),
             capture_refs: Vec::new(),
             returns_ref: false,
+            static_slots: Vec::new(),
+            generator_slot: None,
+            labels: HashMap::new(),
+            goto_jumps: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
             namespace: String::new(),
@@ -286,6 +318,10 @@ impl FnCompiler {
             capture_names: Vec::new(),
             capture_refs: Vec::new(),
             returns_ref: decl.returns_ref,
+            static_slots: Vec::new(),
+            generator_slot: None,
+            labels: HashMap::new(),
+            goto_jumps: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
             namespace: String::new(),
@@ -317,6 +353,10 @@ impl FnCompiler {
             capture_names: Vec::new(),
             capture_refs: Vec::new(),
             returns_ref: false,
+            static_slots: Vec::new(),
+            generator_slot: None,
+            labels: HashMap::new(),
+            goto_jumps: Vec::new(),
             functions: Vec::new(),
             classes: Vec::new(),
             namespace: String::new(),
@@ -340,7 +380,17 @@ impl FnCompiler {
     }
 
     fn finish(mut self) -> (Function, Vec<Function>, Vec<ClassDef>) {
-        self.emit(Op::ReturnNull);
+        if let Some(slot) = self.generator_slot {
+            self.emit(Op::LoadVarOrArray(slot));
+            self.emit(Op::Return);
+        } else {
+            self.emit(Op::ReturnNull);
+        }
+        let end = self.ops.len();
+        for (label, jump, _) in std::mem::take(&mut self.goto_jumps) {
+            let target = self.labels.get(&label).copied().unwrap_or(end);
+            self.patch(jump, target);
+        }
         let mut slot_names = vec![None; self.next_slot as usize];
         for (name, slot) in &self.locals {
             slot_names[*slot as usize] = Some(name.clone());
@@ -353,6 +403,7 @@ impl FnCompiler {
             capture_names: self.capture_names,
             capture_refs: self.capture_refs,
             returns_ref: self.returns_ref,
+            static_slots: self.static_slots,
             chunk: Chunk {
                 ops: self.ops,
                 consts: self.consts,
@@ -593,6 +644,12 @@ impl FnCompiler {
                 }
                 self.load_var_ref(name);
             }
+            Expr::VariableVariable { name } => {
+                self.expr(name)?;
+                self.emit(Op::LoadVarDynamicRef {
+                    global: self.is_main,
+                });
+            }
             Expr::Index { .. } => {
                 let (root, dims) = Self::lvalue_root(source).ok_or_else(|| {
                     CompileError::new(
@@ -652,6 +709,15 @@ impl FnCompiler {
                     return Err(CompileError::new("Cannot re-assign $this", self.line));
                 }
                 self.store_var_ref(name);
+            }
+            Expr::VariableVariable { name } => {
+                let ref_tmp = self.temp();
+                self.emit(Op::StoreTmp(ref_tmp));
+                self.expr(name)?;
+                self.emit(Op::LoadTmp(ref_tmp));
+                self.emit(Op::StoreVarDynamicRef {
+                    global: self.is_main,
+                });
             }
             Expr::Index { .. } => {
                 let (root, dims) = Self::lvalue_root(target).ok_or_else(|| {
@@ -715,6 +781,43 @@ impl FnCompiler {
             | Expr::StaticProperty { .. } => self.load_ref_source(expr),
             _ => self.expr(expr),
         }
+    }
+
+    fn args_have_special(args: &[Expr]) -> bool {
+        args.iter()
+            .any(|arg| matches!(arg, Expr::NamedArg { .. } | Expr::Spread(_)))
+    }
+
+    /// Push call arguments in source order and return the matching metadata.
+    /// Named and unpacked arguments require the `*Ex` opcodes.
+    fn compile_args_with_modes(
+        &mut self,
+        args: &[Expr],
+        passes: &[ArgPass],
+    ) -> Result<(u32, Vec<ArgMode>), CompileError> {
+        let mut modes = Vec::with_capacity(args.len());
+        for (index, arg) in args.iter().enumerate() {
+            match arg {
+                Expr::NamedArg { name, value } => {
+                    self.expr_arg(value)?;
+                    let name = self.const_str(name.as_bytes());
+                    modes.push(ArgMode::Named(name));
+                }
+                Expr::Spread(value) => {
+                    self.expr(value)?;
+                    modes.push(ArgMode::Unpack);
+                }
+                _ => {
+                    match passes.get(index).copied().unwrap_or(ArgPass::Value) {
+                        ArgPass::Value => self.expr(arg)?,
+                        ArgPass::Ref => self.expr_arg_ref(arg)?,
+                        ArgPass::Auto => self.expr_arg(arg)?,
+                    }
+                    modes.push(ArgMode::Positional);
+                }
+            }
+        }
+        Ok((args.len() as u32, modes))
     }
 
     /// Method calls do not carry a compile-time receiver type. Promote an
@@ -785,6 +888,17 @@ impl FnCompiler {
                 self.store_var(name, keep);
                 Ok(())
             }
+            Expr::VariableVariable { name } => {
+                let value_tmp = self.temp();
+                self.emit(Op::StoreTmp(value_tmp));
+                self.expr(name)?;
+                self.emit(Op::LoadTmp(value_tmp));
+                self.emit(Op::StoreVarDynamic {
+                    global: self.is_main,
+                    keep,
+                });
+                Ok(())
+            }
             Expr::Property { object, name } => {
                 let value_tmp = self.temp();
                 self.emit(Op::StoreTmp(value_tmp));
@@ -792,6 +906,15 @@ impl FnCompiler {
                 self.emit(Op::LoadTmp(value_tmp));
                 let index = self.const_str(name.as_bytes());
                 self.emit(Op::AssignProperty { name: index, keep });
+                Ok(())
+            }
+            Expr::DynamicProperty { object, name } => {
+                let value_tmp = self.temp();
+                self.emit(Op::StoreTmp(value_tmp));
+                self.expr(object)?;
+                self.expr(name)?;
+                self.emit(Op::LoadTmp(value_tmp));
+                self.emit(Op::AssignPropertyDynamic { keep });
                 Ok(())
             }
             Expr::StaticProperty { class, name } => {
@@ -802,6 +925,15 @@ impl FnCompiler {
                 let name = self.const_str(name.as_bytes());
                 self.emit(Op::LoadTmp(value_tmp));
                 self.emit(Op::AssignStaticProperty { class, name, keep });
+                Ok(())
+            }
+            Expr::DynamicStaticProperty { class, name } => {
+                let value_tmp = self.temp();
+                self.emit(Op::StoreTmp(value_tmp));
+                self.expr(class)?;
+                self.expr(name)?;
+                self.emit(Op::LoadTmp(value_tmp));
+                self.emit(Op::AssignStaticPropertyDynamicValue { keep });
                 Ok(())
             }
             Expr::Index { .. } => {
@@ -867,6 +999,12 @@ impl FnCompiler {
                 });
                 Ok(())
             }
+            Expr::DynamicProperty { object, name } => {
+                self.expr(object)?;
+                self.expr(name)?;
+                self.emit(Op::LoadPropertyDynamic { safe: true });
+                Ok(())
+            }
             Expr::StaticProperty { class, name } => {
                 let class = self.qualify_class(class);
                 let class = self.const_str(class.as_bytes());
@@ -876,6 +1014,12 @@ impl FnCompiler {
                     name,
                     safe: true,
                 });
+                Ok(())
+            }
+            Expr::DynamicStaticProperty { class, name } => {
+                self.expr(class)?;
+                self.expr(name)?;
+                self.emit(Op::LoadStaticPropertyDynamicValue { safe: true });
                 Ok(())
             }
             other => self.expr(other),
@@ -963,6 +1107,19 @@ impl FnCompiler {
                 }
                 Ok(())
             }
+            Stmt::Const(decls) => {
+                for decl in decls {
+                    self.expr(&decl.value)?;
+                    let name = self.qualify_decl_name(&decl.name, false);
+                    let index = self.const_str(name.as_bytes());
+                    self.emit(Op::DefineConst(index));
+                }
+                Ok(())
+            }
+            Stmt::Declare { body, .. } => match body {
+                Some(body) => self.compile_stmts(body),
+                None => Ok(()),
+            },
             Stmt::Try {
                 body,
                 catches,
@@ -976,28 +1133,76 @@ impl FnCompiler {
                 }
                 Ok(())
             }
+            Stmt::Static(vars) => {
+                for (name, init) in vars {
+                    let slot = self.slot(name);
+                    let default = match init {
+                        Some(expr) => const_expr(expr, self.line)?,
+                        None => Value::Null,
+                    };
+                    if let Some(existing) = self
+                        .static_slots
+                        .iter_mut()
+                        .find(|(existing, _, _)| existing == name)
+                    {
+                        existing.2 = default;
+                    } else {
+                        self.static_slots.push((name.clone(), slot, default));
+                    }
+                }
+                Ok(())
+            }
             Stmt::Unset(targets) => self.compile_unset(targets),
             Stmt::Return(value) => {
-                match value {
-                    Some(expr) if self.returns_ref => {
-                        self.load_ref_source(expr)?;
-                        self.compile_finally_before_return()?;
-                        self.emit(Op::Return);
-                    }
-                    Some(expr) => {
+                if self.generator_slot.is_some() {
+                    if let Some(expr) = value {
                         self.expr(expr)?;
-                        self.compile_finally_before_return()?;
-                        self.emit(Op::Return);
+                        self.emit(Op::Pop);
                     }
-                    None => {
-                        self.compile_finally_before_return()?;
-                        self.emit(Op::ReturnNull);
+                    self.compile_finally_before_return()?;
+                    let slot = self.generator_slot.expect("generator slot");
+                    self.emit(Op::LoadVarOrArray(slot));
+                    self.emit(Op::Return);
+                } else {
+                    match value {
+                        Some(expr) if self.returns_ref => {
+                            self.load_ref_source(expr)?;
+                            self.compile_finally_before_return()?;
+                            self.emit(Op::Return);
+                        }
+                        Some(expr) => {
+                            self.expr(expr)?;
+                            self.compile_finally_before_return()?;
+                            self.emit(Op::Return);
+                        }
+                        None => {
+                            self.compile_finally_before_return()?;
+                            self.emit(Op::ReturnNull);
+                        }
                     }
                 }
                 Ok(())
             }
             Stmt::Break(level) => self.compile_break(*level, false),
             Stmt::Continue(level) => self.compile_break(*level, true),
+            Stmt::Goto(label) => {
+                if let Some(target) = self.labels.get(label).copied() {
+                    self.emit(Op::Jump(target));
+                } else {
+                    let jump = self.emit(Op::Jump(0));
+                    self.goto_jumps.push((label.clone(), jump, self.line));
+                }
+                Ok(())
+            }
+            Stmt::Label(label) => {
+                if self.labels.insert(label.clone(), self.ops.len()).is_some() {
+                    return Err(CompileError::new(
+                        format!("Label '{label}' already defined"),
+                        self.line,
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1029,7 +1234,8 @@ impl FnCompiler {
         let start = self.ops.len();
         self.expr(cond)?;
         let exit = self.emit(Op::JumpIfFalse(0));
-        self.loops.push(LoopCtx::default());
+        self.loops
+            .push(LoopCtx::new(self.active_finally.len(), self.handler_depth));
         self.compile_stmts(body)?;
         let ctx = self.loops.pop().expect("loop context");
         for jump in ctx.continues {
@@ -1046,7 +1252,8 @@ impl FnCompiler {
 
     fn compile_do_while(&mut self, body: &[Stmt], cond: &Expr) -> Result<(), CompileError> {
         let start = self.ops.len();
-        self.loops.push(LoopCtx::default());
+        self.loops
+            .push(LoopCtx::new(self.active_finally.len(), self.handler_depth));
         self.compile_stmts(body)?;
         let cond_label = self.ops.len();
         let ctx = self.loops.pop().expect("loop context");
@@ -1086,7 +1293,8 @@ impl FnCompiler {
         }
         let exit = self.emit(Op::JumpIfFalse(0));
 
-        self.loops.push(LoopCtx::default());
+        self.loops
+            .push(LoopCtx::new(self.active_finally.len(), self.handler_depth));
         self.compile_stmts(body)?;
 
         let step_label = self.ops.len();
@@ -1149,7 +1357,8 @@ impl FnCompiler {
             end: 0,
         });
 
-        self.loops.push(LoopCtx::default());
+        self.loops
+            .push(LoopCtx::new(self.active_finally.len(), self.handler_depth));
         if let (Some(key_target), Some(key_slot)) = (key, key_tmp) {
             self.emit(Op::LoadTmp(key_slot));
             self.store_target(key_target, false)?;
@@ -1219,6 +1428,12 @@ impl FnCompiler {
                         self.emit(Op::UnsetVar(slot));
                     }
                 }
+                Expr::VariableVariable { name } => {
+                    self.expr(name)?;
+                    self.emit(Op::UnsetVarDynamic {
+                        global: self.is_main,
+                    });
+                }
                 Expr::Index { .. } => {
                     let (root, dims) = Self::lvalue_root(target).ok_or_else(|| {
                         CompileError::new(
@@ -1245,11 +1460,21 @@ impl FnCompiler {
                     let name = self.const_str(name.as_bytes());
                     self.emit(Op::UnsetProperty { name });
                 }
+                Expr::DynamicProperty { object, name } => {
+                    self.expr(object)?;
+                    self.expr(name)?;
+                    self.emit(Op::UnsetPropertyDynamic);
+                }
                 Expr::StaticProperty { class, name } => {
                     let class = self.qualify_class(class);
                     let class = self.const_str(class.as_bytes());
                     let name = self.const_str(name.as_bytes());
                     self.emit(Op::UnsetStaticProperty { class, name });
+                }
+                Expr::DynamicStaticProperty { class, name } => {
+                    self.expr(class)?;
+                    self.expr(name)?;
+                    self.emit(Op::UnsetStaticPropertyDynamicValue);
                 }
                 _ => {
                     return Err(CompileError::new(
@@ -1286,7 +1511,8 @@ impl FnCompiler {
         }
         let no_match = self.emit(Op::Jump(0));
 
-        self.loops.push(LoopCtx::default());
+        self.loops
+            .push(LoopCtx::new(self.active_finally.len(), self.handler_depth));
         let mut starts = vec![0usize; cases.len()];
         for (i, case) in cases.iter().enumerate() {
             starts[i] = self.ops.len();
@@ -1306,17 +1532,32 @@ impl FnCompiler {
     }
 
     fn compile_class(&mut self, decl: &ClassDecl) -> Result<(), CompileError> {
-        if !self.is_main {
-            return Err(CompileError::new(
-                "class declarations inside functions are not supported",
-                decl.line,
-            ));
-        }
         let class_name = self.qualify_decl_name(&decl.name, false);
         let parent = decl
             .parent
             .as_ref()
             .map(|parent| self.qualify_class(parent));
+        let interfaces = decl
+            .interfaces
+            .iter()
+            .map(|interface| self.qualify_class(interface))
+            .collect();
+        let traits = decl
+            .traits
+            .iter()
+            .map(|trait_name| self.qualify_class(trait_name))
+            .collect();
+        let mut trait_adaptations = decl.trait_adaptations.clone();
+        for adaptation in &mut trait_adaptations {
+            if let Some(trait_name) = &adaptation.trait_name {
+                adaptation.trait_name = Some(self.qualify_class(trait_name));
+            }
+            adaptation.instead_of = adaptation
+                .instead_of
+                .iter()
+                .map(|trait_name| self.qualify_class(trait_name))
+                .collect();
+        }
         let mut properties = Vec::new();
         for property in &decl.properties {
             properties.push(ClassProperty {
@@ -1330,6 +1571,28 @@ impl FnCompiler {
                 line: property.line,
             });
         }
+        for method in &decl.methods {
+            if method.name.eq_ignore_ascii_case("__construct") {
+                for param in &method.params {
+                    let Some(visibility) = param.promoted else {
+                        continue;
+                    };
+                    if properties
+                        .iter()
+                        .any(|property| property.name == param.name)
+                    {
+                        continue;
+                    }
+                    properties.push(ClassProperty {
+                        name: param.name.clone(),
+                        default: Value::Null,
+                        visibility,
+                        static_: false,
+                        line: method.line,
+                    });
+                }
+            }
+        }
         let mut constants = Vec::new();
         for constant in &decl.constants {
             constants.push((
@@ -1337,51 +1600,158 @@ impl FnCompiler {
                 const_expr(&constant.value, constant.line)?,
             ));
         }
+        let mut enum_cases = Vec::new();
+        for case in &decl.enum_cases {
+            enum_cases.push((
+                case.name.clone(),
+                match &case.value {
+                    Some(expr) => Some(const_expr(expr, case.line)?),
+                    None => None,
+                },
+            ));
+        }
+        if decl.kind == ClassKind::Enum {
+            let mut names = HashSet::new();
+            let mut backing_values = HashSet::new();
+            for (name, value) in &enum_cases {
+                if !names.insert(name.to_ascii_lowercase()) {
+                    return Err(CompileError::new(
+                        format!("Duplicate enum case {name}"),
+                        decl.line,
+                    ));
+                }
+                match decl.enum_backing.as_deref() {
+                    None => {
+                        if value.is_some() {
+                            return Err(CompileError::new(
+                                format!(
+                                    "Case {name} of non-backed enum {} cannot have a value",
+                                    class_name
+                                ),
+                                decl.line,
+                            ));
+                        }
+                    }
+                    Some("int") => match value {
+                        Some(Value::Int(number)) => {
+                            if !backing_values.insert(number.to_string()) {
+                                return Err(CompileError::new(
+                                    format!("Duplicate value in enum {}", class_name),
+                                    decl.line,
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(CompileError::new(
+                                format!("Enum case {name} must have an int value"),
+                                decl.line,
+                            ))
+                        }
+                    },
+                    Some("string") => match value {
+                        Some(Value::Str(text)) => {
+                            if !backing_values.insert(text.to_string_lossy()) {
+                                return Err(CompileError::new(
+                                    format!("Duplicate value in enum {}", class_name),
+                                    decl.line,
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(CompileError::new(
+                                format!("Enum case {name} must have a string value"),
+                                decl.line,
+                            ))
+                        }
+                    },
+                    Some(_) => {
+                        return Err(CompileError::new(
+                            format!("Invalid backing type for enum {}", class_name),
+                            decl.line,
+                        ))
+                    }
+                }
+            }
+            if decl.enum_backing.is_some()
+                && !enum_cases.is_empty()
+                && enum_cases.iter().any(|(_, value)| value.is_none())
+            {
+                return Err(CompileError::new(
+                    format!("All cases of backed enum {} must have a value", class_name),
+                    decl.line,
+                ));
+            }
+        }
 
         let mut methods = Vec::new();
         for method in &decl.methods {
             let function_name = format!("{}::{}", class_name, method.name);
-            let mut nested = FnCompiler::new_method(&function_name, method.line, &self.file);
-            nested.signatures = self.signatures.clone();
-            nested.returns_ref = method.returns_ref;
-            nested.namespace = self.namespace.clone();
-            nested.class_uses = self.class_uses.clone();
-            nested.function_uses = self.function_uses.clone();
-            nested.const_uses = self.const_uses.clone();
-            for param in &method.params {
-                let slot = nested.slot(&param.name);
-                let default = match &param.default {
-                    Some(expr) => Some(const_expr(expr, method.line)?),
-                    None => None,
-                };
-                nested.params.push(ParamSlot {
-                    name: param.name.clone(),
-                    slot,
-                    default,
-                    variadic: param.variadic,
-                    by_ref: param.by_ref,
-                });
-            }
             check_param_names(&method.params, method.line)?;
-            nested.compile_stmts(&method.body)?;
-            let (function, inner, _) = nested.finish();
-            self.functions.push(function);
-            self.functions.extend(inner);
+            if !method.abstract_ {
+                let mut nested = FnCompiler::new_method(&function_name, method.line, &self.file);
+                nested.signatures = self.signatures.clone();
+                nested.returns_ref = method.returns_ref;
+                nested.namespace = self.namespace.clone();
+                nested.class_uses = self.class_uses.clone();
+                nested.function_uses = self.function_uses.clone();
+                nested.const_uses = self.const_uses.clone();
+                for param in &method.params {
+                    let slot = nested.slot(&param.name);
+                    let default = match &param.default {
+                        Some(expr) => Some(const_expr(expr, method.line)?),
+                        None => None,
+                    };
+                    nested.params.push(ParamSlot {
+                        name: param.name.clone(),
+                        slot,
+                        default,
+                        variadic: param.variadic,
+                        by_ref: param.by_ref,
+                    });
+                }
+                if stmts_contain_yield(&method.body) {
+                    nested.start_generator();
+                }
+                if method.name.eq_ignore_ascii_case("__construct") {
+                    for param in &method.params {
+                        if param.promoted.is_none() {
+                            continue;
+                        }
+                        nested.load_var("this");
+                        nested.load_var(&param.name);
+                        let name = nested.const_str(param.name.as_bytes());
+                        nested.emit(Op::AssignProperty { name, keep: false });
+                    }
+                }
+                nested.compile_stmts(&method.body)?;
+                let (function, inner, classes) = nested.finish();
+                self.functions.push(function);
+                self.functions.extend(inner);
+                self.classes.extend(classes);
+            }
             methods.push(ClassMethod {
                 name: method.name.clone(),
                 function: function_name,
                 visibility: method.visibility,
                 static_: method.static_,
+                abstract_: method.abstract_,
                 line: method.line,
             });
         }
 
         self.classes.push(ClassDef {
             name: class_name,
+            kind: decl.kind,
             parent,
+            interfaces,
+            traits,
+            trait_adaptations,
             properties,
             constants,
             methods,
+            enum_backing: decl.enum_backing.clone(),
+            enum_cases,
+            abstract_: decl.abstract_ || decl.kind == ClassKind::Interface,
             line: decl.line,
         });
         Ok(())
@@ -1529,6 +1899,42 @@ impl FnCompiler {
         Ok(())
     }
 
+    /// Emit the `finally` bodies between the current point and a loop/switch
+    /// label. `break`/`continue` must run them before jumping out of a `try`.
+    fn compile_finally_before_jump(
+        &mut self,
+        target_finally_depth: usize,
+        target_handler_depth: usize,
+    ) -> Result<(), CompileError> {
+        let blocks = self.active_finally.clone();
+        let saved_finally = self.active_finally.clone();
+        let saved_handler_depth = self.handler_depth;
+
+        for index in (target_finally_depth..blocks.len()).rev() {
+            let target = blocks[index].outer_handler_depth;
+            while self.handler_depth > target {
+                self.emit(Op::TryEnd);
+                self.handler_depth -= 1;
+            }
+            let body = blocks[index].body.clone();
+            let outer = blocks[..index].to_vec();
+            let saved = std::mem::replace(&mut self.active_finally, outer);
+            self.compile_stmts(&body)?;
+            self.active_finally = saved;
+        }
+        while self.handler_depth > target_handler_depth {
+            self.emit(Op::TryEnd);
+            self.handler_depth -= 1;
+        }
+
+        // The emitted path has unwound to the target. Restore the compiler's
+        // lexical state so the (unreachable) code after the jump is still
+        // compiled as if it were inside the try block.
+        self.active_finally = saved_finally;
+        self.handler_depth = saved_handler_depth;
+        Ok(())
+    }
+
     fn compile_function_decl(&mut self, decl: &FunctionDecl) -> Result<(), CompileError> {
         check_param_names(&decl.params, decl.line)?;
         let mut nested = FnCompiler::new_function(decl, &self.file);
@@ -1551,10 +1957,14 @@ impl FnCompiler {
                 by_ref: param.by_ref,
             });
         }
+        if stmts_contain_yield(&decl.body) {
+            nested.start_generator();
+        }
         nested.compile_stmts(&decl.body)?;
-        let (function, inner, _) = nested.finish();
+        let (function, inner, classes) = nested.finish();
         self.functions.push(function);
         self.functions.extend(inner);
+        self.classes.extend(classes);
         Ok(())
     }
 
@@ -1578,6 +1988,24 @@ impl FnCompiler {
                 self.expr(object)?;
                 let index = self.const_str(method.as_bytes());
                 self.emit(Op::MakeMethodCallable { method: index });
+            }
+            Expr::DynamicMethodCall {
+                object,
+                method,
+                args,
+            } if args.is_empty() => {
+                self.expr(object)?;
+                self.expr(method)?;
+                self.emit(Op::MakeMethodCallableValue);
+            }
+            Expr::DynamicStaticCall {
+                class,
+                method,
+                args,
+            } if args.is_empty() => {
+                self.expr(class)?;
+                self.expr(method)?;
+                self.emit(Op::MakeStaticCallableValue);
             }
             Expr::StaticCall {
                 class,
@@ -1678,6 +2106,13 @@ impl FnCompiler {
                 by_ref: param.by_ref,
             });
         }
+        let yielding = match &decl.body {
+            ClosureBody::Block(body) => stmts_contain_yield(body),
+            ClosureBody::Expr(body) => expr_contains_yield(body),
+        };
+        if yielding {
+            nested.start_generator();
+        }
         match &decl.body {
             ClosureBody::Block(body) => nested.compile_stmts(body)?,
             ClosureBody::Expr(body) => {
@@ -1686,12 +2121,17 @@ impl FnCompiler {
                 } else {
                     nested.expr(body)?;
                 }
+                if let Some(slot) = nested.generator_slot {
+                    nested.emit(Op::Pop);
+                    nested.emit(Op::LoadVarOrArray(slot));
+                }
                 nested.emit(Op::Return);
             }
         }
-        let (function, inner, _) = nested.finish();
+        let (function, inner, classes) = nested.finish();
         self.functions.push(function);
         self.functions.extend(inner);
+        self.classes.extend(classes);
 
         for (capture, by_ref) in &captures {
             if *by_ref {
@@ -1721,12 +2161,79 @@ impl FnCompiler {
             ));
         }
         let index = self.loops.len() - level;
+        let finally_depth = self.loops[index].finally_depth;
+        let handler_depth = self.loops[index].handler_depth;
+        self.compile_finally_before_jump(finally_depth, handler_depth)?;
         let jump = self.emit(Op::Jump(0));
         if is_continue {
             self.loops[index].continues.push(jump);
         } else {
             self.loops[index].breaks.push(jump);
         }
+        Ok(())
+    }
+
+    /// Initialize the hidden generator array at function entry, before any
+    /// branch can `return`. The pre-scan in [`stmts_contain_yield`] decides
+    /// whether a body is a generator.
+    fn start_generator(&mut self) {
+        let slot = self.slot("{generator}");
+        self.emit(Op::ArrayNew);
+        self.emit(Op::StoreVar(slot));
+        self.generator_slot = Some(slot);
+    }
+
+    fn generator_slot(&mut self) -> Result<u32, CompileError> {
+        if self.is_main {
+            return Err(CompileError::new(
+                "\"yield\" outside of a function",
+                self.line,
+            ));
+        }
+        if let Some(slot) = self.generator_slot {
+            return Ok(slot);
+        }
+        let slot = self.slot("{generator}");
+        self.emit(Op::ArrayNew);
+        self.emit(Op::StoreVar(slot));
+        self.generator_slot = Some(slot);
+        Ok(slot)
+    }
+
+    fn compile_yield(
+        &mut self,
+        key: &Option<Box<Expr>>,
+        value: &Option<Box<Expr>>,
+        from: bool,
+    ) -> Result<(), CompileError> {
+        let slot = self.generator_slot()?;
+        self.emit(Op::LoadVar(slot));
+        if from {
+            let value = value
+                .as_ref()
+                .ok_or_else(|| CompileError::new("yield from requires a value", self.line))?;
+            self.expr(value)?;
+            self.emit(Op::YieldFrom);
+        } else if let (Some(key), Some(value)) = (key, value) {
+            self.expr(key)?;
+            self.expr(value)?;
+            self.emit(Op::AssignDim {
+                modes: vec![DimMode::Key],
+            });
+        } else if let Some(value) = value {
+            self.expr(value)?;
+            self.emit(Op::AssignDim {
+                modes: vec![DimMode::Append],
+            });
+        } else {
+            self.emit(Op::Null);
+            self.emit(Op::AssignDim {
+                modes: vec![DimMode::Append],
+            });
+        }
+        self.emit(Op::StoreVar(slot));
+        // Eager generators have no `send()` value to expose.
+        self.emit(Op::Null);
         Ok(())
     }
 
@@ -1773,6 +2280,15 @@ impl FnCompiler {
                 }
             }
             Expr::Var(name) => self.load_var(name),
+            Expr::VariableVariable { name } => {
+                self.expr(name)?;
+                self.emit(Op::LoadVarDynamic {
+                    global: self.is_main,
+                });
+            }
+            Expr::Yield { key, value, from } => {
+                self.compile_yield(key, value, *from)?;
+            }
             Expr::Name(name) => {
                 let lowered = name.to_ascii_lowercase();
                 let magic = match lowered.as_str() {
@@ -1847,31 +2363,57 @@ impl FnCompiler {
                 // array_multisort decides at runtime which arguments are
                 // arrays (by reference) and which are sort flags (by value).
                 let builtin_all_by_ref = short_name.eq_ignore_ascii_case("array_multisort");
-                for (arg_index, arg) in args.iter().enumerate() {
-                    if builtin_all_by_ref
-                        || argument_is_by_ref(signature.as_ref(), arg_index)
-                        || (signature.is_none() && builtin_by_ref.contains(&arg_index))
-                    {
-                        self.expr_arg_ref(arg)?;
-                    } else {
-                        self.expr(arg)?;
-                    }
-                }
+                let passes: Vec<ArgPass> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(arg_index, _)| {
+                        if builtin_all_by_ref
+                            || argument_is_by_ref(signature.as_ref(), arg_index)
+                            || (signature.is_none() && builtin_by_ref.contains(&arg_index))
+                        {
+                            ArgPass::Ref
+                        } else {
+                            ArgPass::Value
+                        }
+                    })
+                    .collect();
                 let index = self.const_str(name.as_bytes());
-                self.emit(Op::Call {
-                    name: index,
-                    argc: args.len() as u32,
-                    fallback,
-                });
+                if Self::args_have_special(args) {
+                    let (argc, modes) = self.compile_args_with_modes(args, &passes)?;
+                    self.emit(Op::CallEx {
+                        name: index,
+                        argc,
+                        fallback,
+                        modes,
+                    });
+                } else {
+                    for (arg_index, arg) in args.iter().enumerate() {
+                        match passes[arg_index] {
+                            ArgPass::Ref => self.expr_arg_ref(arg)?,
+                            _ => self.expr(arg)?,
+                        }
+                    }
+                    self.emit(Op::Call {
+                        name: index,
+                        argc: args.len() as u32,
+                        fallback,
+                    });
+                }
             }
             Expr::DynamicCall { callee, args } => {
                 self.expr(callee)?;
-                for arg in args {
-                    self.expr_arg(arg)?;
+                let passes = vec![ArgPass::Auto; args.len()];
+                if Self::args_have_special(args) {
+                    let (argc, modes) = self.compile_args_with_modes(args, &passes)?;
+                    self.emit(Op::CallValueEx { argc, modes });
+                } else {
+                    for arg in args {
+                        self.expr_arg(arg)?;
+                    }
+                    self.emit(Op::CallValue {
+                        argc: args.len() as u32,
+                    });
                 }
-                self.emit(Op::CallValue {
-                    argc: args.len() as u32,
-                });
             }
             Expr::FirstClassCallable(inner) => self.compile_first_class_callable(inner)?,
             Expr::New { class, args } => {
@@ -1880,17 +2422,54 @@ impl FnCompiler {
                     .signatures
                     .get(&format!("{}::__construct", class_name).to_ascii_lowercase())
                     .cloned();
-                for (arg_index, arg) in args.iter().enumerate() {
-                    if argument_is_by_ref(signature.as_ref(), arg_index) {
-                        self.expr_arg_ref(arg)?;
-                    } else {
-                        self.expr_arg(arg)?;
-                    }
-                }
+                let passes: Vec<ArgPass> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(arg_index, _)| {
+                        if argument_is_by_ref(signature.as_ref(), arg_index) {
+                            ArgPass::Ref
+                        } else {
+                            ArgPass::Auto
+                        }
+                    })
+                    .collect();
                 let index = self.const_str(class_name.as_bytes());
-                self.emit(Op::NewObject {
+                if Self::args_have_special(args) {
+                    let (argc, modes) = self.compile_args_with_modes(args, &passes)?;
+                    self.emit(Op::NewObjectEx {
+                        class: index,
+                        argc,
+                        modes,
+                    });
+                } else {
+                    for (arg_index, arg) in args.iter().enumerate() {
+                        match passes[arg_index] {
+                            ArgPass::Ref => self.expr_arg_ref(arg)?,
+                            _ => self.expr_arg(arg)?,
+                        }
+                    }
+                    self.emit(Op::NewObject {
+                        class: index,
+                        argc: args.len() as u32,
+                    });
+                }
+            }
+            Expr::NewDynamic { class, args } => {
+                self.expr(class)?;
+                let passes = vec![ArgPass::Auto; args.len()];
+                let (argc, modes) = self.compile_args_with_modes(args, &passes)?;
+                self.emit(Op::NewObjectDynamic { argc, modes });
+            }
+            Expr::NewAnonymous { class, args } => {
+                self.compile_class(class)?;
+                let class_name = self.qualify_decl_name(&class.name, false);
+                let index = self.const_str(class_name.as_bytes());
+                let passes = vec![ArgPass::Auto; args.len()];
+                let (argc, modes) = self.compile_args_with_modes(args, &passes)?;
+                self.emit(Op::NewObjectEx {
                     class: index,
-                    argc: args.len() as u32,
+                    argc,
+                    modes,
                 });
             }
             Expr::Property { object, name } => {
@@ -1901,24 +2480,80 @@ impl FnCompiler {
                     safe: false,
                 });
             }
+            Expr::DynamicProperty { object, name } => {
+                self.expr(object)?;
+                self.expr(name)?;
+                self.emit(Op::LoadPropertyDynamic { safe: false });
+            }
+            Expr::DynamicMethodCall {
+                object,
+                method,
+                args,
+            } => {
+                self.expr(object)?;
+                self.expr(method)?;
+                let passes = vec![ArgPass::Auto; args.len()];
+                let (argc, modes) = self.compile_args_with_modes(args, &passes)?;
+                self.emit(Op::CallMethodDynamic { argc, modes });
+            }
+            Expr::DynamicStaticCall {
+                class,
+                method,
+                args,
+            } => {
+                self.expr(class)?;
+                self.expr(method)?;
+                let passes = vec![ArgPass::Auto; args.len()];
+                let (argc, modes) = self.compile_args_with_modes(args, &passes)?;
+                self.emit(Op::CallStaticMethodValue { argc, modes });
+            }
+            Expr::DynamicStaticProperty { class, name } => {
+                self.expr(class)?;
+                self.expr(name)?;
+                self.emit(Op::LoadStaticPropertyDynamicValue { safe: false });
+            }
+            Expr::DynamicClassConst { class, name } => {
+                self.expr(class)?;
+                self.expr(name)?;
+                self.emit(Op::ClassConstantDynamicValue);
+            }
             Expr::MethodCall {
                 object,
                 method,
                 args,
             } => {
                 self.expr(object)?;
-                for (arg_index, arg) in args.iter().enumerate() {
-                    if self.method_argument_by_ref(method, arg_index) {
-                        self.expr_arg_ref(arg)?;
-                    } else {
-                        self.expr_arg(arg)?;
-                    }
-                }
+                let passes: Vec<ArgPass> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(arg_index, _)| {
+                        if self.method_argument_by_ref(method, arg_index) {
+                            ArgPass::Ref
+                        } else {
+                            ArgPass::Auto
+                        }
+                    })
+                    .collect();
                 let index = self.const_str(method.as_bytes());
-                self.emit(Op::CallMethod {
-                    method: index,
-                    argc: args.len() as u32,
-                });
+                if Self::args_have_special(args) {
+                    let (argc, modes) = self.compile_args_with_modes(args, &passes)?;
+                    self.emit(Op::CallMethodEx {
+                        method: index,
+                        argc,
+                        modes,
+                    });
+                } else {
+                    for (arg_index, arg) in args.iter().enumerate() {
+                        match passes[arg_index] {
+                            ArgPass::Ref => self.expr_arg_ref(arg)?,
+                            _ => self.expr_arg(arg)?,
+                        }
+                    }
+                    self.emit(Op::CallMethod {
+                        method: index,
+                        argc: args.len() as u32,
+                    });
+                }
             }
             Expr::StaticCall {
                 class,
@@ -1930,20 +2565,40 @@ impl FnCompiler {
                     .signatures
                     .get(&format!("{}::{}", class_name, method).to_ascii_lowercase())
                     .cloned();
-                for (arg_index, arg) in args.iter().enumerate() {
-                    if argument_is_by_ref(signature.as_ref(), arg_index) {
-                        self.expr_arg_ref(arg)?;
-                    } else {
-                        self.expr_arg(arg)?;
-                    }
-                }
+                let passes: Vec<ArgPass> = args
+                    .iter()
+                    .enumerate()
+                    .map(|(arg_index, _)| {
+                        if argument_is_by_ref(signature.as_ref(), arg_index) {
+                            ArgPass::Ref
+                        } else {
+                            ArgPass::Auto
+                        }
+                    })
+                    .collect();
                 let class = self.const_str(class_name.as_bytes());
                 let method = self.const_str(method.as_bytes());
-                self.emit(Op::CallStaticMethod {
-                    class,
-                    method,
-                    argc: args.len() as u32,
-                });
+                if Self::args_have_special(args) {
+                    let (argc, modes) = self.compile_args_with_modes(args, &passes)?;
+                    self.emit(Op::CallStaticMethodEx {
+                        class,
+                        method,
+                        argc,
+                        modes,
+                    });
+                } else {
+                    for (arg_index, arg) in args.iter().enumerate() {
+                        match passes[arg_index] {
+                            ArgPass::Ref => self.expr_arg_ref(arg)?,
+                            _ => self.expr_arg(arg)?,
+                        }
+                    }
+                    self.emit(Op::CallStaticMethod {
+                        class,
+                        method,
+                        argc: args.len() as u32,
+                    });
+                }
             }
             Expr::StaticProperty { class, name } => {
                 let class = self.qualify_class(class);
@@ -2000,6 +2655,25 @@ impl FnCompiler {
                 self.emit(Op::ToBool);
                 self.emit(Op::Unary(UnOp::Not));
             }
+            Expr::Print(expr) => {
+                self.expr(expr)?;
+                self.emit(Op::Print);
+            }
+            Expr::Exit(value) => {
+                match value {
+                    Some(value) => self.expr(value)?,
+                    None => {
+                        self.emit(Op::Null);
+                    }
+                }
+                self.emit(Op::Exit);
+            }
+            Expr::Spread(_) | Expr::NamedArg { .. } => {
+                return Err(CompileError::new(
+                    "unpacked and named arguments are only valid in a call",
+                    self.line,
+                ))
+            }
         }
         Ok(())
     }
@@ -2015,20 +2689,33 @@ impl FnCompiler {
                     self.line,
                 ));
             };
-            if item.by_ref {
-                return Err(CompileError::new(
-                    "array items by reference are not supported yet",
-                    self.line,
-                ));
+            if item.spread {
+                if item.key.is_some() || item.by_ref {
+                    return Err(CompileError::new(
+                        "array spread cannot have a key or reference",
+                        self.line,
+                    ));
+                }
+                self.expr(value)?;
+                self.emit(Op::ArraySpread { tmp });
+                continue;
             }
             if let Some(key) = &item.key {
                 self.expr(key)?;
             }
-            self.expr(value)?;
-            self.emit(Op::ArraySet {
-                tmp,
-                has_key: item.key.is_some(),
-            });
+            if item.by_ref {
+                self.load_ref_source(value)?;
+                self.emit(Op::ArraySetRef {
+                    tmp,
+                    has_key: item.key.is_some(),
+                });
+            } else {
+                self.expr(value)?;
+                self.emit(Op::ArraySet {
+                    tmp,
+                    has_key: item.key.is_some(),
+                });
+            }
         }
         self.emit(Op::LoadTmp(tmp));
         Ok(())
@@ -2432,6 +3119,15 @@ fn collect_free_vars(
 ) {
     match expr {
         Expr::Var(name) => note_free_var(name, params, out, seen),
+        Expr::VariableVariable { name } => collect_free_vars(name, params, out, seen),
+        Expr::Yield { key, value, .. } => {
+            if let Some(key) = key {
+                collect_free_vars(key, params, out, seen);
+            }
+            if let Some(value) = value {
+                collect_free_vars(value, params, out, seen);
+            }
+        }
         Expr::Cast { expr, .. } | Expr::Unary { expr, .. } | Expr::Empty(expr) => {
             collect_free_vars(expr, params, out, seen);
         }
@@ -2501,12 +3197,59 @@ fn collect_free_vars(
                 collect_free_vars(arg, params, out, seen);
             }
         }
-        Expr::Property { object, .. } => collect_free_vars(object, params, out, seen),
+        Expr::NewDynamic { class, args } => {
+            collect_free_vars(class, params, out, seen);
+            for arg in args {
+                collect_free_vars(arg, params, out, seen);
+            }
+        }
+        Expr::NewAnonymous { args, .. } => {
+            for arg in args {
+                collect_free_vars(arg, params, out, seen);
+            }
+        }
+        Expr::Property { object, .. } => {
+            collect_free_vars(object, params, out, seen);
+        }
+        Expr::DynamicStaticProperty { class, name } => {
+            collect_free_vars(class, params, out, seen);
+            collect_free_vars(name, params, out, seen);
+        }
+        Expr::DynamicProperty { object, name } => {
+            collect_free_vars(object, params, out, seen);
+            collect_free_vars(name, params, out, seen);
+        }
         Expr::MethodCall { object, args, .. } => {
             collect_free_vars(object, params, out, seen);
             for arg in args {
                 collect_free_vars(arg, params, out, seen);
             }
+        }
+        Expr::DynamicMethodCall {
+            object,
+            method,
+            args,
+        } => {
+            collect_free_vars(object, params, out, seen);
+            collect_free_vars(method, params, out, seen);
+            for arg in args {
+                collect_free_vars(arg, params, out, seen);
+            }
+        }
+        Expr::DynamicStaticCall {
+            class,
+            method,
+            args,
+        } => {
+            collect_free_vars(class, params, out, seen);
+            collect_free_vars(method, params, out, seen);
+            for arg in args {
+                collect_free_vars(arg, params, out, seen);
+            }
+        }
+        Expr::DynamicClassConst { class, name } => {
+            collect_free_vars(class, params, out, seen);
+            collect_free_vars(name, params, out, seen);
         }
         Expr::InstanceOf { expr, .. } => collect_free_vars(expr, params, out, seen),
         Expr::Clone(expr) | Expr::Reference(expr) | Expr::Throw(expr) => {
@@ -2542,6 +3285,14 @@ fn collect_free_vars(
                 collect_free_vars(arg, params, out, seen);
             }
         }
+        Expr::Print(expr) => collect_free_vars(expr, params, out, seen),
+        Expr::Exit(value) => {
+            if let Some(value) = value {
+                collect_free_vars(value, params, out, seen);
+            }
+        }
+        Expr::Spread(value) => collect_free_vars(value, params, out, seen),
+        Expr::NamedArg { value, .. } => collect_free_vars(value, params, out, seen),
         Expr::Null
         | Expr::Bool(_)
         | Expr::Int(_)
@@ -2550,6 +3301,188 @@ fn collect_free_vars(
         | Expr::Name(_)
         | Expr::StaticProperty { .. }
         | Expr::ClassConst { .. } => {}
+    }
+}
+
+/// Whether this function/method body directly contains `yield`. Nested
+/// functions, classes and closures are separate scopes and are skipped.
+fn stmts_contain_yield(stmts: &[Stmt]) -> bool {
+    stmts.iter().any(stmt_contains_yield)
+}
+
+fn stmt_contains_yield(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Echo(exprs) => exprs.iter().any(expr_contains_yield),
+        Stmt::Expr(expr) => expr_contains_yield(expr),
+        Stmt::Block(stmts) | Stmt::NamespaceBlock { body: stmts, .. } => stmts_contain_yield(stmts),
+        Stmt::If { branches, else_ } => {
+            branches
+                .iter()
+                .any(|(cond, body)| expr_contains_yield(cond) || stmts_contain_yield(body))
+                || else_.as_deref().is_some_and(stmts_contain_yield)
+        }
+        Stmt::While { cond, body } => expr_contains_yield(cond) || stmts_contain_yield(body),
+        Stmt::DoWhile { body, cond } => stmts_contain_yield(body) || expr_contains_yield(cond),
+        Stmt::For {
+            init,
+            cond,
+            step,
+            body,
+        } => {
+            init.iter().any(expr_contains_yield)
+                || cond.iter().any(expr_contains_yield)
+                || step.iter().any(expr_contains_yield)
+                || stmts_contain_yield(body)
+        }
+        Stmt::Foreach {
+            subject,
+            key,
+            value,
+            body,
+            ..
+        } => {
+            expr_contains_yield(subject)
+                || key.as_ref().is_some_and(expr_contains_yield)
+                || expr_contains_yield(value)
+                || stmts_contain_yield(body)
+        }
+        Stmt::Switch { subject, cases } => {
+            expr_contains_yield(subject)
+                || cases.iter().any(|case| {
+                    case.test.as_ref().is_some_and(expr_contains_yield)
+                        || stmts_contain_yield(&case.body)
+                })
+        }
+        Stmt::Function(_) | Stmt::Class(_) => false,
+        Stmt::Const(decls) => decls.iter().any(|decl| expr_contains_yield(&decl.value)),
+        Stmt::Declare { directives, body } => {
+            directives
+                .iter()
+                .any(|(_, value)| expr_contains_yield(value))
+                || body.as_deref().is_some_and(stmts_contain_yield)
+        }
+        Stmt::Try {
+            body,
+            catches,
+            finally,
+        } => {
+            stmts_contain_yield(body)
+                || catches.iter().any(|catch| stmts_contain_yield(&catch.body))
+                || finally.as_deref().is_some_and(stmts_contain_yield)
+        }
+        Stmt::Static(vars) => vars
+            .iter()
+            .any(|(_, value)| value.as_ref().is_some_and(expr_contains_yield)),
+        Stmt::Unset(targets) => targets.iter().any(expr_contains_yield),
+        Stmt::Return(value) => value.as_ref().is_some_and(expr_contains_yield),
+        Stmt::InlineHtml(_)
+        | Stmt::NamespaceMark(_)
+        | Stmt::Use(_)
+        | Stmt::Global(_)
+        | Stmt::Break(_)
+        | Stmt::Continue(_)
+        | Stmt::Goto(_)
+        | Stmt::Label(_)
+        | Stmt::Nop => false,
+    }
+}
+
+fn expr_contains_yield(expr: &Expr) -> bool {
+    match expr {
+        Expr::Yield { .. } => true,
+        // A nested closure has its own generator context.
+        Expr::Closure(_) => false,
+        Expr::Cast { expr, .. }
+        | Expr::Unary { expr, .. }
+        | Expr::Empty(expr)
+        | Expr::Clone(expr)
+        | Expr::Reference(expr)
+        | Expr::Throw(expr)
+        | Expr::Print(expr)
+        | Expr::Spread(expr) => expr_contains_yield(expr),
+        Expr::VariableVariable { name } => expr_contains_yield(name),
+        Expr::Interp(parts) => parts.iter().any(|part| match part {
+            InterpPart::Expr(expr) => expr_contains_yield(expr),
+            InterpPart::Lit(_) => false,
+        }),
+        Expr::Array(items) | Expr::Destructure(items) => items.iter().any(|item| {
+            item.key.as_ref().is_some_and(expr_contains_yield)
+                || item.value.as_ref().is_some_and(expr_contains_yield)
+        }),
+        Expr::Assign { target, value, .. }
+        | Expr::Binary {
+            lhs: target,
+            rhs: value,
+            ..
+        } => expr_contains_yield(target) || expr_contains_yield(value),
+        Expr::IncDec { target, .. } => expr_contains_yield(target),
+        Expr::Ternary { cond, then_, else_ } => {
+            expr_contains_yield(cond)
+                || then_.as_deref().is_some_and(expr_contains_yield)
+                || expr_contains_yield(else_)
+        }
+        Expr::Index { base, index } => {
+            expr_contains_yield(base) || index.as_deref().is_some_and(expr_contains_yield)
+        }
+        Expr::Call { args, .. } | Expr::New { args, .. } | Expr::StaticCall { args, .. } => {
+            args.iter().any(expr_contains_yield)
+        }
+        Expr::DynamicCall { callee, args } => {
+            expr_contains_yield(callee) || args.iter().any(expr_contains_yield)
+        }
+        Expr::FirstClassCallable(inner) => expr_contains_yield(inner),
+        Expr::NewDynamic { class, args } => {
+            expr_contains_yield(class) || args.iter().any(expr_contains_yield)
+        }
+        Expr::NewAnonymous { args, .. } => args.iter().any(expr_contains_yield),
+        Expr::Property { object, .. } => expr_contains_yield(object),
+        Expr::DynamicProperty { object, name } => {
+            expr_contains_yield(object) || expr_contains_yield(name)
+        }
+        Expr::MethodCall { object, args, .. } => {
+            expr_contains_yield(object) || args.iter().any(expr_contains_yield)
+        }
+        Expr::DynamicMethodCall {
+            object,
+            method,
+            args,
+        } => {
+            expr_contains_yield(object)
+                || expr_contains_yield(method)
+                || args.iter().any(expr_contains_yield)
+        }
+        Expr::DynamicStaticCall {
+            class,
+            method,
+            args,
+        } => {
+            expr_contains_yield(class)
+                || expr_contains_yield(method)
+                || args.iter().any(expr_contains_yield)
+        }
+        Expr::DynamicStaticProperty { class, name } | Expr::DynamicClassConst { class, name } => {
+            expr_contains_yield(class) || expr_contains_yield(name)
+        }
+        Expr::InstanceOf { expr, .. } => expr_contains_yield(expr),
+        Expr::Include { path, .. } => expr_contains_yield(path),
+        Expr::Match { subject, arms } => {
+            expr_contains_yield(subject)
+                || arms.iter().any(|arm| {
+                    arm.conditions.iter().any(expr_contains_yield) || expr_contains_yield(&arm.body)
+                })
+        }
+        Expr::Isset(args) => args.iter().any(expr_contains_yield),
+        Expr::Exit(value) => value.as_deref().is_some_and(expr_contains_yield),
+        Expr::NamedArg { value, .. } => expr_contains_yield(value),
+        Expr::Null
+        | Expr::Bool(_)
+        | Expr::Int(_)
+        | Expr::Float(_)
+        | Expr::Str(_)
+        | Expr::Var(_)
+        | Expr::Name(_)
+        | Expr::StaticProperty { .. }
+        | Expr::ClassConst { .. } => false,
     }
 }
 

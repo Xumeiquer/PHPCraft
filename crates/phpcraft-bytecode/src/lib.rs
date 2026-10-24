@@ -5,7 +5,7 @@
 //! slots) and every opcode maps to one or two Zend opcodes; see
 //! `docs/php-src-map.md` for the correspondence.
 
-use phpcraft_ast::{BinOp, CastKind, UnOp, Visibility};
+use phpcraft_ast::{BinOp, CastKind, ClassKind, TraitAdaptation, UnOp, Visibility};
 use phpcraft_runtime::Value;
 
 /// How one `AssignDim` level addresses the array.
@@ -15,6 +15,17 @@ pub enum DimMode {
     Key,
     /// `[]`
     Append,
+}
+
+/// How one call argument is passed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgMode {
+    /// Ordinary positional argument.
+    Positional,
+    /// `name: value`; the payload indexes `Chunk::consts`.
+    Named(u32),
+    /// `...$values`.
+    Unpack,
 }
 
 #[derive(Clone, Debug)]
@@ -35,6 +46,8 @@ pub enum Op {
     LoadVar(u32),
     /// Like `LoadVar`, but yields `null` without a warning when undefined.
     LoadVarSafe(u32),
+    /// Load a local, substituting an empty array when it is undefined/null.
+    LoadVarOrArray(u32),
     /// Push a reference cell for a local slot, creating one if necessary.
     LoadVarRef(u32),
     StoreVar(u32),
@@ -44,6 +57,28 @@ pub enum Op {
     StoreVarRef(u32),
     /// Pop a value and a reference cell and write the value through the cell.
     StoreRefCell,
+
+    /// Pop a variable name and push its value (`$$name`).
+    LoadVarDynamic {
+        global: bool,
+    },
+    /// Pop a name and a value and assign the dynamic variable.
+    StoreVarDynamic {
+        global: bool,
+        keep: bool,
+    },
+    /// Pop a name and push a reference cell for the dynamic variable.
+    LoadVarDynamicRef {
+        global: bool,
+    },
+    /// Pop a name and a reference cell and bind the dynamic variable to it.
+    StoreVarDynamicRef {
+        global: bool,
+    },
+    /// Pop a name and remove the dynamic variable.
+    UnsetVarDynamic {
+        global: bool,
+    },
 
     LoadGlobal(u32),
     LoadGlobalSafe(u32),
@@ -96,6 +131,8 @@ pub enum Op {
     /// and other non-array values warn and yield `null` (objects are fatal).
     IndexDestructure,
 
+    /// Pop an iterable and an array; append every yielded value to the array.
+    YieldFrom,
     /// Pop `array`, the keys and `value`; push the modified array.
     AssignDim {
         modes: Vec<DimMode>,
@@ -125,6 +162,18 @@ pub enum Op {
     CallValue {
         argc: u32,
     },
+    /// Call with named or unpacked arguments. `modes` is parallel to the
+    /// values pushed by the compiler.
+    CallEx {
+        name: u32,
+        argc: u32,
+        fallback: bool,
+        modes: Vec<ArgMode>,
+    },
+    CallValueEx {
+        argc: u32,
+        modes: Vec<ArgMode>,
+    },
     /// Pop a path expression and include/require it.
     Include {
         once: bool,
@@ -146,11 +195,15 @@ pub enum Op {
     MakeMethodCallable {
         method: u32,
     },
+    /// Pop an object and a method-name value and build a Closure.
+    MakeMethodCallableValue,
     /// Build a Closure for `Class::method(...)`.
     MakeStaticCallable {
         class: u32,
         method: u32,
     },
+    /// Pop a class-name value and a method-name value and build a Closure.
+    MakeStaticCallableValue,
     /// Wrap the callable value on the stack into a Closure (`$callable(...)`).
     CallableFromValue,
 
@@ -164,10 +217,28 @@ pub enum Op {
         class: u32,
         argc: u32,
     },
+    NewObjectEx {
+        class: u32,
+        argc: u32,
+        modes: Vec<ArgMode>,
+    },
+    /// Pop constructor arguments and a class-name value, then instantiate it.
+    NewObjectDynamic {
+        argc: u32,
+        modes: Vec<ArgMode>,
+    },
     /// Pop an object and push its property (warning when missing unless safe).
     LoadProperty {
         name: u32,
         safe: bool,
+    },
+    /// Pop an object and a property-name value, then read the property.
+    LoadPropertyDynamic {
+        safe: bool,
+    },
+    /// Pop an object, a property-name value and a value; assign the property.
+    AssignPropertyDynamic {
+        keep: bool,
     },
     /// Pop an object and a value, assign `object->name = value`, and push the
     /// value back when `keep` is set.
@@ -188,11 +259,39 @@ pub enum Op {
         method: u32,
         argc: u32,
     },
+    CallMethodEx {
+        method: u32,
+        argc: u32,
+        modes: Vec<ArgMode>,
+    },
+    /// Pop arguments, a method-name value and an object, then call the method.
+    CallMethodDynamic {
+        argc: u32,
+        modes: Vec<ArgMode>,
+    },
     /// Call a method statically (`Class::method`, `self::`, `parent::`).
     CallStaticMethod {
         class: u32,
         method: u32,
         argc: u32,
+    },
+    CallStaticMethodEx {
+        class: u32,
+        method: u32,
+        argc: u32,
+        modes: Vec<ArgMode>,
+    },
+    /// Pop arguments and a class-name value, then call a static method.
+    CallStaticMethodDynamic {
+        method: u32,
+        argc: u32,
+        modes: Vec<ArgMode>,
+    },
+    /// Pop arguments, a method-name value and a class-name value, then call a
+    /// static method.
+    CallStaticMethodValue {
+        argc: u32,
+        modes: Vec<ArgMode>,
     },
     LoadStaticProperty {
         class: u32,
@@ -202,6 +301,24 @@ pub enum Op {
     AssignStaticProperty {
         class: u32,
         name: u32,
+        keep: bool,
+    },
+    /// Pop a class-name value and read the static property `name`.
+    LoadStaticPropertyDynamic {
+        name: u32,
+        safe: bool,
+    },
+    /// Pop a class-name value and a property-name value, then read it.
+    LoadStaticPropertyDynamicValue {
+        safe: bool,
+    },
+    /// Pop a class-name value and a value; assign the static property `name`.
+    AssignStaticPropertyDynamic {
+        name: u32,
+        keep: bool,
+    },
+    /// Pop a class-name value, a property-name value and a value.
+    AssignStaticPropertyDynamicValue {
         keep: bool,
     },
     /// Create or reuse a reference cell for a static property.
@@ -218,6 +335,12 @@ pub enum Op {
         class: u32,
         name: u32,
     },
+    /// Pop a class-name value and resolve the class constant `name`.
+    ClassConstantDynamic {
+        name: u32,
+    },
+    /// Pop a class-name value and a constant-name value.
+    ClassConstantDynamicValue,
     /// Pop a value and push whether it is an instance of `class`.
     InstanceOf {
         class: u32,
@@ -227,6 +350,22 @@ pub enum Op {
 
     /// Throw the value on top of the stack.
     Throw,
+    /// Terminate the script with the status value on the stack.
+    Exit,
+    /// Define the runtime constant named by `consts[index]` from the value on
+    /// the stack.
+    DefineConst(u32),
+    /// Pop an array and append its entries to the array in `tmp`.
+    ArraySpread {
+        tmp: u32,
+    },
+    /// Like `ArraySet`, but the value on the stack is a reference cell.
+    ArraySetRef {
+        tmp: u32,
+        has_key: bool,
+    },
+    /// Write the value on the stack and push `1` (the `print` expression).
+    Print,
     /// Install an exception handler covering the following instructions.
     TryStart {
         catch_ip: usize,
@@ -264,10 +403,15 @@ pub enum Op {
     UnsetProperty {
         name: u32,
     },
+    UnsetPropertyDynamic,
     UnsetStaticProperty {
         class: u32,
         name: u32,
     },
+    UnsetStaticPropertyDynamic {
+        name: u32,
+    },
+    UnsetStaticPropertyDynamicValue,
 
     Return,
     ReturnNull,
@@ -316,6 +460,8 @@ pub struct Function {
     pub capture_refs: Vec<bool>,
     /// `function &name()` returns a reference cell.
     pub returns_ref: bool,
+    /// `static` locals: `(name, slot, initial value)`.
+    pub static_slots: Vec<(String, u32, Value)>,
     pub chunk: Chunk,
     pub max_slots: u32,
     /// Variable name per slot (temps have `None`); used in diagnostics.
@@ -351,16 +497,30 @@ pub struct ClassMethod {
     pub function: String,
     pub visibility: Visibility,
     pub static_: bool,
+    /// Interface or abstract method without a body.
+    pub abstract_: bool,
     pub line: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct ClassDef {
     pub name: String,
+    pub kind: ClassKind,
     pub parent: Option<String>,
+    /// Directly implemented/extended interfaces.
+    pub interfaces: Vec<String>,
+    /// Traits named in `use`; merged by the VM after loading.
+    pub traits: Vec<String>,
+    /// `insteadof` exclusions and `as` aliases.
+    pub trait_adaptations: Vec<TraitAdaptation>,
     pub properties: Vec<ClassProperty>,
     pub constants: Vec<(String, Value)>,
     pub methods: Vec<ClassMethod>,
+    /// `Some("int" | "string")` for backed enums.
+    pub enum_backing: Option<String>,
+    /// `(case name, backing value)`; unit-enum cases have `None`.
+    pub enum_cases: Vec<(String, Option<Value>)>,
+    pub abstract_: bool,
     pub line: u32,
 }
 

@@ -38,6 +38,8 @@ pub enum Tok {
     InlineHtml(Vec<u8>),
     Ident(String),
     Var(String),
+    /// A bare `$` starting a variable variable (`$$name`, `${expr}`).
+    Dollar,
     Int(i64),
     Float(f64),
     Str(Vec<u8>),
@@ -115,6 +117,7 @@ impl Tok {
             Tok::InlineHtml(_) => "inline HTML".to_string(),
             Tok::Ident(name) => format!("\"{name}\""),
             Tok::Var(name) => format!("\"${name}\""),
+            Tok::Dollar => "\"$\"".to_string(),
             Tok::Int(v) => format!("\"{v}\""),
             Tok::Float(v) => format!("\"{v}\""),
             Tok::Str(_) | Tok::Interp(_) => "string literal".to_string(),
@@ -182,7 +185,7 @@ impl Tok {
             Tok::Shl => "<<",
             Tok::Shr => ">>",
             Tok::Coalesce => "??",
-            Tok::Eof | Tok::InlineHtml(_) | Tok::Ident(_) | Tok::Var(_) => "",
+            Tok::Eof | Tok::InlineHtml(_) | Tok::Ident(_) | Tok::Var(_) | Tok::Dollar => "",
             Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Interp(_) => "",
         }
     }

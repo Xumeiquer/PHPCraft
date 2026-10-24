@@ -80,7 +80,11 @@ fetch/assign instructions.
 | `LoadProperty`, `AssignProperty`, `MakePropertyRef`, `SetPropertyRef`, `UnsetProperty` | `ZEND_FETCH_OBJ_R`, `ZEND_ASSIGN_OBJ`, `ZEND_ASSIGN_OBJ_REF`, `ZEND_UNSET_OBJ` |
 | `CallMethod`, `CallStaticMethod` | `ZEND_INIT_METHOD_CALL`, `ZEND_INIT_STATIC_METHOD_CALL`, `ZEND_DO_FCALL` |
 | `LoadStaticProperty`, `AssignStaticProperty`, `MakeStaticPropertyRef`, `SetStaticPropertyRef` | `ZEND_FETCH_STATIC_PROP_*`, `ZEND_ASSIGN_STATIC_PROP_*`, `ZEND_ASSIGN_STATIC_PROP_REF` |
-| `ClassConstant` | `ZEND_FETCH_CLASS_CONSTANT` |
+| `ClassConstant`, `ClassConstantDynamic`, `ClassConstantDynamicValue` | `ZEND_FETCH_CLASS_CONSTANT` |
+| `LoadVarDynamic`, `StoreVarDynamic`, `LoadVarDynamicRef`, `StoreVarDynamicRef`, `UnsetVarDynamic` | `ZEND_FETCH_R`/`ZEND_ASSIGN` with a computed variable name |
+| `NewObjectDynamic`, `LoadPropertyDynamic`, `AssignPropertyDynamic`, `CallMethodDynamic`, `CallStaticMethodDynamic`, `CallStaticMethodValue`, `LoadStaticPropertyDynamic*`, `AssignStaticPropertyDynamic*`, `UnsetPropertyDynamic`, `UnsetStaticPropertyDynamic*` | Dynamic `ZEND_NEW`, `ZEND_FETCH_OBJ_R`/`ZEND_ASSIGN_OBJ`, method-call and static-property forms |
+| `MakeMethodCallableValue`, `MakeStaticCallableValue` | `ZEND_CALLABLE_CONVERT` on a dynamic method/static call |
+| `YieldFrom`, `LoadVarOrArray` | `ZEND_YIELD_FROM`; PHPCraft uses eager generator arrays |
 | `InstanceOf` | `ZEND_INSTANCEOF` |
 | `CloneObject` | `ZEND_CLONE` |
 | `Throw` | `ZEND_THROW` |

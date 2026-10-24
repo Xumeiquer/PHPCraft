@@ -7,9 +7,10 @@
 //! boundary of the implementation is always explicit.
 
 use phpcraft_ast::{
-    ArrayItem, BinOp, Capture, CastKind, CatchClause, ClassConstDecl, ClassDecl, ClosureBody,
-    ClosureDecl, Expr, FunctionDecl, InterpPart, MatchArm, MethodDecl, Param, Program,
-    PropertyDecl, Stmt, SwitchCase, UnOp, UseDecl, UseKind, Visibility,
+    ArrayItem, BinOp, Capture, CastKind, CatchClause, ClassConstDecl, ClassDecl, ClassKind,
+    ClosureBody, ClosureDecl, ConstDecl, EnumCaseDecl, Expr, FunctionDecl, InterpPart, MatchArm,
+    MethodDecl, Param, Program, PropertyDecl, Stmt, SwitchCase, TraitAdaptation, UnOp, UseDecl,
+    UseKind, Visibility,
 };
 use phpcraft_lexer::{self, DimKey, StrPart, Tok, Token};
 
@@ -62,6 +63,8 @@ pub struct Parser {
     pos: usize,
     /// Guards against pathological nesting blowing the Rust stack.
     depth: u32,
+    /// Monotonic suffix for generated anonymous-class names.
+    anon_counter: u32,
 }
 
 const MAX_DEPTH: u32 = 512;
@@ -72,6 +75,7 @@ impl Parser {
             tokens,
             pos: 0,
             depth: 0,
+            anon_counter: 0,
         }
     }
 
@@ -234,6 +238,18 @@ impl Parser {
             return Ok(Stmt::InlineHtml(bytes));
         }
 
+        if self.check_keyword("goto") && matches!(self.peek_at(1), Tok::Ident(_)) {
+            self.advance();
+            let label = self.expect_ident()?;
+            self.end_statement()?;
+            return Ok(Stmt::Goto(label));
+        }
+        if matches!(self.peek(), Tok::Ident(_)) && self.peek_at(1) == &Tok::Colon {
+            let label = self.expect_ident()?;
+            self.expect(&Tok::Colon)?;
+            return Ok(Stmt::Label(label));
+        }
+
         if self.check_keyword("echo") {
             self.advance();
             let exprs = self.parse_expr_list()?;
@@ -277,6 +293,15 @@ impl Parser {
         {
             return Ok(Stmt::Class(self.parse_class()?));
         }
+        if self.check_keyword("interface") {
+            return Ok(Stmt::Class(self.parse_class_like(ClassKind::Interface)?));
+        }
+        if self.check_keyword("trait") {
+            return Ok(Stmt::Class(self.parse_class_like(ClassKind::Trait)?));
+        }
+        if self.check_keyword("enum") {
+            return Ok(Stmt::Class(self.parse_class_like(ClassKind::Enum)?));
+        }
         if self.check_keyword("namespace") {
             return self.parse_namespace();
         }
@@ -308,6 +333,24 @@ impl Parser {
             self.end_statement()?;
             return Ok(Stmt::Continue(level));
         }
+        if self.check_keyword("static") && matches!(self.peek_at(1), Tok::Var(_)) {
+            self.advance();
+            let mut vars = Vec::new();
+            loop {
+                let name = self.expect_variable()?;
+                let value = if self.eat(&Tok::Assign) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                vars.push((name, value));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+            self.end_statement()?;
+            return Ok(Stmt::Static(vars));
+        }
         if self.check_keyword("global") {
             self.advance();
             let mut names = Vec::new();
@@ -329,18 +372,14 @@ impl Parser {
             return Ok(Stmt::Unset(targets));
         }
 
-        for keyword in [
-            "interface",
-            "trait",
-            "enum",
-            "const",
-            "static",
-            "declare",
-            "abstract",
-            "final",
-            "readonly",
-            "typedef",
-        ] {
+        if self.check_keyword("const") {
+            return self.parse_const_stmt();
+        }
+        if self.check_keyword("declare") {
+            return self.parse_declare_stmt();
+        }
+
+        for keyword in ["abstract", "final", "readonly", "typedef"] {
             if self.check_keyword(keyword) {
                 return Err(self.unsupported(&format!("\"{keyword}\"")));
             }
@@ -358,6 +397,53 @@ impl Parser {
         let expr = self.parse_expr()?;
         self.end_statement()?;
         Ok(Stmt::Expr(expr))
+    }
+
+    /// `const NAME = value, OTHER = value;` at namespace level.
+    fn parse_const_stmt(&mut self) -> Result<Stmt, ParseError> {
+        let line = self.line();
+        self.expect_keyword("const")?;
+        let mut decls = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            self.expect(&Tok::Assign)?;
+            let value = self.parse_expr()?;
+            decls.push(ConstDecl { name, value, line });
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.end_statement()?;
+        Ok(Stmt::Const(decls))
+    }
+
+    fn parse_declare_stmt(&mut self) -> Result<Stmt, ParseError> {
+        self.expect_keyword("declare")?;
+        self.expect(&Tok::LParen)?;
+        let mut directives = Vec::new();
+        loop {
+            let name = self.expect_ident()?;
+            self.expect(&Tok::Assign)?;
+            let value = self.parse_expr()?;
+            directives.push((name, value));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RParen)?;
+        if self.eat(&Tok::LBrace) {
+            let body = self.parse_block_body()?;
+            Ok(Stmt::Declare {
+                directives,
+                body: Some(body),
+            })
+        } else {
+            self.end_statement()?;
+            Ok(Stmt::Declare {
+                directives,
+                body: None,
+            })
+        }
     }
 
     /// `;`, or the implicit semicolon produced by `?>`.
@@ -407,13 +493,56 @@ impl Parser {
         }
     }
 
+    fn parse_alt_block(&mut self, terminators: &[&str]) -> Result<Vec<Stmt>, ParseError> {
+        let mut stmts = Vec::new();
+        loop {
+            if matches!(self.peek(), Tok::Eof) {
+                return Err(self.error("syntax error, unexpected end of file"));
+            }
+            if let Some(keyword) = self.peek_keyword() {
+                if terminators
+                    .iter()
+                    .any(|terminator| keyword.eq_ignore_ascii_case(terminator))
+                {
+                    break;
+                }
+            }
+            if self.eat(&Tok::Semi) {
+                continue;
+            }
+            stmts.push(self.parse_stmt()?);
+        }
+        Ok(stmts)
+    }
+
     fn parse_if(&mut self) -> Result<Stmt, ParseError> {
         self.expect_keyword("if")?;
         self.expect(&Tok::LParen)?;
         let cond = self.parse_expr()?;
         self.expect(&Tok::RParen)?;
-        if matches!(self.peek(), Tok::Colon) {
-            return Err(self.unsupported("alternative if syntax (: ... endif)"));
+        if self.eat(&Tok::Colon) {
+            let mut branches = Vec::new();
+            let mut current_cond = cond;
+            loop {
+                let body = self.parse_alt_block(&["elseif", "else", "endif"])?;
+                branches.push((current_cond, body));
+                if self.eat_keyword("elseif") {
+                    self.expect(&Tok::LParen)?;
+                    current_cond = self.parse_expr()?;
+                    self.expect(&Tok::RParen)?;
+                    self.expect(&Tok::Colon)?;
+                    continue;
+                }
+                let else_ = if self.eat_keyword("else") {
+                    self.expect(&Tok::Colon)?;
+                    Some(self.parse_alt_block(&["endif"])?)
+                } else {
+                    None
+                };
+                self.expect_keyword("endif")?;
+                self.end_statement()?;
+                return Ok(Stmt::If { branches, else_ });
+            }
         }
         let body = self.parse_stmt_or_block()?;
 
@@ -448,8 +577,11 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         let cond = self.parse_expr()?;
         self.expect(&Tok::RParen)?;
-        if matches!(self.peek(), Tok::Colon) {
-            return Err(self.unsupported("alternative while syntax (: ... endwhile)"));
+        if self.eat(&Tok::Colon) {
+            let body = self.parse_alt_block(&["endwhile"])?;
+            self.expect_keyword("endwhile")?;
+            self.end_statement()?;
+            return Ok(Stmt::While { cond, body });
         }
         let body = self.parse_stmt_or_block()?;
         Ok(Stmt::While { cond, body })
@@ -475,8 +607,16 @@ impl Parser {
         self.expect(&Tok::Semi)?;
         let step = self.parse_expr_list_until(&Tok::RParen)?;
         self.expect(&Tok::RParen)?;
-        if matches!(self.peek(), Tok::Colon) {
-            return Err(self.unsupported("alternative for syntax (: ... endfor)"));
+        if self.eat(&Tok::Colon) {
+            let body = self.parse_alt_block(&["endfor"])?;
+            self.expect_keyword("endfor")?;
+            self.end_statement()?;
+            return Ok(Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            });
         }
         let body = self.parse_stmt_or_block()?;
         Ok(Stmt::For {
@@ -535,8 +675,17 @@ impl Parser {
             return Err(self.unsupported("foreach by reference targets other than variables"));
         }
         self.expect(&Tok::RParen)?;
-        if matches!(self.peek(), Tok::Colon) {
-            return Err(self.unsupported("alternative foreach syntax (: ... endforeach)"));
+        if self.eat(&Tok::Colon) {
+            let body = self.parse_alt_block(&["endforeach"])?;
+            self.expect_keyword("endforeach")?;
+            self.end_statement()?;
+            return Ok(Stmt::Foreach {
+                subject,
+                key,
+                value,
+                by_ref,
+                body,
+            });
         }
         let body = self.parse_stmt_or_block()?;
         Ok(Stmt::Foreach {
@@ -553,14 +702,19 @@ impl Parser {
         self.expect(&Tok::LParen)?;
         let subject = self.parse_expr()?;
         self.expect(&Tok::RParen)?;
-        if matches!(self.peek(), Tok::Colon) {
-            return Err(self.unsupported("alternative switch syntax (: ... endswitch)"));
+        let alternative = self.eat(&Tok::Colon);
+        if !alternative {
+            self.expect(&Tok::LBrace)?;
         }
-        self.expect(&Tok::LBrace)?;
 
         let mut cases: Vec<SwitchCase> = Vec::new();
         loop {
-            if matches!(self.peek(), Tok::RBrace) {
+            if alternative {
+                if self.check_keyword("endswitch") {
+                    self.advance();
+                    break;
+                }
+            } else if matches!(self.peek(), Tok::RBrace) {
                 self.advance();
                 break;
             }
@@ -573,7 +727,9 @@ impl Parser {
             if self.check_keyword("case") {
                 self.advance();
                 let test = self.parse_expr()?;
-                self.expect(&Tok::Colon)?;
+                if !self.eat(&Tok::Colon) {
+                    self.expect(&Tok::Semi)?;
+                }
                 cases.push(SwitchCase {
                     test: Some(test),
                     body: Vec::new(),
@@ -582,7 +738,9 @@ impl Parser {
             }
             if self.check_keyword("default") {
                 self.advance();
-                self.expect(&Tok::Colon)?;
+                if !self.eat(&Tok::Colon) {
+                    self.expect(&Tok::Semi)?;
+                }
                 cases.push(SwitchCase {
                     test: None,
                     body: Vec::new(),
@@ -595,7 +753,53 @@ impl Parser {
                 None => return Err(self.error("statement before the first case label")),
             }
         }
+        if alternative {
+            self.end_statement()?;
+        }
         Ok(Stmt::Switch { subject, cases })
+    }
+
+    fn parse_yield(&mut self) -> Result<Expr, ParseError> {
+        self.expect_keyword("yield")?;
+        if self.eat_keyword("from") {
+            let value = self.parse_bp(0)?;
+            return Ok(Expr::Yield {
+                key: None,
+                value: Some(Box::new(value)),
+                from: true,
+            });
+        }
+        if matches!(
+            self.peek(),
+            Tok::Semi
+                | Tok::Comma
+                | Tok::RParen
+                | Tok::RBracket
+                | Tok::RBrace
+                | Tok::Colon
+                | Tok::Eof
+        ) {
+            return Ok(Expr::Yield {
+                key: None,
+                value: None,
+                from: false,
+            });
+        }
+        let first = self.parse_bp(0)?;
+        if self.eat(&Tok::DoubleArrow) {
+            let value = self.parse_bp(0)?;
+            Ok(Expr::Yield {
+                key: Some(Box::new(first)),
+                value: Some(Box::new(value)),
+                from: false,
+            })
+        } else {
+            Ok(Expr::Yield {
+                key: None,
+                value: Some(Box::new(first)),
+                from: false,
+            })
+        }
     }
 
     fn parse_function(&mut self) -> Result<FunctionDecl, ParseError> {
@@ -747,36 +951,216 @@ impl Parser {
     }
 
     fn parse_class(&mut self) -> Result<ClassDecl, ParseError> {
-        let line = self.line();
-        while matches!(
-            self.peek_keyword().as_deref(),
-            Some("final" | "abstract" | "readonly")
-        ) {
-            self.advance();
+        self.parse_class_like(ClassKind::Class)
+    }
+
+    fn parse_name_list(&mut self) -> Result<Vec<String>, ParseError> {
+        let mut names = Vec::new();
+        loop {
+            names.push(self.parse_qualified_name()?);
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
         }
-        self.expect_keyword("class")?;
+        Ok(names)
+    }
+
+    fn parse_class_like(&mut self, kind: ClassKind) -> Result<ClassDecl, ParseError> {
+        let line = self.line();
+        let mut abstract_ = false;
+        while let Some(keyword) = self.peek_keyword() {
+            match keyword.as_str() {
+                "final" | "readonly" => {
+                    self.advance();
+                }
+                "abstract" => {
+                    abstract_ = true;
+                    self.advance();
+                }
+                _ => break,
+            }
+        }
+        match kind {
+            ClassKind::Class => self.expect_keyword("class")?,
+            ClassKind::Interface => self.expect_keyword("interface")?,
+            ClassKind::Trait => self.expect_keyword("trait")?,
+            ClassKind::Enum => self.expect_keyword("enum")?,
+        }
         let name = self.expect_ident()?;
-        let parent = if self.eat_keyword("extends") {
-            Some(self.parse_qualified_name()?)
-        } else {
-            None
-        };
-        if self.check_keyword("implements") {
-            return Err(self.unsupported("interfaces (implements)"));
+        let mut parent = None;
+        let mut interfaces = Vec::new();
+        let mut enum_backing = None;
+        match kind {
+            ClassKind::Class => {
+                if self.eat_keyword("extends") {
+                    parent = Some(self.parse_qualified_name()?);
+                }
+                if self.eat_keyword("implements") {
+                    interfaces = self.parse_name_list()?;
+                }
+            }
+            ClassKind::Interface => {
+                if self.eat_keyword("extends") {
+                    interfaces = self.parse_name_list()?;
+                }
+            }
+            ClassKind::Enum => {
+                if self.eat(&Tok::Colon) {
+                    let backing = self.expect_ident()?;
+                    if !backing.eq_ignore_ascii_case("int")
+                        && !backing.eq_ignore_ascii_case("string")
+                    {
+                        return Err(
+                            self.error("syntax error, enum backing type must be int or string")
+                        );
+                    }
+                    enum_backing = Some(backing);
+                }
+                if self.eat_keyword("implements") {
+                    interfaces = self.parse_name_list()?;
+                }
+            }
+            ClassKind::Trait => {}
         }
         self.expect(&Tok::LBrace)?;
+        let (properties, constants, methods, traits, trait_adaptations, enum_cases) =
+            self.parse_class_body(kind)?;
+        Ok(ClassDecl {
+            kind,
+            name,
+            parent,
+            interfaces,
+            traits,
+            trait_adaptations,
+            properties,
+            constants,
+            methods,
+            enum_backing,
+            enum_cases,
+            abstract_: abstract_ || kind == ClassKind::Interface,
+            line,
+        })
+    }
 
+    #[allow(clippy::type_complexity)]
+    fn parse_class_body(
+        &mut self,
+        kind: ClassKind,
+    ) -> Result<
+        (
+            Vec<PropertyDecl>,
+            Vec<ClassConstDecl>,
+            Vec<MethodDecl>,
+            Vec<String>,
+            Vec<TraitAdaptation>,
+            Vec<EnumCaseDecl>,
+        ),
+        ParseError,
+    > {
         let mut properties = Vec::new();
         let mut constants = Vec::new();
         let mut methods = Vec::new();
+        let mut traits = Vec::new();
+        let mut trait_adaptations = Vec::new();
+        let mut enum_cases = Vec::new();
         while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
             if self.eat(&Tok::Semi) {
                 continue;
             }
             let member_line = self.line();
-            let (visibility, static_) = self.parse_member_modifiers()?;
+            if kind == ClassKind::Enum && self.check_keyword("case") {
+                self.advance();
+                let case_name = self.expect_ident()?;
+                let value = if self.eat(&Tok::Assign) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                self.end_statement()?;
+                enum_cases.push(EnumCaseDecl {
+                    name: case_name,
+                    value,
+                    line: member_line,
+                });
+                continue;
+            }
+            if self.check_keyword("use") {
+                self.advance();
+                traits.extend(self.parse_name_list()?);
+                if self.eat(&Tok::LBrace) {
+                    while !matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                        if self.eat(&Tok::Semi) {
+                            continue;
+                        }
+                        let trait_name = if matches!(self.peek(), Tok::Ident(_))
+                            && self.peek_at(1) == &Tok::DoubleColon
+                        {
+                            let name = self.parse_qualified_name()?;
+                            self.expect(&Tok::DoubleColon)?;
+                            Some(name)
+                        } else {
+                            None
+                        };
+                        let method = self.expect_ident()?;
+                        if self.eat_keyword("insteadof") {
+                            let mut instead_of = Vec::new();
+                            loop {
+                                instead_of.push(self.parse_qualified_name()?);
+                                if !self.eat(&Tok::Comma) {
+                                    break;
+                                }
+                            }
+                            trait_adaptations.push(TraitAdaptation {
+                                trait_name,
+                                method,
+                                instead_of,
+                                alias: None,
+                                visibility: None,
+                            });
+                        } else if self.eat_keyword("as") {
+                            let visibility = match self.peek_keyword().as_deref() {
+                                Some("public") => Some(Visibility::Public),
+                                Some("protected") => Some(Visibility::Protected),
+                                Some("private") => Some(Visibility::Private),
+                                _ => None,
+                            };
+                            if visibility.is_some() {
+                                self.advance();
+                            }
+                            let alias = if let Tok::Ident(alias) = self.peek().clone() {
+                                self.advance();
+                                Some(alias)
+                            } else {
+                                None
+                            };
+                            trait_adaptations.push(TraitAdaptation {
+                                trait_name,
+                                method,
+                                instead_of: Vec::new(),
+                                alias,
+                                visibility,
+                            });
+                        } else {
+                            return Err(self.error(
+                                "syntax error in trait adaptation block, expecting insteadof or as",
+                            ));
+                        }
+                        self.end_statement()?;
+                    }
+                    self.expect(&Tok::RBrace)?;
+                    let _ = self.eat(&Tok::Semi);
+                } else {
+                    self.end_statement()?;
+                }
+                continue;
+            }
+            let (visibility, static_, member_abstract) = self.parse_member_modifiers()?;
             if self.check_keyword("function") {
-                methods.push(self.parse_method(visibility, static_)?);
+                methods.push(self.parse_method(
+                    visibility,
+                    static_,
+                    member_abstract || kind == ClassKind::Interface,
+                )?);
             } else if self.check_keyword("const") {
                 self.advance();
                 loop {
@@ -824,19 +1208,68 @@ impl Parser {
             }
         }
         self.expect(&Tok::RBrace)?;
-        Ok(ClassDecl {
-            name,
-            parent,
+        Ok((
             properties,
             constants,
             methods,
-            line,
-        })
+            traits,
+            trait_adaptations,
+            enum_cases,
+        ))
     }
 
-    fn parse_member_modifiers(&mut self) -> Result<(Visibility, bool), ParseError> {
+    fn parse_anonymous_class(&mut self) -> Result<(ClassDecl, Vec<Expr>), ParseError> {
+        let line = self.line();
+        self.expect_keyword("class")?;
+        let args = if self.eat(&Tok::LParen) {
+            match self.parse_call_args()? {
+                CallArguments::List(args) => args,
+                CallArguments::FirstClass => {
+                    return Err(self.error("Cannot create Closure for anonymous class"))
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let parent = if self.eat_keyword("extends") {
+            Some(self.parse_qualified_name()?)
+        } else {
+            None
+        };
+        let interfaces = if self.eat_keyword("implements") {
+            self.parse_name_list()?
+        } else {
+            Vec::new()
+        };
+        self.expect(&Tok::LBrace)?;
+        let (properties, constants, methods, traits, trait_adaptations, enum_cases) =
+            self.parse_class_body(ClassKind::Class)?;
+        let id = self.anon_counter;
+        self.anon_counter += 1;
+        Ok((
+            ClassDecl {
+                kind: ClassKind::Class,
+                name: format!("class@anonymous:{line}:{id}"),
+                parent,
+                interfaces,
+                traits,
+                trait_adaptations,
+                properties,
+                constants,
+                methods,
+                enum_backing: None,
+                enum_cases,
+                abstract_: false,
+                line,
+            },
+            args,
+        ))
+    }
+
+    fn parse_member_modifiers(&mut self) -> Result<(Visibility, bool, bool), ParseError> {
         let mut visibility = Visibility::Public;
         let mut static_ = false;
+        let mut abstract_ = false;
         while let Some(keyword) = self.peek_keyword() {
             match keyword.as_str() {
                 "public" => {
@@ -858,19 +1291,24 @@ impl Parser {
                 "var" => {
                     self.advance();
                 }
-                "final" | "abstract" | "readonly" => {
+                "abstract" => {
+                    self.advance();
+                    abstract_ = true;
+                }
+                "final" | "readonly" => {
                     self.advance();
                 }
                 _ => break,
             }
         }
-        Ok((visibility, static_))
+        Ok((visibility, static_, abstract_))
     }
 
     fn parse_method(
         &mut self,
         visibility: Visibility,
         static_: bool,
+        abstract_: bool,
     ) -> Result<MethodDecl, ParseError> {
         let line = self.line();
         self.expect_keyword("function")?;
@@ -884,7 +1322,16 @@ impl Parser {
             }
         }
         if self.eat(&Tok::Semi) {
-            return Err(self.unsupported("abstract/interface method declarations"));
+            return Ok(MethodDecl {
+                name,
+                params,
+                body: Vec::new(),
+                visibility,
+                static_,
+                returns_ref,
+                abstract_: true,
+                line,
+            });
         }
         self.expect(&Tok::LBrace)?;
         let body = self.parse_block_body()?;
@@ -895,6 +1342,7 @@ impl Parser {
             visibility,
             static_,
             returns_ref,
+            abstract_,
             line,
         })
     }
@@ -1025,10 +1473,20 @@ impl Parser {
                 break;
             }
             // Optional type declaration: consume tokens until the variable.
+            // Visibility keywords here are constructor property promotion.
+            let mut promoted = None;
             while !matches!(
                 self.peek(),
                 Tok::Var(_) | Tok::Ellipsis | Tok::BitAnd | Tok::Comma | Tok::RParen
             ) {
+                if let Tok::Ident(keyword) = self.peek() {
+                    promoted = match keyword.to_ascii_lowercase().as_str() {
+                        "public" => Some(Visibility::Public),
+                        "protected" => Some(Visibility::Protected),
+                        "private" => Some(Visibility::Private),
+                        _ => promoted,
+                    };
+                }
                 self.advance();
             }
             let by_ref = self.eat(&Tok::BitAnd);
@@ -1044,6 +1502,7 @@ impl Parser {
                 default,
                 variadic,
                 by_ref,
+                promoted,
             });
             if self.eat(&Tok::Comma) {
                 continue;
@@ -1155,12 +1614,18 @@ impl Parser {
                 continue;
             }
             if self.eat(&Tok::Arrow) {
-                let name = match self.peek().clone() {
-                    Tok::Ident(name) => {
+                let dynamic = match self.peek().clone() {
+                    Tok::Ident(_) => None,
+                    Tok::Var(name) => {
                         self.advance();
-                        name
+                        Some(Expr::Var(name))
                     }
-                    Tok::Var(_) => return Err(self.unsupported("dynamic property names")),
+                    Tok::LBrace => {
+                        self.advance();
+                        let expr = self.parse_expr()?;
+                        self.expect(&Tok::RBrace)?;
+                        Some(expr)
+                    }
                     other => {
                         return Err(self.error(format!(
                             "syntax error, unexpected {}, expecting property name",
@@ -1168,57 +1633,200 @@ impl Parser {
                         )))
                     }
                 };
+                let name = match &dynamic {
+                    None => match self.peek().clone() {
+                        Tok::Ident(name) => {
+                            self.advance();
+                            name
+                        }
+                        _ => unreachable!(),
+                    },
+                    Some(_) => String::new(),
+                };
                 lhs = if self.eat(&Tok::LParen) {
                     match self.parse_call_args()? {
-                        CallArguments::List(args) => Expr::MethodCall {
-                            object: Box::new(lhs),
-                            method: name,
-                            args,
+                        CallArguments::List(args) => match dynamic {
+                            Some(method) => Expr::DynamicMethodCall {
+                                object: Box::new(lhs),
+                                method: Box::new(method),
+                                args,
+                            },
+                            None => Expr::MethodCall {
+                                object: Box::new(lhs),
+                                method: name,
+                                args,
+                            },
                         },
-                        CallArguments::FirstClass => {
-                            Expr::FirstClassCallable(Box::new(Expr::MethodCall {
+                        CallArguments::FirstClass => match dynamic {
+                            Some(method) => {
+                                Expr::FirstClassCallable(Box::new(Expr::DynamicMethodCall {
+                                    object: Box::new(lhs),
+                                    method: Box::new(method),
+                                    args: Vec::new(),
+                                }))
+                            }
+                            None => Expr::FirstClassCallable(Box::new(Expr::MethodCall {
                                 object: Box::new(lhs),
                                 method: name,
                                 args: Vec::new(),
-                            }))
-                        }
+                            })),
+                        },
                     }
                 } else {
-                    Expr::Property {
-                        object: Box::new(lhs),
-                        name,
+                    match dynamic {
+                        Some(name) => Expr::DynamicProperty {
+                            object: Box::new(lhs),
+                            name: Box::new(name),
+                        },
+                        None => Expr::Property {
+                            object: Box::new(lhs),
+                            name,
+                        },
                     }
                 };
                 continue;
             }
             if self.eat(&Tok::DoubleColon) {
                 let class = match &lhs {
-                    Expr::Name(name) => name.clone(),
-                    _ => return Err(self.unsupported("dynamic class names")),
+                    Expr::Name(name) => Some(name.clone()),
+                    _ => None,
                 };
                 if let Tok::Var(name) = self.peek().clone() {
                     self.advance();
-                    lhs = Expr::StaticProperty { class, name };
+                    if self.eat(&Tok::LParen) {
+                        let (args, first_class) = match self.parse_call_args()? {
+                            CallArguments::List(args) => (args, false),
+                            CallArguments::FirstClass => (Vec::new(), true),
+                        };
+                        let class = match &class {
+                            Some(class) => Expr::Str(class.as_bytes().to_vec()),
+                            None => lhs,
+                        };
+                        let call = Expr::DynamicStaticCall {
+                            class: Box::new(class),
+                            method: Box::new(Expr::Var(name)),
+                            args,
+                        };
+                        lhs = if first_class {
+                            Expr::FirstClassCallable(Box::new(call))
+                        } else {
+                            call
+                        };
+                    } else {
+                        lhs = match class {
+                            Some(class) => Expr::StaticProperty { class, name },
+                            None => Expr::DynamicStaticProperty {
+                                class: Box::new(lhs),
+                                name: Box::new(Expr::Str(name.into_bytes())),
+                            },
+                        };
+                    }
+                    continue;
+                }
+                if self.eat(&Tok::Dollar) {
+                    let name = if let Tok::Var(name) = self.peek().clone() {
+                        self.advance();
+                        Expr::Var(name)
+                    } else if self.eat(&Tok::LBrace) {
+                        let name = self.parse_expr()?;
+                        self.expect(&Tok::RBrace)?;
+                        name
+                    } else {
+                        return Err(self.error("syntax error, unexpected token after $"));
+                    };
+                    let class = match &class {
+                        Some(class) => Expr::Str(class.as_bytes().to_vec()),
+                        None => lhs,
+                    };
+                    lhs = if self.eat(&Tok::LParen) {
+                        let (args, first_class) = match self.parse_call_args()? {
+                            CallArguments::List(args) => (args, false),
+                            CallArguments::FirstClass => (Vec::new(), true),
+                        };
+                        let call = Expr::DynamicStaticCall {
+                            class: Box::new(class),
+                            method: Box::new(name),
+                            args,
+                        };
+                        if first_class {
+                            Expr::FirstClassCallable(Box::new(call))
+                        } else {
+                            call
+                        }
+                    } else {
+                        Expr::DynamicStaticProperty {
+                            class: Box::new(class),
+                            name: Box::new(name),
+                        }
+                    };
+                    continue;
+                }
+                if self.eat(&Tok::LBrace) {
+                    let name = self.parse_expr()?;
+                    self.expect(&Tok::RBrace)?;
+                    let class = match &class {
+                        Some(class) => Expr::Str(class.as_bytes().to_vec()),
+                        None => lhs,
+                    };
+                    lhs = if self.eat(&Tok::LParen) {
+                        let (args, first_class) = match self.parse_call_args()? {
+                            CallArguments::List(args) => (args, false),
+                            CallArguments::FirstClass => (Vec::new(), true),
+                        };
+                        let call = Expr::DynamicStaticCall {
+                            class: Box::new(class),
+                            method: Box::new(name),
+                            args,
+                        };
+                        if first_class {
+                            Expr::FirstClassCallable(Box::new(call))
+                        } else {
+                            call
+                        }
+                    } else {
+                        Expr::DynamicClassConst {
+                            class: Box::new(class),
+                            name: Box::new(name),
+                        }
+                    };
                     continue;
                 }
                 let name = self.expect_ident()?;
                 lhs = if self.eat(&Tok::LParen) {
                     match self.parse_call_args()? {
-                        CallArguments::List(args) => Expr::StaticCall {
-                            class,
-                            method: name,
-                            args,
+                        CallArguments::List(args) => match class {
+                            Some(class) => Expr::StaticCall {
+                                class,
+                                method: name,
+                                args,
+                            },
+                            None => Expr::DynamicStaticCall {
+                                class: Box::new(lhs),
+                                method: Box::new(Expr::Str(name.into_bytes())),
+                                args,
+                            },
                         },
-                        CallArguments::FirstClass => {
-                            Expr::FirstClassCallable(Box::new(Expr::StaticCall {
+                        CallArguments::FirstClass => match class {
+                            Some(class) => Expr::FirstClassCallable(Box::new(Expr::StaticCall {
                                 class,
                                 method: name,
                                 args: Vec::new(),
-                            }))
-                        }
+                            })),
+                            None => Expr::FirstClassCallable(Box::new(Expr::DynamicStaticCall {
+                                class: Box::new(lhs),
+                                method: Box::new(Expr::Str(name.into_bytes())),
+                                args: Vec::new(),
+                            })),
+                        },
                     }
                 } else {
-                    Expr::ClassConst { class, name }
+                    match class {
+                        Some(class) => Expr::ClassConst { class, name },
+                        None => Expr::DynamicClassConst {
+                            class: Box::new(lhs),
+                            name: Box::new(Expr::Str(name.into_bytes())),
+                        },
+                    }
                 };
                 continue;
             }
@@ -1367,6 +1975,23 @@ impl Parser {
                 self.advance();
                 Ok(Expr::Var(name))
             }
+            Tok::Dollar => {
+                self.advance();
+                if let Tok::Var(name) = self.peek().clone() {
+                    self.advance();
+                    Ok(Expr::VariableVariable {
+                        name: Box::new(Expr::Var(name)),
+                    })
+                } else if self.eat(&Tok::LBrace) {
+                    let name = self.parse_expr()?;
+                    self.expect(&Tok::RBrace)?;
+                    Ok(Expr::VariableVariable {
+                        name: Box::new(name),
+                    })
+                } else {
+                    Err(self.error("syntax error, unexpected token after $"))
+                }
+            }
             Tok::LParen => {
                 self.advance();
                 if let Tok::Ident(name) = self.peek().clone() {
@@ -1512,7 +2137,30 @@ impl Parser {
                     "new" => {
                         self.advance();
                         if self.check_keyword("class") {
-                            return Err(self.unsupported("anonymous classes"));
+                            let (class, args) = self.parse_anonymous_class()?;
+                            return Ok(Expr::NewAnonymous {
+                                class: Box::new(class),
+                                args,
+                            });
+                        }
+                        if matches!(self.peek(), Tok::Var(_) | Tok::LParen | Tok::Str(_)) {
+                            let class = self.parse_prefix()?;
+                            let args = if self.eat(&Tok::LParen) {
+                                match self.parse_call_args()? {
+                                    CallArguments::List(args) => args,
+                                    CallArguments::FirstClass => {
+                                        return Err(
+                                            self.error("Cannot create Closure for new expression")
+                                        )
+                                    }
+                                }
+                            } else {
+                                Vec::new()
+                            };
+                            return Ok(Expr::NewDynamic {
+                                class: Box::new(class),
+                                args,
+                            });
                         }
                         let class = self.parse_qualified_name()?;
                         let args = if self.eat(&Tok::LParen) {
@@ -1559,9 +2207,38 @@ impl Parser {
                     "function" => self.parse_closure_expr(false),
                     "fn" => self.parse_closure_expr(true),
                     "match" if self.peek_at(1) == &Tok::LParen => self.parse_match(),
-                    "yield" => Err(self.unsupported("generators")),
-                    "print" => Err(self.unsupported("the print expression; use echo")),
-                    "exit" | "die" => Err(self.unsupported("exit/die")),
+                    "yield" => self.parse_yield(),
+                    "print" => {
+                        self.advance();
+                        // `print` binds looser than assignment but tighter
+                        // than `and`/`xor`/`or`.
+                        Ok(Expr::Print(Box::new(self.parse_bp(4)?)))
+                    }
+                    "exit" | "die" => {
+                        self.advance();
+                        let value = if self.eat(&Tok::LParen) {
+                            if self.eat(&Tok::RParen) {
+                                None
+                            } else {
+                                let value = self.parse_expr()?;
+                                self.expect(&Tok::RParen)?;
+                                Some(Box::new(value))
+                            }
+                        } else if matches!(
+                            self.peek(),
+                            Tok::Semi
+                                | Tok::Comma
+                                | Tok::RParen
+                                | Tok::RBracket
+                                | Tok::RBrace
+                                | Tok::Eof
+                        ) {
+                            None
+                        } else {
+                            Some(Box::new(self.parse_bp(4)?))
+                        };
+                        Ok(Expr::Exit(value))
+                    }
                     "instanceof" => Err(self.unsupported("instanceof")),
                     "namespace" if self.peek_at(1) == &Tok::Backslash => {
                         self.advance();
@@ -1674,13 +2351,26 @@ impl Parser {
                 return Err(self.error("syntax error, unexpected end of file"));
             }
             if matches!(self.peek(), Tok::Ellipsis) {
-                return Err(self.unsupported("array spread (...$array)"));
+                self.advance();
+                let value = self.parse_expr()?;
+                items.push(ArrayItem {
+                    key: None,
+                    value: Some(value),
+                    by_ref: false,
+                    spread: true,
+                });
+                if self.eat(&Tok::Comma) {
+                    continue;
+                }
+                self.expect(close)?;
+                break;
             }
             if self.eat(&Tok::Comma) {
                 items.push(ArrayItem {
                     key: None,
                     value: None,
                     by_ref: false,
+                    spread: false,
                 });
                 continue;
             }
@@ -1699,12 +2389,14 @@ impl Parser {
                     key: Some(first),
                     value: Some(value),
                     by_ref,
+                    spread: false,
                 });
             } else {
                 items.push(ArrayItem {
                     key: None,
                     value: Some(first),
                     by_ref,
+                    spread: false,
                 });
             }
             if self.eat(&Tok::Comma) {
@@ -1773,15 +2465,34 @@ impl Parser {
             if self.eat(&Tok::RParen) {
                 break;
             }
-            if matches!(self.peek(), Tok::Ellipsis) {
-                return Err(self.unsupported("argument unpacking (...$args)"));
+            if self.eat(&Tok::Ellipsis) {
+                let value = self.parse_expr()?;
+                args.push(Expr::Spread(Box::new(value)));
+                if self.eat(&Tok::Comma) {
+                    continue;
+                }
+                self.expect(&Tok::RParen)?;
+                break;
             }
             if matches!(self.peek(), Tok::BitAnd) {
                 return Err(self.unsupported("arguments by reference (&$arg)"));
             }
-            // Named arguments (`name: value`) are recognised and rejected.
-            if matches!(self.peek(), Tok::Ident(_)) && self.peek_at(1) == &Tok::Colon {
-                return Err(self.unsupported("named arguments"));
+            // Named argument (`name: value`).
+            if let Tok::Ident(name) = self.peek().clone() {
+                if self.peek_at(1) == &Tok::Colon {
+                    self.advance();
+                    self.advance();
+                    let value = self.parse_expr()?;
+                    args.push(Expr::NamedArg {
+                        name,
+                        value: Box::new(value),
+                    });
+                    if self.eat(&Tok::Comma) {
+                        continue;
+                    }
+                    self.expect(&Tok::RParen)?;
+                    break;
+                }
             }
             args.push(self.parse_expr()?);
             if self.eat(&Tok::Comma) {
@@ -1824,8 +2535,11 @@ fn assignment_op(tok: &Tok) -> Option<Option<BinOp>> {
 /// Can this expression appear on the left of an assignment?
 fn is_valid_target(expr: &Expr) -> bool {
     match expr {
-        Expr::Var(_) => true,
-        Expr::Property { .. } | Expr::StaticProperty { .. } => true,
+        Expr::Var(_) | Expr::VariableVariable { .. } => true,
+        Expr::Property { .. }
+        | Expr::StaticProperty { .. }
+        | Expr::DynamicProperty { .. }
+        | Expr::DynamicStaticProperty { .. } => true,
         Expr::Index { base, .. } => is_valid_target(base),
         Expr::Destructure(items) => items.iter().all(|item| match &item.value {
             None => true,
@@ -2216,8 +2930,8 @@ mod tests {
 
     #[test]
     fn reports_unsupported_constructs() {
-        let err = parse_file(b"<?php interface Foo {}").unwrap_err();
-        assert!(err.message.contains("interface"));
+        let err = parse_file(b"<?php typedef Foo;").unwrap_err();
+        assert!(err.message.contains("typedef"));
     }
 
     #[test]

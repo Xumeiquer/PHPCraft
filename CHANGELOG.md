@@ -10,6 +10,24 @@ The reference behaviour is PHP 8.5.4.
 
 ### Added
 
+- Expanded PHP 8.5 syntax coverage: named and unpacked arguments, alternative
+  control syntax, `print`, `exit`/`die`, `goto` and labels, `declare`,
+  attributes (accepted and ignored), top-level and namespaced `const`
+  declarations, constructor property promotion, anonymous classes, and
+  `final`/`readonly` modifier syntax (their inheritance/immutability
+  constraints are not enforced yet).
+- Object model: interfaces, traits (including `insteadof` and `as`
+  adaptations), enums with backed-case validation plus `cases()`/`from()`/
+  `tryFrom()`, abstract classes, and static local variables.
+- Dynamic language features: `new $class`, dynamic properties, instance and
+  static methods, class constants, static properties, variable variables
+  (`$$name`, `${expr}`), and first-class dynamic callables such as
+  `$object->$method(...)` and `$class::$method(...)`.
+- Generators: eager `yield`, keyed `yield`, and `yield from` support for
+  `foreach` iteration. A resumable `Generator` object is not yet implemented.
+- Array literals now accept by-reference elements (`[&$value]`) and continue
+  to support spread.
+- `finally` now also runs when `break` or `continue` leaves a `try` block.
 - Classes and objects: constructors, properties (including typed and static
   declarations), methods, inheritance, `$this`, `parent::`, `self::`,
   `static::`, class constants, `new`, `clone`, `instanceof`, object identity

@@ -158,6 +158,14 @@ static REGISTRY: &[(&str, NativeFn)] = &[
     ("is_scalar", is_scalar),
     ("is_callable", is_callable),
     ("function_exists", function_exists),
+    ("class_exists", class_exists),
+    ("interface_exists", interface_exists),
+    ("trait_exists", trait_exists),
+    ("enum_exists", enum_exists),
+    ("spl_autoload_register", spl_autoload_register),
+    ("spl_autoload_unregister", spl_autoload_unregister),
+    ("spl_autoload_functions", spl_autoload_functions),
+    ("spl_autoload_call", spl_autoload_call),
     ("call_user_func", call_user_func),
     ("call_user_func_array", call_user_func_array),
     // output
@@ -3092,6 +3100,79 @@ fn function_exists(_hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult
     Ok(Value::Bool(
         _hooks.function_exists(&String::from_utf8_lossy(&name)),
     ))
+}
+
+fn class_exists(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("class_exists", &args, 1, Some(2))?;
+    let name = as_string(hooks, &args, 0, "class_exists", "class")?;
+    let autoload = args.get(1).map(Value::to_bool).unwrap_or(true);
+    Ok(Value::Bool(hooks.type_exists(
+        &String::from_utf8_lossy(&name),
+        autoload,
+        "class",
+    )?))
+}
+
+fn interface_exists(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("interface_exists", &args, 1, Some(2))?;
+    let name = as_string(hooks, &args, 0, "interface_exists", "interface")?;
+    let autoload = args.get(1).map(Value::to_bool).unwrap_or(true);
+    Ok(Value::Bool(hooks.type_exists(
+        &String::from_utf8_lossy(&name),
+        autoload,
+        "interface",
+    )?))
+}
+
+fn trait_exists(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("trait_exists", &args, 1, Some(2))?;
+    let name = as_string(hooks, &args, 0, "trait_exists", "trait")?;
+    let autoload = args.get(1).map(Value::to_bool).unwrap_or(true);
+    Ok(Value::Bool(hooks.type_exists(
+        &String::from_utf8_lossy(&name),
+        autoload,
+        "trait",
+    )?))
+}
+
+fn enum_exists(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("enum_exists", &args, 1, Some(2))?;
+    let name = as_string(hooks, &args, 0, "enum_exists", "enum")?;
+    let autoload = args.get(1).map(Value::to_bool).unwrap_or(true);
+    Ok(Value::Bool(hooks.type_exists(
+        &String::from_utf8_lossy(&name),
+        autoload,
+        "enum",
+    )?))
+}
+
+fn spl_autoload_register(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("spl_autoload_register", &args, 1, Some(3))?;
+    let callback = args[0].clone();
+    if !hooks.is_callable(&callback) {
+        return Err(PhpError::type_error(
+            "spl_autoload_register(): Argument #1 ($callback) must be a valid callback",
+        ));
+    }
+    let prepend = args.get(2).map(Value::to_bool).unwrap_or(false);
+    Ok(Value::Bool(hooks.register_autoloader(callback, prepend)?))
+}
+
+fn spl_autoload_unregister(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("spl_autoload_unregister", &args, 1, Some(1))?;
+    Ok(Value::Bool(hooks.unregister_autoloader(&args[0])))
+}
+
+fn spl_autoload_functions(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("spl_autoload_functions", &args, 0, Some(0))?;
+    Ok(Value::array(PhpArray::from(hooks.autoload_functions())))
+}
+
+fn spl_autoload_call(hooks: &mut dyn RuntimeHooks, args: Vec<Value>) -> PhpResult<Value> {
+    arity("spl_autoload_call", &args, 1, Some(1))?;
+    let class = as_string(hooks, &args, 0, "spl_autoload_call", "class")?;
+    hooks.autoload_call(&String::from_utf8_lossy(&class))?;
+    Ok(Value::Null)
 }
 
 // ------------------------------------------------------------------- output

@@ -171,35 +171,57 @@ writing), and `vendor/php-src` tracks branch `PHP-8.5`.
 
 ## Current limits
 
-Deliberately unimplemented (they produce explicit errors): attributes,
-interfaces, traits, enums, named arguments, alternative control syntax and
-array literals with by-reference elements (`[&$value]`). First-class callable
-syntax and callable arrays are implemented; `Closure::fromCallable()`/
-`Closure::bind()` are not. Destructuring supports `list(...)` and `[...]`
-targets with skipped entries, nested/keyed targets, by-reference slots and
-`foreach` targets. References can be rooted in variable, object-property and
-static-property dimension chains (`&$object->items[0]`,
-`&Class::$items[0]`). The implemented by-reference builtins are `sort`,
-`rsort`, `asort`, `arsort`, `ksort`, `krsort`, `usort`, `uasort`, `uksort`,
-`shuffle`, `array_multisort`, `array_push`, `array_pop`, `array_shift` and
-`array_unshift`. `sort()` and `array_multisort()` flags cover `SORT_REGULAR`,
-`SORT_NUMERIC`, `SORT_STRING`, `SORT_LOCALE_STRING` and `SORT_FLAG_CASE`;
-`SORT_NATURAL` and unknown flags raise explicit errors. Comparator sorts use a
-stable merge sort so callbacks can re-enter the VM without losing PHP's stable
-tie ordering. Namespace support covers ordinary and braced declarations,
-per-kind and group `use` imports and aliases; namespaced `const` declarations
-and autoloading are not implemented. Includes resolve through `include_path`
-(default `.`), then the calling script's directory, then the current
-directory; `get_include_path()`, `set_include_path()` and `PATH_SEPARATOR`
-are supported. An include written inside a function still executes in the
-global scope.
-Visibility is enforced for properties and methods using the declaring class
-stored on objects; protected access follows the inheritance chain. Objects
-also remember their declaring class per property so a subclass cannot read a
-parent's private slot (PHP treats it as an undefined dynamic property).
-String-typed builtins and untyped string contexts call `__toString()`, while
-`Closure` and objects without it report the PHP conversion error. `finally`
-bodies run on normal completion, `return`, rethrow and exceptions escaping a
-`catch`; `break`/`continue` leaving a `try` block still bypasses `finally`.
-Opcodes carry no source line information yet, so exceptions and runtime
-diagnostics use line 1.
+The parser accepts the PHP 8.5 surface syntax used by the test corpus:
+alternative control syntax, named and unpacked arguments, `goto`/labels,
+`declare`, attributes, constructor property promotion, anonymous classes,
+interfaces, traits with `insteadof`/`as` adaptations, enums, and the
+`final`/`readonly` modifiers. Attributes are skipped rather than exposed via
+reflection, and `final`/`readonly` constraints are currently declarative only.
+Property hooks, asymmetric visibility and the `Attribute` reflection API are
+not implemented.
+
+Generators accept `yield`, keyed `yield`, and `yield from`. They are evaluated
+eagerly into an array so `foreach` observes the right sequence, but there is
+no resumable `Generator` object, lazy execution, `send()`, `current()` or
+`getReturn()`.
+
+Interfaces, traits and enums use the VM's merged class definitions. Trait
+methods are merged at class load, `insteadof` excludes a conflicting method,
+`as` adds an alias or changes visibility, and backed enums are validated for
+case values and uniqueness. Constructor-promoted parameters become declared
+properties and are assigned before the constructor body runs. Static locals
+use persistent reference cells keyed by function and variable name.
+
+Dynamic syntax is supported for `new $class`, dynamic class constants and
+static properties, dynamic instance and static methods, variable variables
+(`$$name`, `${expr}`), and first-class dynamic callables. First-class
+`Closure::fromCallable()`/`Closure::bind()` are not available.
+
+Destructuring supports `list(...)` and `[...]` targets with skipped entries,
+nested/keyed targets, by-reference slots and `foreach` targets. Array literals
+support by-reference elements (`[&$value]`) and spread. References can be
+rooted in variable, object-property and static-property dimension chains
+(`&$object->items[0]`, `&Class::$items[0]`). The implemented by-reference
+builtins are `sort`, `rsort`, `asort`, `arsort`, `ksort`, `krsort`, `usort`,
+`uasort`, `uksort`, `shuffle`, `array_multisort`, `array_push`, `array_pop`,
+`array_shift` and `array_unshift`. `sort()` and `array_multisort()` flags cover
+`SORT_REGULAR`, `SORT_NUMERIC`, `SORT_STRING`, `SORT_LOCALE_STRING` and
+`SORT_FLAG_CASE`; `SORT_NATURAL` and unknown flags raise explicit errors.
+Comparator sorts use a stable merge sort so callbacks can re-enter the VM
+without losing PHP's stable tie ordering.
+
+Namespace support covers ordinary and braced declarations, per-kind and group
+`use` imports and aliases, namespaced `const` declarations, and autoloading.
+Includes resolve through `include_path` (default `.`), then the calling
+script's directory, then the current directory; `get_include_path()`,
+`set_include_path()` and `PATH_SEPARATOR` are supported. An include written
+inside a function still executes in the global scope. Visibility is enforced
+for properties and methods using the declaring class stored on objects;
+protected access follows the inheritance chain. Objects also remember their
+declaring class per property so a subclass cannot read a parent's private slot
+(PHP treats it as an undefined dynamic property). String-typed builtins and
+untyped string contexts call `__toString()`, while `Closure` and objects
+without it report the PHP conversion error. `finally` bodies run on normal
+completion, `return`, `break`/`continue`, rethrow and exceptions escaping a
+`catch`. Opcodes carry no source line information yet, so exceptions and
+runtime diagnostics use line 1.

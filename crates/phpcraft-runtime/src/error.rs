@@ -18,6 +18,8 @@ pub enum ErrorKind {
     ArithmeticError,
     ParseError,
     UnhandledMatch,
+    /// `exit`/`die`: terminate without running `finally` blocks.
+    Exit,
     /// A userland `throw` (the value is carried in `PhpError::thrown`).
     Thrown,
 }
@@ -32,6 +34,7 @@ impl ErrorKind {
             ErrorKind::ArithmeticError => "ArithmeticError",
             ErrorKind::ParseError => "Parse error",
             ErrorKind::UnhandledMatch => "UnhandledMatchError",
+            ErrorKind::Exit => "Exit",
             ErrorKind::Thrown => "Exception",
         }
     }
@@ -44,6 +47,8 @@ pub struct PhpError {
     pub message: String,
     /// Present for `ErrorKind::Thrown`: the thrown object.
     pub thrown: Option<Value>,
+    /// Present for `ErrorKind::Exit`: the process status code.
+    pub exit_code: Option<i32>,
 }
 
 impl PhpError {
@@ -52,6 +57,7 @@ impl PhpError {
             kind,
             message: message.into(),
             thrown: None,
+            exit_code: None,
         }
     }
 
@@ -60,6 +66,16 @@ impl PhpError {
             kind: ErrorKind::Thrown,
             message: message.into(),
             thrown: Some(value),
+            exit_code: None,
+        }
+    }
+
+    pub fn exit(code: i32) -> Self {
+        Self {
+            kind: ErrorKind::Exit,
+            message: String::new(),
+            thrown: None,
+            exit_code: Some(code),
         }
     }
 

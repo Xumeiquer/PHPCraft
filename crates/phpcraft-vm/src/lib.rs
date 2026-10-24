@@ -10,8 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use phpcraft_ast::{BinOp, CastKind, UnOp, Visibility};
-use phpcraft_bytecode::{Chunk, ClassDef, CompiledProgram, DimMode, Function, Op};
+use phpcraft_ast::{BinOp, CastKind, ClassKind, UnOp, Visibility};
+use phpcraft_bytecode::{ArgMode, Chunk, ClassDef, CompiledProgram, DimMode, Function, Op};
 use phpcraft_runtime::{
     compare, key_from_value, loose_eq, strict_eq, ErrorKind, ExceptionData, Key, Numeric, PhpArray,
     PhpError, PhpObject, PhpResult, RuntimeHooks, ToNumber, Value,
@@ -31,6 +31,27 @@ enum Control {
     Return(Value),
 }
 
+/// Evaluated call arguments before binding. Unpacked arrays and named
+/// arguments are flattened by [`Vm::evaluate_call_args`].
+#[derive(Clone, Debug, Default)]
+struct CallArgs {
+    positional: Vec<Value>,
+    named: Vec<(String, Value)>,
+}
+
+impl CallArgs {
+    fn positional(args: Vec<Value>) -> Self {
+        Self {
+            positional: args,
+            named: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.positional.len() + self.named.len()
+    }
+}
+
 struct Handler {
     catch_ip: usize,
     catch_slot: u32,
@@ -47,6 +68,8 @@ struct Frame {
     class_name: Option<String>,
     /// Runtime class of the receiver (`static`), when different.
     called_class: Option<String>,
+    /// Locals created through variable variables (`$$name`).
+    dynamic: HashMap<String, Value>,
 }
 
 impl Frame {
@@ -58,6 +81,7 @@ impl Frame {
             handlers: Vec::new(),
             class_name: None,
             called_class: None,
+            dynamic: HashMap::new(),
         }
     }
 
@@ -101,6 +125,124 @@ impl Frame {
     }
 }
 
+fn merge_trait_members(
+    class: &mut ClassDef,
+    trait_def: &ClassDef,
+    excluded: &HashSet<(String, String)>,
+) {
+    let trait_name = trait_def.name.to_ascii_lowercase();
+    for method in &trait_def.methods {
+        if excluded.contains(&(trait_name.clone(), method.name.to_ascii_lowercase())) {
+            continue;
+        }
+        if !class
+            .methods
+            .iter()
+            .any(|existing| existing.name.eq_ignore_ascii_case(&method.name))
+        {
+            class.methods.push(method.clone());
+        }
+    }
+    for property in &trait_def.properties {
+        if !class
+            .properties
+            .iter()
+            .any(|existing| existing.name == property.name)
+        {
+            class.properties.push(property.clone());
+        }
+    }
+    for (name, value) in &trait_def.constants {
+        if !class
+            .constants
+            .iter()
+            .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
+        {
+            class.constants.push((name.clone(), value.clone()));
+        }
+    }
+}
+
+fn merged_class_def(
+    defs: &HashMap<String, ClassDef>,
+    name: &str,
+    visiting: &mut HashSet<String>,
+) -> Option<ClassDef> {
+    let lower = name.to_ascii_lowercase();
+    if !visiting.insert(lower.clone()) {
+        return defs.get(&lower).cloned();
+    }
+    let mut class = defs.get(&lower)?.clone();
+    let traits = class.traits.clone();
+    let adaptations = class.trait_adaptations.clone();
+    let mut merged_traits = Vec::new();
+    for trait_name in traits {
+        if let Some(trait_def) = merged_class_def(defs, &trait_name, visiting) {
+            merged_traits.push(trait_def);
+        }
+    }
+    let mut excluded = HashSet::new();
+    for adaptation in &adaptations {
+        for trait_name in &adaptation.instead_of {
+            excluded.insert((
+                trait_name.to_ascii_lowercase(),
+                adaptation.method.to_ascii_lowercase(),
+            ));
+        }
+    }
+    for trait_def in &merged_traits {
+        merge_trait_members(&mut class, trait_def, &excluded);
+    }
+    for adaptation in &adaptations {
+        let source = adaptation
+            .trait_name
+            .as_ref()
+            .and_then(|name| {
+                merged_traits
+                    .iter()
+                    .find(|trait_def| trait_def.name.eq_ignore_ascii_case(name))
+            })
+            .or_else(|| {
+                merged_traits
+                    .iter()
+                    .find(|trait_def| trait_def.method(&adaptation.method).is_some())
+            });
+        let Some(source) = source else {
+            continue;
+        };
+        let Some(method) = source.method(&adaptation.method) else {
+            continue;
+        };
+        if let Some(alias) = &adaptation.alias {
+            if class
+                .methods
+                .iter()
+                .any(|existing| existing.name.eq_ignore_ascii_case(alias))
+            {
+                continue;
+            }
+            let mut aliased = method.clone();
+            aliased.name = alias.clone();
+            if let Some(visibility) = adaptation.visibility {
+                aliased.visibility = visibility;
+            }
+            class.methods.push(aliased);
+        } else if let Some(visibility) = adaptation.visibility {
+            if let Some(existing) = class
+                .methods
+                .iter_mut()
+                .find(|existing| existing.name.eq_ignore_ascii_case(&adaptation.method))
+            {
+                existing.visibility = visibility;
+            }
+        }
+    }
+    class.traits.clear();
+    class.trait_adaptations.clear();
+    visiting.remove(&lower);
+    Some(class)
+}
+
 pub struct Vm {
     functions: HashMap<String, Rc<Function>>,
     classes: HashMap<String, Rc<ClassDef>>,
@@ -114,6 +256,10 @@ pub struct Vm {
     next_object_id: u64,
     included_files: HashSet<String>,
     include_path: String,
+    autoloaders: Vec<Value>,
+    autoloading: HashSet<String>,
+    /// Persistent cells backing `static` locals, keyed by function and name.
+    static_locals: HashMap<String, Value>,
 }
 
 impl Default for Vm {
@@ -181,10 +327,15 @@ impl Vm {
             next_object_id: 1,
             included_files: HashSet::new(),
             include_path: ".".to_string(),
+            autoloaders: Vec::new(),
+            autoloading: HashSet::new(),
+            static_locals: HashMap::new(),
         }
     }
 
-    /// Register every compiled userland function.
+    /// Register every compiled userland function and class. Traits are merged
+    /// here rather than in the compiler so `use TraitName;` works even when the
+    /// trait is declared later in the file (or by an autoloader).
     pub fn load(&mut self, program: &CompiledProgram) {
         self.file = program.file.clone();
         for function in &program.functions {
@@ -193,8 +344,41 @@ impl Vm {
                 Rc::new(function.clone()),
             );
         }
-        for class in &program.classes {
-            let name = class.name.to_ascii_lowercase();
+
+        let defs: HashMap<String, ClassDef> = program
+            .classes
+            .iter()
+            .cloned()
+            .map(|class| (class.name.to_ascii_lowercase(), class))
+            .collect();
+        let mut merged = HashMap::new();
+        for name in defs.keys() {
+            if let Some(class) = merged_class_def(&defs, name, &mut HashSet::new()) {
+                merged.insert(name.clone(), class);
+            }
+        }
+
+        // Enum cases are singleton objects and class constants. Materialise
+        // them once per load, after trait members have been merged.
+        for class in merged.values_mut() {
+            if class.kind != ClassKind::Enum {
+                continue;
+            }
+            for (case, backing) in class.enum_cases.clone() {
+                let id = self.next_object_id;
+                self.next_object_id += 1;
+                let mut object = PhpObject::new(class.name.clone(), id);
+                object
+                    .properties
+                    .insert_str("name", Value::str(case.as_bytes().to_vec()));
+                if let Some(value) = backing {
+                    object.properties.insert_str("value", value);
+                }
+                class.constants.push((case, Value::object(object)));
+            }
+        }
+
+        for (name, class) in merged {
             self.classes.insert(name.clone(), Rc::new(class.clone()));
             let mut statics = PhpArray::new();
             for property in class.properties.iter().filter(|property| property.static_) {
@@ -239,11 +423,16 @@ impl Vm {
 
     /// Call a userland function or builtin by name, case-insensitively.
     pub fn call_named(&mut self, name: &str, args: Vec<Value>) -> PhpResult<Value> {
+        self.call_named_args(name, CallArgs::positional(args))
+    }
+
+    fn call_named_args(&mut self, name: &str, args: CallArgs) -> PhpResult<Value> {
         let lower = name.to_ascii_lowercase();
         if let Some(function) = self.functions.get(&lower).cloned() {
-            return self.call_function(function, args);
+            return self.call_function_with_context_args(function, &[], None, None, None, args);
         }
         if let Some(native) = phpcraft_stdlib::find(&lower) {
+            let args = self.reorder_builtin_args(&lower, args)?;
             // array_multisort classifies each argument itself: arrays are
             // passed by reference, sort flags may arrive as references too.
             if lower == "array_multisort" {
@@ -266,6 +455,47 @@ impl Vm {
         Err(PhpError::fatal(format!(
             "Call to undefined function {name}()"
         )))
+    }
+
+    /// Map named arguments onto a builtin's positional parameter list.
+    fn reorder_builtin_args(&self, name: &str, args: CallArgs) -> PhpResult<Vec<Value>> {
+        if args.named.is_empty() {
+            return Ok(args.positional);
+        }
+        let params = phpcraft_stdlib::parameters(name);
+        let mut slots: Vec<Option<Value>> = vec![None; params.len()];
+        let mut extra = Vec::new();
+        for (index, value) in args.positional.into_iter().enumerate() {
+            if index < slots.len() {
+                slots[index] = Some(value);
+            } else {
+                extra.push(value);
+            }
+        }
+        for (named, value) in args.named {
+            let Some(index) = params.iter().position(|(parameter, _)| *parameter == named) else {
+                return Err(PhpError::fatal(format!("Unknown named parameter ${named}")));
+            };
+            if slots[index].is_some() {
+                return Err(PhpError::fatal(format!(
+                    "Named parameter ${named} overwrites previous argument"
+                )));
+            }
+            slots[index] = Some(value);
+        }
+        let last = slots
+            .iter()
+            .rposition(Option::is_some)
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        if slots[..last].iter().any(Option::is_none) {
+            return Err(PhpError::argument_count(format!(
+                "{name}(): Argument not passed for parameter before a named argument"
+            )));
+        }
+        let mut out: Vec<Value> = slots[..last].iter().cloned().map(Option::unwrap).collect();
+        out.extend(extra);
+        Ok(out)
     }
 
     fn include_file(&mut self, raw: &str, once: bool, require: bool) -> PhpResult<Value> {
@@ -392,26 +622,26 @@ impl Vm {
     }
 
     fn call_function(&mut self, function: Rc<Function>, args: Vec<Value>) -> PhpResult<Value> {
-        self.call_function_with_captures(function, &[], args)
+        self.call_function_with_captures_args(function, &[], CallArgs::positional(args))
     }
 
-    fn call_function_with_captures(
+    fn call_function_with_captures_args(
         &mut self,
         function: Rc<Function>,
         captures: &[Value],
-        args: Vec<Value>,
+        args: CallArgs,
     ) -> PhpResult<Value> {
-        self.call_function_with_context(function, captures, None, None, None, args)
+        self.call_function_with_context_args(function, captures, None, None, None, args)
     }
 
-    fn call_function_with_context(
+    fn call_function_with_context_args(
         &mut self,
         function: Rc<Function>,
         captures: &[Value],
         this: Option<Value>,
         class_name: Option<String>,
         called_class: Option<String>,
-        args: Vec<Value>,
+        args: CallArgs,
     ) -> PhpResult<Value> {
         if self.depth >= MAX_CALL_DEPTH {
             return Err(PhpError::fatal(
@@ -437,54 +667,16 @@ impl Vm {
                 frame.set(*slot, value.deref());
             }
         }
-        let mut arg_index = 0usize;
-        for (param_index, param) in function.params.iter().enumerate() {
-            if param.variadic {
-                let mut rest = Vec::new();
-                for (offset, value) in args.iter().skip(arg_index).enumerate() {
-                    if param.by_ref {
-                        if value.as_ref_cell().is_none() {
-                            return Err(PhpError::fatal(format!(
-                                "{}(): Argument #{} could not be passed by reference",
-                                function.display_name(),
-                                arg_index + offset + 1
-                            )));
-                        }
-                        rest.push(value.clone());
-                    } else {
-                        rest.push(value.deref());
-                    }
-                }
-                frame.set(param.slot, Value::array(PhpArray::from(rest)));
-                break;
-            }
-            if arg_index < args.len() {
-                let value = &args[arg_index];
-                if param.by_ref {
-                    if value.as_ref_cell().is_none() {
-                        return Err(PhpError::fatal(format!(
-                            "{}(): Argument #{} (${}) could not be passed by reference",
-                            function.display_name(),
-                            param_index + 1,
-                            param.name
-                        )));
-                    }
-                    frame.set(param.slot, value.clone());
-                } else {
-                    frame.set(param.slot, value.deref());
-                }
-                arg_index += 1;
-            } else if let Some(default) = &param.default {
-                frame.set(param.slot, default.clone());
-            } else {
-                return Err(PhpError::argument_count(format!(
-                    "Too few arguments to function {}(); {} passed and at least {} expected",
-                    function.display_name(),
-                    args.len(),
-                    function.params.len()
-                )));
-            }
+        for (name, slot, default) in &function.static_slots {
+            let key = format!("{}::{}", function.name, name);
+            let cell = self
+                .static_locals
+                .entry(key)
+                .or_insert_with(|| Value::reference(default.clone()))
+                .clone();
+            frame.set(*slot, cell);
         }
+        self.bind_function_arguments(&function, &mut frame, args)?;
 
         self.depth += 1;
         let result = self.run_chunk(&function.chunk, &function.slot_names, &mut frame);
@@ -496,9 +688,121 @@ impl Vm {
         }
     }
 
+    fn bind_function_arguments(
+        &mut self,
+        function: &Function,
+        frame: &mut Frame,
+        args: CallArgs,
+    ) -> PhpResult<()> {
+        let params = &function.params;
+        let mut bound: Vec<Option<Value>> = vec![None; params.len()];
+        let mut next_position = 0usize;
+        let mut variadic_positional = Vec::new();
+        let mut variadic_named = Vec::new();
+        let total = args.len();
+
+        for value in args.positional {
+            while next_position < params.len() && bound[next_position].is_some() {
+                next_position += 1;
+            }
+            let Some(param) = params.get(next_position) else {
+                // PHP userland functions accept extra positional arguments;
+                // they are only reachable through func_get_args().
+                continue;
+            };
+            if param.variadic {
+                variadic_positional.push(value);
+                continue;
+            }
+            bound[next_position] = Some(value);
+            next_position += 1;
+        }
+
+        for (name, value) in args.named {
+            if let Some(index) = params
+                .iter()
+                .position(|param| !param.variadic && param.name == name)
+            {
+                if bound[index].is_some() {
+                    return Err(PhpError::fatal(format!(
+                        "Named parameter ${name} overwrites previous argument"
+                    )));
+                }
+                bound[index] = Some(value);
+            } else if params.last().is_some_and(|param| param.variadic) {
+                variadic_named.push((name, value));
+            } else {
+                return Err(PhpError::fatal(format!("Unknown named parameter ${name}")));
+            }
+        }
+
+        for (index, param) in params.iter().enumerate() {
+            if param.variadic {
+                let mut array = PhpArray::new();
+                for value in variadic_positional.drain(..) {
+                    if param.by_ref && value.as_ref_cell().is_none() {
+                        return Err(PhpError::fatal(format!(
+                            "{}(): Argument could not be passed by reference",
+                            function.display_name()
+                        )));
+                    }
+                    array.push(if param.by_ref { value } else { value.deref() });
+                }
+                for (name, value) in variadic_named.drain(..) {
+                    if param.by_ref && value.as_ref_cell().is_none() {
+                        return Err(PhpError::fatal(format!(
+                            "{}(): Argument ${name} could not be passed by reference",
+                            function.display_name()
+                        )));
+                    }
+                    array.insert_str(&name, if param.by_ref { value } else { value.deref() });
+                }
+                frame.set(param.slot, Value::array(array));
+                continue;
+            }
+
+            let value = match bound[index].take() {
+                Some(value) => value,
+                None => match &param.default {
+                    Some(default) => default.clone(),
+                    None => {
+                        let required = params
+                            .iter()
+                            .filter(|param| !param.variadic && param.default.is_none())
+                            .count();
+                        return Err(PhpError::argument_count(format!(
+                            "Too few arguments to function {}(); {} passed and at least {} expected",
+                            function.display_name(),
+                            total,
+                            required
+                        )));
+                    }
+                },
+            };
+            if param.by_ref {
+                if value.as_ref_cell().is_none() {
+                    return Err(PhpError::fatal(format!(
+                        "{}(): Argument #{} (${}) could not be passed by reference",
+                        function.display_name(),
+                        index + 1,
+                        param.name
+                    )));
+                }
+                frame.set(param.slot, value);
+            } else {
+                frame.set(param.slot, value.deref());
+            }
+        }
+        Ok(())
+    }
+
     /// Invoke a callable value: a closure, function name, `Class::method`
     /// string, callable array or object with `__invoke`.
     pub fn invoke(&mut self, callable: Value, args: Vec<Value>) -> PhpResult<Value> {
+        self.invoke_args(callable, CallArgs::positional(args))
+    }
+
+    fn invoke_args(&mut self, callable: Value, args: CallArgs) -> PhpResult<Value> {
         match callable.deref() {
             Value::Closure(closure) => {
                 let lower = closure.function.to_ascii_lowercase();
@@ -511,7 +815,7 @@ impl Vm {
                         ),
                         None => (None, None, None),
                     };
-                    return self.call_function_with_context(
+                    return self.call_function_with_context_args(
                         function,
                         &closure.captures,
                         this,
@@ -523,7 +827,7 @@ impl Vm {
                 // First-class callables may target a builtin function, which
                 // has no entry in the userland function table.
                 if closure.callable.is_some() && phpcraft_stdlib::find(&lower).is_some() {
-                    return self.call_named(&closure.function, args);
+                    return self.call_named_args(&closure.function, args);
                 }
                 Err(PhpError::fatal(format!(
                     "Closure function {} not found",
@@ -533,15 +837,15 @@ impl Vm {
             Value::Str(name) => {
                 let name = String::from_utf8_lossy(name.as_bytes()).into_owned();
                 match name.rsplit_once("::") {
-                    Some((class, method)) => self.call_static_callable(class, method, args),
-                    None => self.call_named(&name, args),
+                    Some((class, method)) => self.call_static_callable_args(class, method, args),
+                    None => self.call_named_args(&name, args),
                 }
             }
-            Value::Array(array) => self.invoke_callable_array(&array, args),
+            Value::Array(array) => self.invoke_callable_array_args(&array, args),
             Value::Object(object) => {
                 let class = object.borrow().class_name.clone();
                 if self.find_method(&class, "__invoke").is_some() {
-                    self.call_method_value(Value::Object(object), "__invoke", args, None)
+                    self.call_method_value_args(Value::Object(object), "__invoke", args, None)
                 } else {
                     Err(PhpError::fatal(format!(
                         "Object of class {} is not callable",
@@ -670,6 +974,7 @@ impl Vm {
         method: &str,
         scope: Option<&str>,
     ) -> PhpResult<Value> {
+        self.autoload_class(class)?;
         let canonical = self
             .canonical_class_name(class)
             .ok_or_else(|| PhpError::fatal(format!("Class \"{class}\" not found")))?;
@@ -774,17 +1079,17 @@ impl Vm {
         }
     }
 
-    fn invoke_callable_array(&mut self, array: &PhpArray, args: Vec<Value>) -> PhpResult<Value> {
+    fn invoke_callable_array_args(&mut self, array: &PhpArray, args: CallArgs) -> PhpResult<Value> {
         let (first, second) = self.callable_array_parts(array)?;
         match first.deref() {
             Value::Object(object) => {
                 let method = callable_method_name(&second)?;
-                self.call_method_value(Value::Object(object), &method, args, None)
+                self.call_method_value_args(Value::Object(object), &method, args, None)
             }
             Value::Str(class) => {
                 let class = String::from_utf8_lossy(class.as_bytes()).into_owned();
                 let method = callable_method_name(&second)?;
-                self.call_static_callable(&class, &method, args)
+                self.call_static_callable_args(&class, &method, args)
             }
             _ => Err(PhpError::fatal(
                 "First array member is not a valid class name or object",
@@ -809,15 +1114,19 @@ impl Vm {
         Ok((first, second))
     }
 
-    fn call_static_callable(
+    fn call_static_callable_args(
         &mut self,
         class: &str,
         method: &str,
-        args: Vec<Value>,
+        args: CallArgs,
     ) -> PhpResult<Value> {
+        self.autoload_class(class)?;
         let canonical = self
             .canonical_class_name(class)
             .ok_or_else(|| PhpError::fatal(format!("Class \"{class}\" not found")))?;
+        if let Some(result) = self.call_enum_static(&canonical, method, &args) {
+            return result;
+        }
         let Some((function, owner, is_static, visibility)) = self.find_method(&canonical, method)
         else {
             return Err(PhpError::fatal(format!(
@@ -832,7 +1141,14 @@ impl Vm {
                 function.name
             )));
         }
-        self.call_function_with_context(function, &[], None, Some(owner), Some(canonical), args)
+        self.call_function_with_context_args(
+            function,
+            &[],
+            None,
+            Some(owner),
+            Some(canonical),
+            args,
+        )
     }
 
     /// Static-method/string callable test used by `is_callable()`.
@@ -923,6 +1239,41 @@ impl Vm {
         })
     }
 
+    fn trigger_autoload(&mut self, name: &str, force: bool) -> PhpResult<()> {
+        let normalized = Self::normalize_class(name);
+        if normalized.is_empty() {
+            return Ok(());
+        }
+        let lower = normalized.to_ascii_lowercase();
+        if !force
+            && (self.classes.contains_key(&lower)
+                || self.canonical_class_name(&normalized).is_some())
+        {
+            return Ok(());
+        }
+        if self.autoloaders.is_empty() || !self.autoloading.insert(lower.clone()) {
+            return Ok(());
+        }
+        let loaders = self.autoloaders.clone();
+        for loader in loaders {
+            if self.classes.contains_key(&lower) {
+                break;
+            }
+            if let Err(error) =
+                self.invoke(loader, vec![Value::str(normalized.as_bytes().to_vec())])
+            {
+                self.autoloading.remove(&lower);
+                return Err(error);
+            }
+        }
+        self.autoloading.remove(&lower);
+        Ok(())
+    }
+
+    fn autoload_class(&mut self, name: &str) -> PhpResult<()> {
+        self.trigger_autoload(name, false)
+    }
+
     fn canonical_class_name(&self, name: &str) -> Option<String> {
         let normalized = Self::normalize_class(name);
         if let Some(class) = self.classes.get(&normalized.to_ascii_lowercase()) {
@@ -981,6 +1332,158 @@ impl Vm {
         chain
     }
 
+    fn collect_interface(&self, name: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+        let normalized = Self::normalize_class(name);
+        let lower = normalized.to_ascii_lowercase();
+        if !seen.insert(lower.clone()) {
+            return;
+        }
+        out.push(normalized);
+        if let Some(def) = self.classes.get(&lower) {
+            for parent in &def.interfaces {
+                self.collect_interface(parent, out, seen);
+            }
+        }
+    }
+
+    fn class_interfaces(&self, name: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for owner in self.class_chain(name) {
+            if let Some(def) = self.classes.get(&owner.to_ascii_lowercase()) {
+                for interface in &def.interfaces {
+                    self.collect_interface(interface, &mut out, &mut seen);
+                }
+            }
+        }
+        out
+    }
+
+    fn has_concrete_method(&self, class: &str, method: &str) -> bool {
+        self.class_chain(class).iter().any(|owner| {
+            self.classes
+                .get(&owner.to_ascii_lowercase())
+                .and_then(|def| def.method(method))
+                .is_some_and(|method| !method.abstract_)
+        })
+    }
+
+    fn class_has_abstract_methods(&self, class: &str) -> bool {
+        let mut resolved = HashSet::new();
+        for owner in self.class_chain(class) {
+            if let Some(def) = self.classes.get(&owner.to_ascii_lowercase()) {
+                for method in &def.methods {
+                    if resolved.insert(method.name.to_ascii_lowercase()) && method.abstract_ {
+                        return true;
+                    }
+                }
+            }
+        }
+        for interface in self.class_interfaces(class) {
+            if let Some(def) = self.classes.get(&interface.to_ascii_lowercase()) {
+                for method in &def.methods {
+                    if !self.has_concrete_method(class, &method.name) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn enum_case_value(&self, class: &str, name: &str) -> Option<Value> {
+        self.class_constant(class, name).ok()
+    }
+
+    fn enum_cases_array(&self, class: &str) -> PhpResult<Value> {
+        let def = self
+            .classes
+            .get(&Self::normalize_class(class).to_ascii_lowercase())
+            .ok_or_else(|| PhpError::fatal(format!("Class \"{class}\" not found")))?;
+        let mut cases = PhpArray::new();
+        for (name, _) in &def.enum_cases {
+            cases.push(self.enum_case_value(&def.name, name).ok_or_else(|| {
+                PhpError::fatal(format!("Undefined constant {}::{}", def.name, name))
+            })?);
+        }
+        Ok(Value::array(cases))
+    }
+
+    fn call_enum_static(
+        &self,
+        class: &str,
+        method: &str,
+        args: &CallArgs,
+    ) -> Option<PhpResult<Value>> {
+        let def = self
+            .classes
+            .get(&Self::normalize_class(class).to_ascii_lowercase())?;
+        if def.kind != ClassKind::Enum {
+            return None;
+        }
+        let lower = method.to_ascii_lowercase();
+        match lower.as_str() {
+            "cases" => Some(self.enum_cases_array(&def.name)),
+            "from" | "tryfrom" => {
+                def.enum_backing.as_ref()?;
+                let value = args.positional.first().cloned().or_else(|| {
+                    args.named
+                        .iter()
+                        .find(|(name, _)| name == "value")
+                        .map(|(_, value)| value.clone())
+                });
+                match value {
+                    Some(value) => {
+                        Some(self.enum_from_value(&def.name, &value, lower == "tryfrom"))
+                    }
+                    None => Some(Err(PhpError::argument_count(format!(
+                        "{}::{}() expects exactly 1 argument, 0 given",
+                        def.name,
+                        if lower == "tryfrom" {
+                            "tryFrom"
+                        } else {
+                            "from"
+                        }
+                    )))),
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn enum_from_value(&self, class: &str, value: &Value, try_: bool) -> PhpResult<Value> {
+        let def = self
+            .classes
+            .get(&Self::normalize_class(class).to_ascii_lowercase())
+            .ok_or_else(|| PhpError::fatal(format!("Class \"{class}\" not found")))?;
+        if def.enum_backing.is_none() {
+            return Err(PhpError::fatal(format!(
+                "Call to undefined method {}::from()",
+                def.name
+            )));
+        }
+        let value = value.deref();
+        for (name, backing) in &def.enum_cases {
+            if backing
+                .as_ref()
+                .is_some_and(|backing| strict_eq(backing, &value))
+            {
+                return self.enum_case_value(&def.name, name).ok_or_else(|| {
+                    PhpError::fatal(format!("Undefined constant {}::{}", def.name, name))
+                });
+            }
+        }
+        if try_ {
+            Ok(Value::Null)
+        } else {
+            Err(PhpError::value_error(format!(
+                "{} is not a valid backing value for enum {}",
+                value.to_string_lossy(),
+                def.name
+            )))
+        }
+    }
+
     fn resolve_class_marker(&self, marker: &str, frame: &Frame) -> PhpResult<String> {
         let normalized = Self::normalize_class(marker);
         match normalized.to_ascii_lowercase().as_str() {
@@ -1018,11 +1521,26 @@ impl Vm {
         if target.eq_ignore_ascii_case("Throwable") {
             return chain.iter().any(|name| {
                 name.eq_ignore_ascii_case("Exception") || name.eq_ignore_ascii_case("Error")
-            });
+            }) || self
+                .class_interfaces(&class)
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("Throwable"));
+        }
+        let def = self.classes.get(&class.to_ascii_lowercase());
+        if target.eq_ignore_ascii_case("UnitEnum") {
+            return def.is_some_and(|def| def.kind == ClassKind::Enum);
+        }
+        if target.eq_ignore_ascii_case("BackedEnum") {
+            return def
+                .is_some_and(|def| def.kind == ClassKind::Enum && def.enum_backing.is_some());
         }
         chain
             .iter()
             .any(|name| name.eq_ignore_ascii_case(target.as_str()))
+            || self
+                .class_interfaces(&class)
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(target.as_str()))
     }
 
     /// Whether `scope` may access a member declared in `owner`. Private
@@ -1126,12 +1644,51 @@ impl Vm {
         args: Vec<Value>,
         scope: Option<&str>,
     ) -> PhpResult<Value> {
+        self.new_object_args(class, CallArgs::positional(args), scope)
+    }
+
+    fn new_object_args(
+        &mut self,
+        class: &str,
+        args: CallArgs,
+        scope: Option<&str>,
+    ) -> PhpResult<Value> {
+        self.autoload_class(class)?;
         let canonical = self.canonical_class_name(class).ok_or_else(|| {
             PhpError::fatal(format!(
                 "Class \"{}\" not found",
                 Self::normalize_class(class)
             ))
         })?;
+        if let Some(def) = self.classes.get(&canonical.to_ascii_lowercase()) {
+            match def.kind {
+                ClassKind::Interface => {
+                    return Err(PhpError::fatal(format!(
+                        "Cannot instantiate interface {}",
+                        def.name
+                    )))
+                }
+                ClassKind::Trait => {
+                    return Err(PhpError::fatal(format!(
+                        "Cannot instantiate trait {}",
+                        def.name
+                    )))
+                }
+                ClassKind::Enum => {
+                    return Err(PhpError::fatal(format!(
+                        "Cannot instantiate enum {}",
+                        def.name
+                    )))
+                }
+                ClassKind::Class => {}
+            }
+            if def.abstract_ || self.class_has_abstract_methods(&canonical) {
+                return Err(PhpError::fatal(format!(
+                    "Cannot instantiate abstract class {}",
+                    def.name
+                )));
+            }
+        }
         let mut properties = PhpArray::new();
         let mut chain = self.class_chain(&canonical);
         chain.reverse();
@@ -1176,7 +1733,7 @@ impl Vm {
         if let Some((function, owner, _, visibility)) = self.find_method(&canonical, "__construct")
         {
             self.method_access(&owner, visibility, "__construct", scope)?;
-            self.call_function_with_context(
+            self.call_function_with_context_args(
                 function,
                 &[],
                 Some(value.clone()),
@@ -1187,14 +1744,26 @@ impl Vm {
             return Ok(value);
         }
         if is_exception {
-            self.init_exception(&value, args)?;
+            self.init_exception_args(&value, args)?;
         }
         Ok(value)
     }
 
-    fn init_exception(&mut self, object: &Value, args: Vec<Value>) -> PhpResult<()> {
-        let message = args.first().map(Value::to_string_lossy).unwrap_or_default();
-        let code = args.get(1).map(Value::to_int_cast).unwrap_or(0);
+    fn init_exception_args(&mut self, object: &Value, args: CallArgs) -> PhpResult<()> {
+        let mut message = args
+            .positional
+            .first()
+            .map(Value::to_string_lossy)
+            .unwrap_or_default();
+        let mut code = args.positional.get(1).map(Value::to_int_cast).unwrap_or(0);
+        for (name, value) in &args.named {
+            match name.as_str() {
+                "message" => message = value.to_string_lossy(),
+                "code" => code = value.to_int_cast(),
+                "previous" => {}
+                _ => return Err(PhpError::fatal(format!("Unknown named parameter ${name}"))),
+            }
+        }
         if let Value::Object(object) = object {
             let mut object = object.borrow_mut();
             let line = object.exception.as_ref().map(|data| data.line).unwrap_or(0);
@@ -1228,7 +1797,7 @@ impl Vm {
         &mut self,
         object: &Value,
         method: &str,
-        args: Option<Vec<Value>>,
+        args: Option<CallArgs>,
     ) -> Option<PhpResult<Value>> {
         let class = object.object_class()?;
         if !self.is_exception_class(&class) {
@@ -1237,7 +1806,7 @@ impl Vm {
         let lower = method.to_ascii_lowercase();
         if lower == "__construct" {
             let args = args.unwrap_or_default();
-            return Some(self.init_exception(object, args).map(|()| Value::Null));
+            return Some(self.init_exception_args(object, args).map(|()| Value::Null));
         }
         let data = match object {
             Value::Object(object) => object.borrow().exception.clone(),
@@ -1270,6 +1839,16 @@ impl Vm {
         args: Vec<Value>,
         scope: Option<&str>,
     ) -> PhpResult<Value> {
+        self.call_method_value_args(object, method, CallArgs::positional(args), scope)
+    }
+
+    fn call_method_value_args(
+        &mut self,
+        object: Value,
+        method: &str,
+        args: CallArgs,
+        scope: Option<&str>,
+    ) -> PhpResult<Value> {
         let class = object.object_class().ok_or_else(|| {
             PhpError::fatal(format!(
                 "Call to a member function {}() on {}",
@@ -1279,7 +1858,7 @@ impl Vm {
         })?;
         if let Some((function, owner, _, visibility)) = self.find_method(&class, method) {
             self.method_access(&owner, visibility, method, scope)?;
-            return self.call_function_with_context(
+            return self.call_function_with_context_args(
                 function,
                 &[],
                 Some(object),
@@ -1304,7 +1883,21 @@ impl Vm {
         args: Vec<Value>,
         frame: &Frame,
     ) -> PhpResult<Value> {
+        self.call_static_args(class, method, CallArgs::positional(args), frame)
+    }
+
+    fn call_static_args(
+        &mut self,
+        class: &str,
+        method: &str,
+        args: CallArgs,
+        frame: &Frame,
+    ) -> PhpResult<Value> {
         let resolved = self.resolve_class_marker(class, frame)?;
+        self.autoload_class(&resolved)?;
+        if let Some(result) = self.call_enum_static(&resolved, method, &args) {
+            return result;
+        }
         let receiver = frame
             .defined
             .first()
@@ -1314,7 +1907,7 @@ impl Vm {
         if let Some((function, owner, is_static, visibility)) = self.find_method(&resolved, method)
         {
             self.method_access(&owner, visibility, method, frame.class_name.as_deref())?;
-            return self.call_function_with_context(
+            return self.call_function_with_context_args(
                 function,
                 &[],
                 if is_static { None } else { receiver },
@@ -1324,13 +1917,13 @@ impl Vm {
             );
         }
         if self.is_exception_class(&resolved) {
-            if let Some(this) = frame
+            let this = frame
                 .defined
                 .first()
                 .copied()
                 .unwrap_or(false)
-                .then(|| frame.get(0).clone())
-            {
+                .then(|| frame.get(0).clone());
+            if let Some(this) = this {
                 if let Some(result) = self.builtin_exception_method(&this, method, Some(args)) {
                     return result;
                 }
@@ -1556,7 +2149,9 @@ impl Vm {
                     .into_bytes(),
             ));
         }
-        for owner in self.class_chain(class) {
+        let mut owners = self.class_chain(class);
+        owners.extend(self.class_interfaces(class));
+        for owner in owners {
             if let Some(def) = self.classes.get(&owner.to_ascii_lowercase()) {
                 if let Some((_, value)) = def
                     .constants
@@ -1635,6 +2230,79 @@ impl Vm {
         Value::object(object)
     }
 
+    fn evaluate_call_args(
+        &mut self,
+        stack: &mut Vec<Value>,
+        argc: u32,
+        modes: &[ArgMode],
+        chunk: &Chunk,
+    ) -> PhpResult<CallArgs> {
+        let count = argc as usize;
+        let values = if count == 0 {
+            Vec::new()
+        } else {
+            stack.split_off(stack.len() - count)
+        };
+        let mut args = CallArgs::default();
+        let mut saw_named = false;
+        for (index, value) in values.into_iter().enumerate() {
+            match modes.get(index).copied().unwrap_or(ArgMode::Positional) {
+                ArgMode::Positional => {
+                    if saw_named {
+                        return Err(PhpError::fatal(
+                            "Cannot use positional argument after named argument",
+                        ));
+                    }
+                    args.positional.push(value);
+                }
+                ArgMode::Named(index) => {
+                    saw_named = true;
+                    let name = String::from_utf8_lossy(chunk.const_str(index)).into_owned();
+                    if args.named.iter().any(|(existing, _)| existing == &name) {
+                        return Err(PhpError::fatal(format!(
+                            "Named parameter ${name} overwrites previous argument"
+                        )));
+                    }
+                    args.named.push((name, value));
+                }
+                ArgMode::Unpack => {
+                    let array = match value.deref() {
+                        Value::Array(array) => array,
+                        other => {
+                            return Err(PhpError::fatal(format!(
+                                "Only arrays and Traversables can be unpacked, {} given",
+                                other.debug_type_name()
+                            )))
+                        }
+                    };
+                    for (key, item) in array.iter() {
+                        match key {
+                            Key::Int(_) => {
+                                if saw_named {
+                                    return Err(PhpError::fatal(
+                                        "Cannot use positional argument after named argument",
+                                    ));
+                                }
+                                args.positional.push(item.clone());
+                            }
+                            Key::Str(name) => {
+                                saw_named = true;
+                                let name = name.to_string_lossy();
+                                if args.named.iter().any(|(existing, _)| existing == &name) {
+                                    return Err(PhpError::fatal(format!(
+                                        "Named parameter ${name} overwrites previous argument"
+                                    )));
+                                }
+                                args.named.push((name, item.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(args)
+    }
+
     fn run_chunk(
         &mut self,
         chunk: &Chunk,
@@ -1674,6 +2342,24 @@ impl Vm {
                             }
                         }
                     }
+                    Op::DefineConst(index) => {
+                        let name = String::from_utf8_lossy(chunk.const_str(*index)).into_owned();
+                        let value = stack.pop().unwrap_or(Value::Null).deref();
+                        let existing = match self.constants.entry(name) {
+                            std::collections::hash_map::Entry::Occupied(entry) => {
+                                Some(entry.key().clone())
+                            }
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(value);
+                                None
+                            }
+                        };
+                        if let Some(name) = existing {
+                            self.warn(format!(
+                                "Constant {name} already defined, this will be an error in PHP 9"
+                            ));
+                        }
+                    }
                     Op::Pop => {
                         stack.pop();
                     }
@@ -1701,6 +2387,18 @@ impl Vm {
                             Value::Null
                         };
                         stack.push(value);
+                    }
+                    Op::LoadVarOrArray(slot) => {
+                        let index = *slot as usize;
+                        let value = if frame.defined.get(index).copied().unwrap_or(false) {
+                            frame.get(*slot).deref()
+                        } else {
+                            Value::Null
+                        };
+                        stack.push(match value {
+                            Value::Array(_) => value,
+                            _ => Value::array(PhpArray::new()),
+                        });
                     }
                     Op::LoadVarRef(slot) => {
                         let index = *slot as usize;
@@ -1740,6 +2438,139 @@ impl Vm {
                                     "Only variables should be assigned by reference",
                                 ))
                             }
+                        }
+                    }
+                    Op::LoadVarDynamic { global } => {
+                        let name = stack.pop().unwrap_or(Value::Null).deref();
+                        let name = name.to_string_lossy();
+                        if *global {
+                            match self.globals.get(&Key::from_str(&name)) {
+                                Some(value) => stack.push(value.deref()),
+                                None => {
+                                    self.warn(format!("Undefined variable ${name}"));
+                                    stack.push(Value::Null);
+                                }
+                            }
+                        } else if let Some(slot) = slot_names
+                            .iter()
+                            .position(|slot| slot.as_deref() == Some(name.as_str()))
+                        {
+                            let slot = slot as u32;
+                            if !frame.defined.get(slot as usize).copied().unwrap_or(false) {
+                                self.warn(format!("Undefined variable ${name}"));
+                            }
+                            stack.push(frame.get(slot).deref());
+                        } else {
+                            match frame.dynamic.get(&name) {
+                                Some(value) => stack.push(value.deref()),
+                                None => {
+                                    self.warn(format!("Undefined variable ${name}"));
+                                    stack.push(Value::Null);
+                                }
+                            }
+                        }
+                    }
+                    Op::StoreVarDynamic { global, keep } => {
+                        let value = stack.pop().unwrap_or(Value::Null).deref();
+                        let name = stack.pop().unwrap_or(Value::Null).deref();
+                        let name = name.to_string_lossy();
+                        if *global {
+                            let key = Key::from_str(&name);
+                            if let Some(Value::Ref(cell)) = self.globals.get(&key).cloned() {
+                                *cell.borrow_mut() = value.clone();
+                            } else {
+                                self.globals.insert(key, value.clone());
+                            }
+                        } else if let Some(slot) = slot_names
+                            .iter()
+                            .position(|slot| slot.as_deref() == Some(name.as_str()))
+                        {
+                            frame.assign(slot as u32, value.clone());
+                        } else if let Some(Value::Ref(cell)) = frame.dynamic.get(&name).cloned() {
+                            *cell.borrow_mut() = value.clone();
+                        } else {
+                            frame.dynamic.insert(name, value.clone());
+                        }
+                        if *keep {
+                            stack.push(value);
+                        }
+                    }
+                    Op::LoadVarDynamicRef { global } => {
+                        let name = stack.pop().unwrap_or(Value::Null).deref();
+                        let name = name.to_string_lossy();
+                        if *global {
+                            let key = Key::from_str(&name);
+                            let existing = self.globals.get(&key).cloned();
+                            match existing {
+                                Some(Value::Ref(cell)) => stack.push(Value::Ref(cell)),
+                                Some(value) => {
+                                    let cell = Rc::new(std::cell::RefCell::new(value));
+                                    self.globals.insert(key, Value::Ref(cell.clone()));
+                                    stack.push(Value::Ref(cell));
+                                }
+                                None => {
+                                    self.warn(format!("Undefined variable ${name}"));
+                                    let cell = Rc::new(std::cell::RefCell::new(Value::Null));
+                                    self.globals.insert(key, Value::Ref(cell.clone()));
+                                    stack.push(Value::Ref(cell));
+                                }
+                            }
+                        } else if let Some(slot) = slot_names
+                            .iter()
+                            .position(|slot| slot.as_deref() == Some(name.as_str()))
+                        {
+                            stack.push(frame.ref_for(slot as u32));
+                        } else {
+                            let existing = frame.dynamic.get(&name).cloned();
+                            match existing {
+                                Some(Value::Ref(cell)) => stack.push(Value::Ref(cell)),
+                                Some(value) => {
+                                    let cell = Rc::new(std::cell::RefCell::new(value));
+                                    frame.dynamic.insert(name, Value::Ref(cell.clone()));
+                                    stack.push(Value::Ref(cell));
+                                }
+                                None => {
+                                    self.warn(format!("Undefined variable ${name}"));
+                                    let cell = Rc::new(std::cell::RefCell::new(Value::Null));
+                                    frame.dynamic.insert(name, Value::Ref(cell.clone()));
+                                    stack.push(Value::Ref(cell));
+                                }
+                            }
+                        }
+                    }
+                    Op::StoreVarDynamicRef { global } => {
+                        let value = stack.pop().unwrap_or(Value::Null);
+                        let name = stack.pop().unwrap_or(Value::Null).deref();
+                        let name = name.to_string_lossy();
+                        if value.as_ref_cell().is_none() {
+                            return Err(PhpError::fatal(
+                                "Only variables should be assigned by reference",
+                            ));
+                        }
+                        if *global {
+                            self.globals.insert(Key::from_str(&name), value);
+                        } else if let Some(slot) = slot_names
+                            .iter()
+                            .position(|slot| slot.as_deref() == Some(name.as_str()))
+                        {
+                            frame.set(slot as u32, value);
+                        } else {
+                            frame.dynamic.insert(name, value);
+                        }
+                    }
+                    Op::UnsetVarDynamic { global } => {
+                        let name = stack.pop().unwrap_or(Value::Null).deref();
+                        let name = name.to_string_lossy();
+                        if *global {
+                            self.globals.remove(&Key::from_str(&name));
+                        } else if let Some(slot) = slot_names
+                            .iter()
+                            .position(|slot| slot.as_deref() == Some(name.as_str()))
+                        {
+                            frame.slots[slot] = Value::Null;
+                            frame.defined[slot] = false;
+                        } else {
+                            frame.dynamic.remove(&name);
                         }
                     }
                     Op::LoadGlobal(index) => {
@@ -1887,7 +2718,40 @@ impl Vm {
                         let bytes = self.output_bytes(&value)?;
                         self.output.extend_from_slice(&bytes);
                     }
+                    Op::Print => {
+                        let value = stack.pop().unwrap_or(Value::Null);
+                        let bytes = self.output_bytes(&value)?;
+                        self.output.extend_from_slice(&bytes);
+                        stack.push(Value::Int(1));
+                    }
                     Op::ArrayNew => stack.push(Value::array(PhpArray::new())),
+                    Op::YieldFrom => {
+                        let source = stack.pop().unwrap_or(Value::Null).deref();
+                        let array = stack.pop().unwrap_or(Value::Null).deref();
+                        let mut array = match array {
+                            Value::Array(array) => (*array).clone(),
+                            _ => PhpArray::new(),
+                        };
+                        match source {
+                            Value::Array(source) => {
+                                for (key, value) in source.iter() {
+                                    array.insert(key.clone(), value.deref());
+                                }
+                            }
+                            Value::Object(object) => {
+                                for (key, value) in object.borrow().properties.iter() {
+                                    array.insert(key.clone(), value.deref());
+                                }
+                            }
+                            other => {
+                                return Err(PhpError::fatal(format!(
+                                    "yield from must be an array or Traversable, {} given",
+                                    other.debug_type_name()
+                                )))
+                            }
+                        }
+                        stack.push(Value::array(array));
+                    }
                     Op::ArraySet { tmp, has_key } => {
                         let value = stack.pop().unwrap_or(Value::Null).deref();
                         let key = if *has_key {
@@ -1914,6 +2778,63 @@ impl Vm {
                                 }
                             }
                             frame.set(*tmp, Value::array(array));
+                        }
+                    }
+                    Op::ArraySetRef { tmp, has_key } => {
+                        let value = stack.pop().unwrap_or(Value::Null);
+                        let key = if *has_key {
+                            let key_value = stack.pop().unwrap_or(Value::Null).deref();
+                            Some(key_from_value(&key_value)?)
+                        } else {
+                            None
+                        };
+                        let slot = *tmp as usize;
+                        if let Some(Value::Array(array)) = frame.slots.get_mut(slot) {
+                            let array = Rc::make_mut(array);
+                            match key {
+                                Some(key) => array.insert(key, value),
+                                None => {
+                                    array.push(value);
+                                }
+                            }
+                        } else {
+                            let mut array = PhpArray::new();
+                            match key {
+                                Some(key) => array.insert(key, value),
+                                None => {
+                                    array.push(value);
+                                }
+                            }
+                            frame.set(*tmp, Value::array(array));
+                        }
+                    }
+                    Op::ArraySpread { tmp } => {
+                        let value = stack.pop().unwrap_or(Value::Null).deref();
+                        let source = match value {
+                            Value::Array(array) => array,
+                            other => {
+                                return Err(PhpError::fatal(format!(
+                                    "Only arrays and Traversables can be unpacked, {} given",
+                                    other.debug_type_name()
+                                )))
+                            }
+                        };
+                        let slot = *tmp as usize;
+                        if !matches!(frame.slots.get(slot), Some(Value::Array(_))) {
+                            frame.set(*tmp, Value::array(PhpArray::new()));
+                        }
+                        if let Some(Value::Array(target)) = frame.slots.get_mut(slot) {
+                            let target = Rc::make_mut(target);
+                            for (key, item) in source.iter() {
+                                match key {
+                                    Key::Int(_) => {
+                                        target.push(item.clone());
+                                    }
+                                    Key::Str(_) => {
+                                        target.insert(key.clone(), item.clone());
+                                    }
+                                }
+                            }
                         }
                     }
                     Op::Index => {
@@ -2064,6 +2985,25 @@ impl Vm {
                         let result = self.call_named(&name, args)?;
                         stack.push(result);
                     }
+                    Op::CallEx {
+                        name,
+                        argc,
+                        fallback,
+                        modes,
+                    } => {
+                        let mut name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        let args = self.evaluate_call_args(&mut stack, *argc, modes, chunk)?;
+                        let lower = name.to_ascii_lowercase();
+                        let exists = self.functions.contains_key(&lower)
+                            || phpcraft_stdlib::find(&lower).is_some();
+                        if !exists && *fallback {
+                            if let Some((_, short)) = name.rsplit_once('\\') {
+                                name = short.to_string();
+                            }
+                        }
+                        let result = self.call_named_args(&name, args)?;
+                        stack.push(result);
+                    }
                     Op::CallValue { argc } => {
                         let argc = *argc as usize;
                         let args = if argc == 0 {
@@ -2073,6 +3013,12 @@ impl Vm {
                         };
                         let callee = stack.pop().unwrap_or(Value::Null);
                         let result = self.invoke(callee, args)?;
+                        stack.push(result);
+                    }
+                    Op::CallValueEx { argc, modes } => {
+                        let args = self.evaluate_call_args(&mut stack, *argc, modes, chunk)?;
+                        let callee = stack.pop().unwrap_or(Value::Null);
+                        let result = self.invoke_args(callee, args)?;
                         stack.push(result);
                     }
                     Op::Include { once, require } => {
@@ -2142,10 +3088,33 @@ impl Vm {
                         )?;
                         stack.push(callable);
                     }
+                    Op::MakeMethodCallableValue => {
+                        let method = stack.pop().unwrap_or(Value::Null).deref();
+                        let object = stack.pop().unwrap_or(Value::Null);
+                        let method = method.to_string_lossy();
+                        let callable = self.make_method_callable(
+                            object,
+                            &method,
+                            frame.class_name.as_deref(),
+                        )?;
+                        stack.push(callable);
+                    }
                     Op::MakeStaticCallable { class, method } => {
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let method = String::from_utf8_lossy(chunk.const_str(*method)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
+                        let callable = self.make_static_callable(
+                            &class,
+                            &method,
+                            frame.class_name.as_deref(),
+                        )?;
+                        stack.push(callable);
+                    }
+                    Op::MakeStaticCallableValue => {
+                        let method = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = self.resolve_class_marker(&class.to_string_lossy(), frame)?;
+                        let method = method.to_string_lossy();
                         let callable = self.make_static_callable(
                             &class,
                             &method,
@@ -2178,9 +3147,36 @@ impl Vm {
                         let object = self.new_object(&class, args, frame.class_name.as_deref())?;
                         stack.push(object);
                     }
+                    Op::NewObjectEx { class, argc, modes } => {
+                        let args = self.evaluate_call_args(&mut stack, *argc, modes, chunk)?;
+                        let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
+                        let class = self.resolve_class_marker(&class, frame)?;
+                        let object =
+                            self.new_object_args(&class, args, frame.class_name.as_deref())?;
+                        stack.push(object);
+                    }
+                    Op::NewObjectDynamic { argc, modes } => {
+                        let args = self.evaluate_call_args(&mut stack, *argc, modes, chunk)?;
+                        let class = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = class.to_string_lossy();
+                        let object =
+                            self.new_object_args(&class, args, frame.class_name.as_deref())?;
+                        stack.push(object);
+                    }
                     Op::LoadProperty { name, safe } => {
                         let object = stack.pop().unwrap_or(Value::Null);
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        stack.push(self.load_property(
+                            object,
+                            &name,
+                            !*safe,
+                            frame.class_name.as_deref(),
+                        )?);
+                    }
+                    Op::LoadPropertyDynamic { safe } => {
+                        let name = stack.pop().unwrap_or(Value::Null).deref();
+                        let object = stack.pop().unwrap_or(Value::Null);
+                        let name = name.to_string_lossy();
                         stack.push(self.load_property(
                             object,
                             &name,
@@ -2192,6 +3188,21 @@ impl Vm {
                         let value = stack.pop().unwrap_or(Value::Null).deref();
                         let object = stack.pop().unwrap_or(Value::Null).deref();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        self.assign_property(
+                            object,
+                            &name,
+                            value.clone(),
+                            frame.class_name.as_deref(),
+                        )?;
+                        if *keep {
+                            stack.push(value);
+                        }
+                    }
+                    Op::AssignPropertyDynamic { keep } => {
+                        let value = stack.pop().unwrap_or(Value::Null).deref();
+                        let name = stack.pop().unwrap_or(Value::Null).deref();
+                        let object = stack.pop().unwrap_or(Value::Null).deref();
+                        let name = name.to_string_lossy();
                         self.assign_property(
                             object,
                             &name,
@@ -2231,6 +3242,33 @@ impl Vm {
                             frame.class_name.as_deref(),
                         )?);
                     }
+                    Op::CallMethodEx {
+                        method,
+                        argc,
+                        modes,
+                    } => {
+                        let args = self.evaluate_call_args(&mut stack, *argc, modes, chunk)?;
+                        let object = stack.pop().unwrap_or(Value::Null);
+                        let method = String::from_utf8_lossy(chunk.const_str(*method)).into_owned();
+                        stack.push(self.call_method_value_args(
+                            object,
+                            &method,
+                            args,
+                            frame.class_name.as_deref(),
+                        )?);
+                    }
+                    Op::CallMethodDynamic { argc, modes } => {
+                        let args = self.evaluate_call_args(&mut stack, *argc, modes, chunk)?;
+                        let method = stack.pop().unwrap_or(Value::Null).deref();
+                        let object = stack.pop().unwrap_or(Value::Null);
+                        let method = method.to_string_lossy();
+                        stack.push(self.call_method_value_args(
+                            object,
+                            &method,
+                            args,
+                            frame.class_name.as_deref(),
+                        )?);
+                    }
                     Op::CallStaticMethod {
                         class,
                         method,
@@ -2246,10 +3284,41 @@ impl Vm {
                         let method = String::from_utf8_lossy(chunk.const_str(*method)).into_owned();
                         stack.push(self.call_static(&class, &method, args, frame)?);
                     }
+                    Op::CallStaticMethodEx {
+                        class,
+                        method,
+                        argc,
+                        modes,
+                    } => {
+                        let args = self.evaluate_call_args(&mut stack, *argc, modes, chunk)?;
+                        let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
+                        let method = String::from_utf8_lossy(chunk.const_str(*method)).into_owned();
+                        stack.push(self.call_static_args(&class, &method, args, frame)?);
+                    }
+                    Op::CallStaticMethodDynamic {
+                        method,
+                        argc,
+                        modes,
+                    } => {
+                        let args = self.evaluate_call_args(&mut stack, *argc, modes, chunk)?;
+                        let class = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = class.to_string_lossy();
+                        let method = String::from_utf8_lossy(chunk.const_str(*method)).into_owned();
+                        stack.push(self.call_static_args(&class, &method, args, frame)?);
+                    }
+                    Op::CallStaticMethodValue { argc, modes } => {
+                        let args = self.evaluate_call_args(&mut stack, *argc, modes, chunk)?;
+                        let method = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = class.to_string_lossy();
+                        let method = method.to_string_lossy();
+                        stack.push(self.call_static_args(&class, &method, args, frame)?);
+                    }
                     Op::LoadStaticProperty { class, name, safe } => {
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
+                        self.autoload_class(&class)?;
                         stack.push(self.load_static_property(
                             &class,
                             &name,
@@ -2262,6 +3331,65 @@ impl Vm {
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
+                        self.autoload_class(&class)?;
+                        self.assign_static_property(
+                            &class,
+                            &name,
+                            value.clone(),
+                            frame.class_name.as_deref(),
+                        )?;
+                        if *keep {
+                            stack.push(value);
+                        }
+                    }
+                    Op::LoadStaticPropertyDynamic { name, safe } => {
+                        let class = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = self.resolve_class_marker(&class.to_string_lossy(), frame)?;
+                        let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        self.autoload_class(&class)?;
+                        stack.push(self.load_static_property(
+                            &class,
+                            &name,
+                            !*safe,
+                            frame.class_name.as_deref(),
+                        )?);
+                    }
+                    Op::AssignStaticPropertyDynamic { name, keep } => {
+                        let value = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = self.resolve_class_marker(&class.to_string_lossy(), frame)?;
+                        let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        self.autoload_class(&class)?;
+                        self.assign_static_property(
+                            &class,
+                            &name,
+                            value.clone(),
+                            frame.class_name.as_deref(),
+                        )?;
+                        if *keep {
+                            stack.push(value);
+                        }
+                    }
+                    Op::LoadStaticPropertyDynamicValue { safe } => {
+                        let name = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = self.resolve_class_marker(&class.to_string_lossy(), frame)?;
+                        let name = name.to_string_lossy();
+                        self.autoload_class(&class)?;
+                        stack.push(self.load_static_property(
+                            &class,
+                            &name,
+                            !*safe,
+                            frame.class_name.as_deref(),
+                        )?);
+                    }
+                    Op::AssignStaticPropertyDynamicValue { keep } => {
+                        let value = stack.pop().unwrap_or(Value::Null).deref();
+                        let name = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = self.resolve_class_marker(&class.to_string_lossy(), frame)?;
+                        let name = name.to_string_lossy();
+                        self.autoload_class(&class)?;
                         self.assign_static_property(
                             &class,
                             &name,
@@ -2276,6 +3404,7 @@ impl Vm {
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
+                        self.autoload_class(&class)?;
                         stack.push(self.make_static_property_ref(
                             &class,
                             &name,
@@ -2287,6 +3416,7 @@ impl Vm {
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
+                        self.autoload_class(&class)?;
                         self.set_static_property_ref(
                             &class,
                             &name,
@@ -2298,6 +3428,28 @@ impl Vm {
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
+                        if !name.eq_ignore_ascii_case("class") {
+                            self.autoload_class(&class)?;
+                        }
+                        stack.push(self.class_constant(&class, &name)?);
+                    }
+                    Op::ClassConstantDynamic { name } => {
+                        let class = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = self.resolve_class_marker(&class.to_string_lossy(), frame)?;
+                        let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        if !name.eq_ignore_ascii_case("class") {
+                            self.autoload_class(&class)?;
+                        }
+                        stack.push(self.class_constant(&class, &name)?);
+                    }
+                    Op::ClassConstantDynamicValue => {
+                        let name = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = self.resolve_class_marker(&class.to_string_lossy(), frame)?;
+                        let name = name.to_string_lossy();
+                        if !name.eq_ignore_ascii_case("class") {
+                            self.autoload_class(&class)?;
+                        }
                         stack.push(self.class_constant(&class, &name)?);
                     }
                     Op::InstanceOf { class } => {
@@ -2313,6 +3465,20 @@ impl Vm {
                     Op::Throw => {
                         let value = stack.pop().unwrap_or(Value::Null);
                         return Err(self.throw_value(value));
+                    }
+                    Op::Exit => {
+                        let value = stack.pop().unwrap_or(Value::Null).deref();
+                        match value {
+                            Value::Int(code) => {
+                                return Err(PhpError::exit((code & 0xff) as i32));
+                            }
+                            Value::Null => return Err(PhpError::exit(0)),
+                            other => {
+                                let bytes = self.output_bytes(&other)?;
+                                self.output.extend_from_slice(&bytes);
+                                return Err(PhpError::exit(0));
+                            }
+                        }
                     }
                     Op::TryStart {
                         catch_ip,
@@ -2427,10 +3593,47 @@ impl Vm {
                             ));
                         }
                     }
+                    Op::UnsetPropertyDynamic => {
+                        let name = stack.pop().unwrap_or(Value::Null).deref();
+                        let object = stack.pop().unwrap_or(Value::Null);
+                        let name = name.to_string_lossy();
+                        if let Value::Object(object) = object.deref() {
+                            self.object_property_access(
+                                &object.borrow(),
+                                &name,
+                                frame.class_name.as_deref(),
+                            )?;
+                            object.borrow_mut().properties.remove(&Key::from_str(&name));
+                        } else {
+                            self.warn(format!(
+                                "Attempt to unset property \"{}\" on non-object",
+                                name
+                            ));
+                        }
+                    }
                     Op::UnsetStaticProperty { class, name } => {
                         let class = String::from_utf8_lossy(chunk.const_str(*class)).into_owned();
                         let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
                         let class = self.resolve_class_marker(&class, frame)?;
+                        return Err(PhpError::fatal(format!(
+                            "Attempt to unset static property {}::${}",
+                            class, name
+                        )));
+                    }
+                    Op::UnsetStaticPropertyDynamic { name } => {
+                        let class = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = self.resolve_class_marker(&class.to_string_lossy(), frame)?;
+                        let name = String::from_utf8_lossy(chunk.const_str(*name)).into_owned();
+                        return Err(PhpError::fatal(format!(
+                            "Attempt to unset static property {}::${}",
+                            class, name
+                        )));
+                    }
+                    Op::UnsetStaticPropertyDynamicValue => {
+                        let name = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = stack.pop().unwrap_or(Value::Null).deref();
+                        let class = self.resolve_class_marker(&class.to_string_lossy(), frame)?;
+                        let name = name.to_string_lossy();
                         return Err(PhpError::fatal(format!(
                             "Attempt to unset static property {}::${}",
                             class, name
@@ -2448,6 +3651,9 @@ impl Vm {
                 Ok(Control::Continue) => {}
                 Ok(Control::Return(value)) => return Ok(value),
                 Err(error) => {
+                    if error.kind == ErrorKind::Exit {
+                        return Err(error);
+                    }
                     if let Some(handler) = frame.handlers.pop() {
                         let thrown = match error.thrown.clone() {
                             Some(value) => value,
@@ -3056,6 +4262,64 @@ impl RuntimeHooks for Vm {
     fn function_exists(&mut self, name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
         self.functions.contains_key(&lower) || phpcraft_stdlib::find(&lower).is_some()
+    }
+
+    fn register_autoloader(&mut self, callable: Value, prepend: bool) -> PhpResult<bool> {
+        if self
+            .autoloaders
+            .iter()
+            .any(|existing| strict_eq(existing, &callable))
+        {
+            return Ok(false);
+        }
+        if prepend {
+            self.autoloaders.insert(0, callable);
+        } else {
+            self.autoloaders.push(callable);
+        }
+        Ok(true)
+    }
+
+    fn unregister_autoloader(&mut self, callable: &Value) -> bool {
+        if let Some(index) = self
+            .autoloaders
+            .iter()
+            .position(|existing| strict_eq(existing, callable))
+        {
+            self.autoloaders.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn autoload_functions(&mut self) -> Vec<Value> {
+        self.autoloaders.clone()
+    }
+
+    fn autoload_call(&mut self, class: &str) -> PhpResult<()> {
+        self.trigger_autoload(class, true)
+    }
+
+    fn class_exists(&mut self, class: &str, autoload: bool) -> PhpResult<bool> {
+        self.type_exists(class, autoload, "class")
+    }
+
+    fn type_exists(&mut self, class: &str, autoload: bool, kind: &str) -> PhpResult<bool> {
+        if autoload {
+            self.autoload_class(class)?;
+        }
+        let normalized = Self::normalize_class(class);
+        if let Some(def) = self.classes.get(&normalized.to_ascii_lowercase()) {
+            let actual = match def.kind {
+                ClassKind::Class => "class",
+                ClassKind::Interface => "interface",
+                ClassKind::Trait => "trait",
+                ClassKind::Enum => "enum",
+            };
+            return Ok(actual == kind);
+        }
+        Ok(kind == "class" && self.canonical_class_name(&normalized).is_some())
     }
 
     fn is_callable(&mut self, value: &Value) -> bool {

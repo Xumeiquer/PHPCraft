@@ -2,7 +2,7 @@
 //!
 //! Mirrors the shape of `zend_ast.h` (`ZEND_AST_*` nodes) but in idiomatic
 //! Rust. Only the constructs the engine currently executes are represented;
-//! attributes, interfaces, traits and enums are still missing.
+//! attributes are skipped by the parser and therefore have no node.
 
 /// A parsed PHP file.
 #[derive(Clone, Debug)]
@@ -60,6 +60,14 @@ pub enum Stmt {
     },
     /// One or more `use` imports.
     Use(Vec<UseDecl>),
+    /// Namespace-level `const NAME = value, ...;`.
+    Const(Vec<ConstDecl>),
+    /// `declare(strict_types=1);` and block forms. Directive values are parsed
+    /// but not enforced by this engine.
+    Declare {
+        directives: Vec<(String, Expr)>,
+        body: Option<Vec<Stmt>>,
+    },
     /// `try { ... } catch (...) { ... } finally { ... }`
     Try {
         body: Vec<Stmt>,
@@ -68,11 +76,17 @@ pub enum Stmt {
     },
     /// `global $a, $b;`
     Global(Vec<String>),
+    /// `static $a = 1, $b;`
+    Static(Vec<(String, Option<Expr>)>),
     /// `unset($a, $b[0], $object->property);`
     Unset(Vec<Expr>),
     Return(Option<Expr>),
     Break(Option<u32>),
     Continue(Option<u32>),
+    /// `goto label;`
+    Goto(String),
+    /// `label:`
+    Label(String),
     Nop,
 }
 
@@ -99,6 +113,8 @@ pub struct Param {
     pub default: Option<Expr>,
     pub variadic: bool,
     pub by_ref: bool,
+    /// Constructor property promotion (`public int $value`).
+    pub promoted: Option<Visibility>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,9 +160,31 @@ pub struct PropertyDecl {
 }
 
 #[derive(Clone, Debug)]
+pub struct ConstDecl {
+    pub name: String,
+    pub value: Expr,
+    pub line: u32,
+}
+
+#[derive(Clone, Debug)]
 pub struct ClassConstDecl {
     pub name: String,
     pub value: Expr,
+    pub line: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassKind {
+    Class,
+    Interface,
+    Trait,
+    Enum,
+}
+
+#[derive(Clone, Debug)]
+pub struct EnumCaseDecl {
+    pub name: String,
+    pub value: Option<Expr>,
     pub line: u32,
 }
 
@@ -159,16 +197,35 @@ pub struct MethodDecl {
     pub static_: bool,
     /// `function &name()` returns by reference.
     pub returns_ref: bool,
+    /// Interface/abstract declaration (`function f();`).
+    pub abstract_: bool,
     pub line: u32,
 }
 
 #[derive(Clone, Debug)]
+pub struct TraitAdaptation {
+    /// `Trait::` prefix, when present.
+    pub trait_name: Option<String>,
+    pub method: String,
+    pub instead_of: Vec<String>,
+    pub alias: Option<String>,
+    pub visibility: Option<Visibility>,
+}
+
+#[derive(Clone, Debug)]
 pub struct ClassDecl {
+    pub kind: ClassKind,
     pub name: String,
     pub parent: Option<String>,
+    pub interfaces: Vec<String>,
+    pub traits: Vec<String>,
+    pub trait_adaptations: Vec<TraitAdaptation>,
     pub properties: Vec<PropertyDecl>,
     pub constants: Vec<ClassConstDecl>,
     pub methods: Vec<MethodDecl>,
+    pub enum_backing: Option<String>,
+    pub enum_cases: Vec<EnumCaseDecl>,
+    pub abstract_: bool,
     pub line: u32,
 }
 
@@ -219,9 +276,10 @@ pub struct ArrayItem {
     pub key: Option<Expr>,
     /// `None` is an empty slot in a destructuring target (`[, $b]`).
     pub value: Option<Expr>,
-    /// `&$value` inside a destructuring target. PHP also has by-reference
-    /// array literals, but they remain unsupported.
+    /// `&$value` inside a destructuring target or array literal.
     pub by_ref: bool,
+    /// `...$array` inside an array literal.
+    pub spread: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -261,6 +319,16 @@ pub enum Expr {
     /// Double-quoted/heredoc string with `$vars` and `{$expr}`.
     Interp(Vec<InterpPart>),
     Var(String),
+    /// `$$name` or `${expr}`.
+    VariableVariable {
+        name: Box<Expr>,
+    },
+    /// `yield`, `yield $value`, `yield $key => $value`, or `yield from $iterable`.
+    Yield {
+        key: Option<Box<Expr>>,
+        value: Option<Box<Expr>>,
+        from: bool,
+    },
     /// A bare name used as a constant (`PHP_EOL`, `true` is parsed separately).
     Name(String),
     Array(Vec<ArrayItem>),
@@ -316,15 +384,36 @@ pub enum Expr {
         class: String,
         args: Vec<Expr>,
     },
+    /// `new $class(...)`.
+    NewDynamic {
+        class: Box<Expr>,
+        args: Vec<Expr>,
+    },
+    /// Anonymous class instantiation (`new class { ... }`).
+    NewAnonymous {
+        class: Box<ClassDecl>,
+        args: Vec<Expr>,
+    },
     /// `$object->name` (method calls are represented separately).
     Property {
         object: Box<Expr>,
         name: String,
     },
+    /// `$object->$name` / `$object->{$expr}`.
+    DynamicProperty {
+        object: Box<Expr>,
+        name: Box<Expr>,
+    },
     /// `$object->method(...)`.
     MethodCall {
         object: Box<Expr>,
         method: String,
+        args: Vec<Expr>,
+    },
+    /// `$object->$method(...)`.
+    DynamicMethodCall {
+        object: Box<Expr>,
+        method: Box<Expr>,
         args: Vec<Expr>,
     },
     /// `Class::method(...)` (also `self::`, `parent::`, `static::`).
@@ -333,15 +422,31 @@ pub enum Expr {
         method: String,
         args: Vec<Expr>,
     },
+    /// `$class::method(...)` or `$class::$method(...)`.
+    DynamicStaticCall {
+        class: Box<Expr>,
+        method: Box<Expr>,
+        args: Vec<Expr>,
+    },
     /// `Class::$property`.
     StaticProperty {
         class: String,
         name: String,
     },
+    /// `$class::$property` / `$class::$$name`.
+    DynamicStaticProperty {
+        class: Box<Expr>,
+        name: Box<Expr>,
+    },
     /// `Class::CONSTANT`, including `Class::class`.
     ClassConst {
         class: String,
         name: String,
+    },
+    /// `$class::CONSTANT` or `$class::{$name}`.
+    DynamicClassConst {
+        class: Box<Expr>,
+        name: Box<Expr>,
     },
     /// `$value instanceof Class`.
     InstanceOf {
@@ -369,6 +474,17 @@ pub enum Expr {
     },
     Isset(Vec<Expr>),
     Empty(Box<Expr>),
+    /// `print $value` (an expression returning `1`).
+    Print(Box<Expr>),
+    /// `exit` / `die`, with an optional status message or code.
+    Exit(Option<Box<Expr>>),
+    /// `...$values` in a call argument list.
+    Spread(Box<Expr>),
+    /// `name: $value` in a call argument list.
+    NamedArg {
+        name: String,
+        value: Box<Expr>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

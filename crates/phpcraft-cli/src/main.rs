@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use phpcraft_compiler::compile;
 use phpcraft_parser::{parse_file, parse_fragment};
-use phpcraft_runtime::Value;
+use phpcraft_runtime::{ErrorKind, Value};
 use phpcraft_vm::Vm;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -177,6 +177,9 @@ fn run(args: &[String]) -> Result<u8, u8> {
             _ => 0,
         }),
         Err(error) => {
+            if error.kind == ErrorKind::Exit {
+                return Ok((error.exit_code.unwrap_or(0) & 0xff) as u8);
+            }
             if let Some(Value::Object(object)) = &error.thrown {
                 let object = object.borrow();
                 let data = object.exception.as_ref();
